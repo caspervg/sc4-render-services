@@ -69,7 +69,6 @@ target_include_directories(imgui PUBLIC
         ${IMGUI_DIR}
 )
 target_compile_definitions(imgui PRIVATE IMGUI_DLL_EXPORT)
-target_compile_definitions(imgui PUBLIC IMGUI_USE_BGRA_PACKED_COLOR)
 
 if(WIN32)
     target_link_libraries(imgui PRIVATE user32 gdi32 ddraw dxguid)

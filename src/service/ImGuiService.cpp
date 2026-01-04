@@ -213,6 +213,14 @@ void ImGuiService::RenderFrame(IDirect3DDevice7* device) {
         }
     }
 
+    // Reset texture coordinate generation/transform state that can be left
+    // dirty by the game and cause garbled font sampling by the ImGui backend.
+    device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+    device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    device->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 0);
+    device->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    device->SetRenderState(D3DRENDERSTATE_ALPHATESTENABLE, FALSE);
+
     ImGui::Render();
     ImGui_ImplDX7_RenderDrawData(ImGui::GetDrawData());
 
