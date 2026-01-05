@@ -248,6 +248,10 @@ if(MSVC)
     )
 endif()
 
+add_custom_target(SC4ImGuiAllTargets
+        DEPENDS imgui SC4ImGuiService SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo
+)
+
 # Automatic deployment to SC4 directories
 if(WIN32)
     # Try to find SC4 installation directory

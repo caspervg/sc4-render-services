@@ -34,10 +34,28 @@
             "configuration": "Debug"
         },
         {
-            "name": "vs2022-win32-release-build", 
+            "name": "vs2022-win32-debug-all",
+            "displayName": "Build Win32 Debug (All DLLs)",
+            "configurePreset": "vs2022-win32-debug",
+            "configuration": "Debug",
+            "targets": [
+                "SC4ImGuiAllTargets"
+            ]
+        },
+        {
+            "name": "vs2022-win32-release-build",
             "displayName": "Build Win32 Release",
             "configurePreset": "vs2022-win32-release",
             "configuration": "Release"
+        },
+        {
+            "name": "vs2022-win32-release-all",
+            "displayName": "Build Win32 Release (All DLLs)",
+            "configurePreset": "vs2022-win32-release",
+            "configuration": "Release",
+            "targets": [
+                "SC4ImGuiAllTargets"
+            ]
         }
     ]
 }
