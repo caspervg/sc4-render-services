@@ -1,4 +1,4 @@
-# sc4-imgui-backend
+# sc4-imgui-service
 
 ImGui service and samples for SimCity 4 DLL plugins using the gzcom-dll SDK.
 
