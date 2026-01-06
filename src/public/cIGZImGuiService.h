@@ -16,6 +16,9 @@ struct ImGuiPanelDesc
     void* data;
 };
 
+struct IDirectDraw7;
+struct IDirect3DDevice7;
+
 // ReSharper disable once CppPolymorphicClassWithNonVirtualPublicDestructor
 class cIGZImGuiService : public cIGZUnknown
 {
