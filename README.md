@@ -33,6 +33,8 @@ Optional samples (deployed to `...\Documents\SimCity 4\Plugins\`):
 - Query the service via `cIGZFrameWork::GetSystemService` with `kImGuiServiceID`
   and `GZIID_cIGZImGuiService` from `src/public/ImGuiServiceIds.h`.
 - Register a panel with `ImGuiPanelDesc` and render using `ImGui::*`.
+- The service owns the ImGui context; do not call `ImGui::CreateContext()` or
+  `ImGui::DestroyContext()` in clients.
 
 ## Public API
 
@@ -94,6 +96,26 @@ void RegisterPanel(cIGZFrameWork* fw) {
     desc.data = nullptr;
     service->RegisterPanel(desc);
     service->Release();
+}
+```
+
+### DX7 interface access
+
+If you need DirectX 7 interfaces (e.g., to create textures for `ImGui::Image`),
+use `cIGZImGuiService::AcquireD3DInterfaces`. The service AddRef()s both
+interfaces; callers must Release() them when done. Prefer acquiring per
+operation/frame rather than caching across frames. Use
+`IsDeviceReady()` and `GetDeviceGeneration()` to detect when cached textures
+must be recreated.
+
+Example:
+```cpp
+IDirect3DDevice7* d3d = nullptr;
+IDirectDraw7* dd = nullptr;
+if (service->AcquireD3DInterfaces(&d3d, &dd)) {
+    // use d3d/dd
+    d3d->Release();
+    dd->Release();
 }
 ```
 
