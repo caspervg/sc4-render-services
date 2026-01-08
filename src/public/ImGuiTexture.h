@@ -89,6 +89,7 @@ public:
         if (currentGen != lastKnownGeneration_) {
             // Device was reset, texture handle is stale
             handle_.generation = 0;  // Invalidate
+            lastKnownGeneration_ = currentGen;  // Update to avoid repeated warnings
             return nullptr;
         }
 

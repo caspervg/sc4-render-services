@@ -697,12 +697,16 @@ void* ImGuiService::GetTextureID(ImGuiTextureHandle handle) {
     }
 
     // Validate surface is not lost
-    if (tex.surface && FAILED(tex.surface->IsLost())) {
-        LOG_WARN("ImGuiService::GetTextureID: surface is lost (id={})", tex.id);
-        tex.surface->Release();
-        tex.surface = nullptr;
-        tex.needsRecreation = true;
-        return nullptr;
+    // IsLost() returns DD_OK (S_OK) if surface is valid, DDERR_SURFACELOST if lost
+    if (tex.surface) {
+        HRESULT hr = tex.surface->IsLost();
+        if (hr == DDERR_SURFACELOST) {
+            LOG_WARN("ImGuiService::GetTextureID: surface is lost (id={})", tex.id);
+            tex.surface->Release();
+            tex.surface = nullptr;
+            tex.needsRecreation = true;
+            return nullptr;
+        }
     }
 
     return static_cast<void*>(tex.surface);

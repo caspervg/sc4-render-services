@@ -26,8 +26,9 @@ namespace {
         std::vector<uint8_t> pixels(pixelCount * 4);  // RGBA32
         
         for (uint32_t y = 0; y < height; ++y) {
+            size_t rowOffset = static_cast<size_t>(y) * width * 4;
             for (uint32_t x = 0; x < width; ++x) {
-                const size_t offset = (static_cast<size_t>(y) * width + x) * 4;
+                const size_t offset = rowOffset + x * 4;
                 const bool isWhite = ((x / 16) + (y / 16)) % 2 == 0;
                 
                 if (isWhite) {
