@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <ranges>
 #include <ddraw.h>
+#include <winerror.h>
 
 #include "cIGZFrameWorkW32.h"
 #include "cIGZGraphicSystem2.h"
@@ -313,7 +314,7 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
 
     // Check for device loss
     HRESULT hr = dd->TestCooperativeLevel();
-    if (hr != DD_OK) {
+    if (FAILED(hr)) {
         if (!deviceLost_) {
             OnDeviceLost_();
         }
@@ -511,16 +512,17 @@ ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
     }
 
     // Check for potential integer overflow in size calculation
-    // Maximum safe size is SIZE_MAX / 4 to account for 4 bytes per pixel
-    constexpr size_t maxDimension = SIZE_MAX / 4;
-    if (desc.width > maxDimension || desc.height > maxDimension) {
-        LOG_ERROR("ImGuiService::CreateTexture: dimensions too large (width={}, height={})",
+    // Ensure width * height doesn't overflow when computing pixel count
+    if (desc.height > SIZE_MAX / desc.width) {
+        LOG_ERROR("ImGuiService::CreateTexture: dimensions would overflow (width={}, height={})",
             desc.width, desc.height);
         return ImGuiTextureHandle{0, 0};
     }
 
     const size_t pixelCount = static_cast<size_t>(desc.width) * desc.height;
-    if (pixelCount > maxDimension) {
+    
+    // Ensure pixelCount * 4 doesn't overflow when computing byte size
+    if (pixelCount > SIZE_MAX / 4) {
         LOG_ERROR("ImGuiService::CreateTexture: texture too large ({} pixels)", pixelCount);
         return ImGuiTextureHandle{0, 0};
     }
@@ -695,7 +697,7 @@ void* ImGuiService::GetTextureID(ImGuiTextureHandle handle) {
     }
 
     // Validate surface is not lost
-    if (tex.surface && tex.surface->IsLost() != DD_OK) {
+    if (tex.surface && FAILED(tex.surface->IsLost())) {
         LOG_WARN("ImGuiService::GetTextureID: surface is lost (id={})", tex.id);
         tex.surface->Release();
         tex.surface = nullptr;
