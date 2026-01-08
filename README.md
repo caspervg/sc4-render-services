@@ -26,6 +26,7 @@ Optional samples (deployed to `...\Documents\SimCity 4\Plugins\`):
 - `SC4ImGuiSample.dll` (basic panel)
 - `SC4ImGuiSampleCity.dll` (city-view only)
 - `SC4ImGuiSampleDemo.dll` (ImGui demo window)
+- `SC4ImGuiTextureSample.dll` (texture management example)
 
 ## Usage
 
@@ -99,13 +100,151 @@ void RegisterPanel(cIGZFrameWork* fw) {
 }
 ```
 
+### Safe Texture Management
+
+The service provides a comprehensive texture management API that handles device loss, memory management, and automatic recreation. This is the **recommended** way to create textures for use with `ImGui::Image()`.
+
+#### Features
+
+- **Automatic device loss handling**: Textures survive Alt+Tab and resolution changes
+- **Generation tracking**: Old texture handles are automatically invalidated after device reset
+- **Memory safety**: Source pixel data is stored for automatic recreation
+- **Fallback support**: Automatically falls back to system memory if video memory is exhausted
+- **RAII wrapper**: Optional `ImGuiTexture` class for automatic lifetime management
+
+#### Basic Usage (RAII Wrapper - Recommended)
+
+```cpp
+#include "public/ImGuiTexture.h"
+
+class MyPanel {
+    cIGZImGuiService* service_;
+    ImGuiTexture myTexture_;
+    
+    void OnInit() {
+        // Generate RGBA32 pixel data (4 bytes per pixel)
+        std::vector<uint8_t> pixels(128 * 128 * 4);
+        // ... fill pixel data ...
+        
+        // Create texture - automatically manages lifetime
+        if (!myTexture_.Create(service_, 128, 128, pixels.data())) {
+            // Handle error
+        }
+    }
+    
+    void OnRender() {
+        // Get texture ID - returns nullptr if device was lost
+        void* texId = myTexture_.GetID();
+        if (texId) {
+            ImGui::Image(texId, ImVec2(128, 128));
+        } else {
+            ImGui::TextUnformatted("Texture unavailable");
+        }
+    }
+    
+    // Texture is automatically released in destructor
+};
+```
+
+#### Manual API Usage
+
+```cpp
+#include "public/cIGZImGuiService.h"
+
+// Create texture descriptor
+ImGuiTextureDesc desc{};
+desc.width = 128;
+desc.height = 128;
+desc.pixels = myRGBA32Data;  // Must remain valid during call
+desc.useSystemMemory = false;  // Prefer video memory
+
+// Create texture - service stores pixel data internally
+ImGuiTextureHandle handle = service->CreateTexture(desc);
+if (handle.id == 0) {
+    // Handle error
+}
+
+// In render loop:
+void* texId = service->GetTextureID(handle);
+if (texId) {
+    ImGui::Image(texId, ImVec2(128, 128));
+}
+
+// When done:
+service->ReleaseTexture(handle);
+```
+
+#### Device Generation Pattern
+
+When the DirectX device is reset (Alt+Tab, resolution change), the device generation increments. Old texture handles become invalid:
+
+```cpp
+void OnRender() {
+    static uint32_t lastGen = 0;
+    uint32_t currentGen = service->GetDeviceGeneration();
+    
+    if (currentGen != lastGen) {
+        // Device was reset - recreate textures
+        RecreateMyTextures();
+        lastGen = currentGen;
+    }
+    
+    // Use textures normally...
+}
+```
+
+The `ImGuiTexture` RAII wrapper handles this automatically by returning `nullptr` from `GetID()` when generation changes.
+
+#### Safety Notes
+
+- **Always check return values**: `GetTextureID()` can return `nullptr` if device is lost
+- **Store source data**: The service keeps a copy, but you may want to keep your own for modification
+- **RGBA32 format**: Pixel data must be in RGBA32 format (4 bytes per pixel: R, G, B, A)
+- **Thread safety**: Not thread-safe - call from render thread only
+- **Lifetime**: Release textures before unregistering panels or shutting down
+- **Generation mismatch**: Handles from old device generations return `nullptr` from `GetTextureID()`
+
+#### Performance Considerations
+
+- **Video memory preferred**: Set `useSystemMemory = false` for better performance (default)
+- **Automatic fallback**: Service falls back to system memory if video memory is exhausted
+- **On-demand recreation**: Surfaces are recreated lazily when first accessed after device loss
+- **Minimal overhead**: Device loss detection uses existing cooperative level checks
+
+#### Error Handling
+
+The API is designed to fail gracefully:
+
+```cpp
+// Creation can fail - check handle
+ImGuiTextureHandle handle = service->CreateTexture(desc);
+if (handle.id == 0) {
+    LOG_ERROR("Texture creation failed");
+    return;
+}
+
+// GetTextureID returns nullptr on failure
+void* texId = service->GetTextureID(handle);
+if (!texId) {
+    // Device lost, generation mismatch, or surface recreation failed
+    // Check IsTextureValid() to distinguish:
+    if (!service->IsTextureValid(handle)) {
+        // Handle is stale (generation mismatch)
+        // Need to create new texture
+    }
+}
+```
+
+See `src/sample/ImGuiTextureSample.cpp` for a complete working example.
+
 ### DX7 interface access
 
-If you need DirectX 7 interfaces (e.g., to create textures for `ImGui::Image`),
-use `cIGZImGuiService::AcquireD3DInterfaces`. The service AddRef()s both
+**Note**: For texture creation, prefer using the [Safe Texture Management API](#safe-texture-management) instead of manually managing DirectDraw surfaces. The texture API handles device loss automatically.
+
+If you need DirectX 7 interfaces for advanced use cases, use `cIGZImGuiService::AcquireD3DInterfaces`. The service AddRef()s both
 interfaces; callers must Release() them when done. Prefer acquiring per
 operation/frame rather than caching across frames. Use
-`IsDeviceReady()` and `GetDeviceGeneration()` to detect when cached textures
+`IsDeviceReady()` and `GetDeviceGeneration()` to detect when cached resources
 must be recreated.
 
 Example:
