@@ -17,11 +17,17 @@
 namespace {
     // Generate a simple test pattern (checkerboard)
     std::vector<uint8_t> GenerateTestPattern(uint32_t width, uint32_t height) {
-        std::vector<uint8_t> pixels(width * height * 4);  // RGBA32
+        // Prevent integer overflow
+        const size_t pixelCount = static_cast<size_t>(width) * height;
+        if (pixelCount > SIZE_MAX / 4) {
+            return {};  // Return empty vector on overflow
+        }
+        
+        std::vector<uint8_t> pixels(pixelCount * 4);  // RGBA32
         
         for (uint32_t y = 0; y < height; ++y) {
             for (uint32_t x = 0; x < width; ++x) {
-                const size_t offset = (y * width + x) * 4;
+                const size_t offset = (static_cast<size_t>(y) * width + x) * 4;
                 const bool isWhite = ((x / 16) + (y / 16)) % 2 == 0;
                 
                 if (isWhite) {
@@ -67,13 +73,13 @@ namespace {
         auto pattern1 = GenerateTestPattern(128, 128);
         auto pattern2 = GenerateTestPattern(64, 64);
         
-        if (sampleData->texture1.Create(sampleData->service, 128, 128, pattern1.data())) {
+        if (!pattern1.empty() && sampleData->texture1.Create(sampleData->service, 128, 128, pattern1.data())) {
             LOG_INFO("ImGuiTextureSample: Created texture1 (128x128)");
         } else {
             LOG_ERROR("ImGuiTextureSample: Failed to create texture1");
         }
         
-        if (sampleData->texture2.Create(sampleData->service, 64, 64, pattern2.data())) {
+        if (!pattern2.empty() && sampleData->texture2.Create(sampleData->service, 64, 64, pattern2.data())) {
             LOG_INFO("ImGuiTextureSample: Created texture2 (64x64)");
         } else {
             LOG_ERROR("ImGuiTextureSample: Failed to create texture2");

@@ -3,6 +3,7 @@
 #include "ImGuiService.h"
 
 #include <algorithm>
+#include <ranges>
 #include <ddraw.h>
 
 #include "cIGZFrameWorkW32.h"
@@ -509,6 +510,21 @@ ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
         return ImGuiTextureHandle{0, 0};
     }
 
+    // Check for potential integer overflow in size calculation
+    // Maximum safe size is SIZE_MAX / 4 to account for 4 bytes per pixel
+    constexpr size_t maxDimension = SIZE_MAX / 4;
+    if (desc.width > maxDimension || desc.height > maxDimension) {
+        LOG_ERROR("ImGuiService::CreateTexture: dimensions too large (width={}, height={})",
+            desc.width, desc.height);
+        return ImGuiTextureHandle{0, 0};
+    }
+
+    const size_t pixelCount = static_cast<size_t>(desc.width) * desc.height;
+    if (pixelCount > maxDimension) {
+        LOG_ERROR("ImGuiService::CreateTexture: texture too large ({} pixels)", pixelCount);
+        return ImGuiTextureHandle{0, 0};
+    }
+
     if (!IsDeviceReady()) {
         LOG_WARN("ImGuiService::CreateTexture: device not ready, texture will be created on-demand");
     }
@@ -524,7 +540,7 @@ ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
     tex.needsRecreation = false;
 
     // Store source pixel data for recreation after device loss
-    const size_t dataSize = static_cast<size_t>(desc.width) * desc.height * 4;  // RGBA32
+    const size_t dataSize = pixelCount * 4;  // RGBA32
     tex.sourceData.resize(dataSize);
     std::memcpy(tex.sourceData.data(), desc.pixels, dataSize);
 
@@ -538,11 +554,12 @@ ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
         tex.needsRecreation = true;
     }
 
+    const uint32_t textureId = tex.id;
     textures_.push_back(std::move(tex));
     LOG_INFO("ImGuiService::CreateTexture: created texture id={} ({}x{}, gen={})",
-        tex.id, desc.width, desc.height, deviceGeneration_);
+        textureId, desc.width, desc.height, deviceGeneration_);
 
-    return ImGuiTextureHandle{tex.id, deviceGeneration_};
+    return ImGuiTextureHandle{textureId, deviceGeneration_};
 }
 
 bool ImGuiService::CreateSurfaceForTexture_(ManagedTexture& tex) {
