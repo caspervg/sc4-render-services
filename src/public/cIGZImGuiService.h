@@ -72,17 +72,21 @@ public:
     // Creates a managed texture from RGBA32 pixel data.
     // The service stores source data for automatic recreation after device loss.
     // Returns a handle with the current device generation.
+    // Thread safety: Must be called from the render thread only.
     virtual ImGuiTextureHandle CreateTexture(const ImGuiTextureDesc& desc) = 0;
 
     // Gets a texture ID for use with ImGui::Image().
     // Returns nullptr if handle is invalid or from a stale device generation.
     // The texture surface is recreated on-demand if device was lost.
+    // Thread safety: Must be called from the render thread only.
     [[nodiscard]] virtual void* GetTextureID(ImGuiTextureHandle handle) = 0;
 
     // Releases a texture and frees associated resources.
     // Safe to call with invalid handles (no-op).
+    // Thread safety: Must be called from the render thread only.
     virtual void ReleaseTexture(ImGuiTextureHandle handle) = 0;
 
     // Checks if a texture handle is valid and matches the current device generation.
+    // Thread safety: Must be called from the render thread only.
     [[nodiscard]] virtual bool IsTextureValid(ImGuiTextureHandle handle) const = 0;
 };

@@ -5,6 +5,8 @@
 // RAII wrapper for automatic texture lifetime management with device generation tracking.
 // This class provides automatic cleanup and device loss handling for ImGui textures.
 //
+// Thread safety: Not thread-safe. Must be used from the render thread only.
+//
 // Example usage:
 //   ImGuiTexture myTexture;
 //   myTexture.Create(service, width, height, pixelData);
