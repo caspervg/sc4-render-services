@@ -774,7 +774,8 @@ void* ImGuiService::GetTextureID(ImGuiTextureHandle handle) {
     }
 
     // Validate surface is not lost
-    // IsLost() returns DD_OK (S_OK) if surface is valid, DDERR_SURFACELOST if lost
+    // IsLost() returns DD_OK (S_OK) if surface is valid, DDERR_SURFACELOST if lost; other return values
+    // (including unexpected error codes) are not explicitly handled here and are treated as a valid surface.
     if (tex.surface) {
         HRESULT hr = tex.surface->IsLost();
         if (hr == DDERR_SURFACELOST) {
