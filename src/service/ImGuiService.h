@@ -4,6 +4,8 @@
 #include <d3d.h>
 #include <vector>
 #include <Windows.h>
+#include <atomic>
+#include <mutex>
 
 #include "cRZBaseSystemService.h"
 #include "public/cIGZImGuiService.h"
@@ -88,7 +90,10 @@ private:
 
 private:
     std::vector<PanelEntry> panels_;
+    mutable std::mutex panelsMutex_;
+
     std::vector<ManagedTexture> textures_;
+    mutable std::mutex texturesMutex_;
 
     HWND gameWindow_;
     WNDPROC originalWndProc_;
@@ -98,6 +103,6 @@ private:
     bool warnedNoDriver_;
     bool warnedMissingWindow_;
     bool deviceLost_;
-    uint32_t deviceGeneration_;
+    std::atomic<uint32_t> deviceGeneration_;
     uint32_t nextTextureId_;
 };

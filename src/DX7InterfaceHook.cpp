@@ -5,20 +5,37 @@
 #include "imgui_impl_dx7.h"
 #include "imgui_impl_win32.h"
 
+#include <atomic>
+#include <Windows.h>
+
 namespace {
     constexpr size_t kEndSceneVTableIndex = 6;
 }
 
-static DX7InterfaceHook::FrameCallback s_FrameCallback = nullptr;
-static IDirect3DDevice7* s_HookedDevice = nullptr;
-static HRESULT (STDMETHODCALLTYPE* s_OriginalEndScene)(IDirect3DDevice7*) = nullptr;
+static std::atomic<DX7InterfaceHook::FrameCallback> s_FrameCallback{nullptr};
+static std::atomic<IDirect3DDevice7*> s_HookedDevice{nullptr};
+static std::atomic<HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice7*)> s_OriginalEndScene{nullptr};
 
 static HRESULT STDMETHODCALLTYPE EndSceneHook(IDirect3DDevice7* device)
 {
-    if (s_FrameCallback) {
-        s_FrameCallback(device);
+    auto* d3dx = DX7InterfaceHook::s_pD3DX.load(std::memory_order_acquire);
+    auto* d3d = d3dx ? d3dx->GetD3DDevice() : nullptr;
+    auto* dd = d3dx ? d3dx->GetDD() : nullptr;
+
+    if (d3dx && (!d3d || !dd)) {
+        LOG_WARN("EndSceneHook: D3DX interface not ready (d3dx={}, d3d={}, dd={}), clearing",
+            static_cast<void*>(d3dx),
+            static_cast<void*>(d3d),
+            static_cast<void*>(dd));
+        DX7InterfaceHook::s_pD3DX.store(nullptr, std::memory_order_release);
     }
-    return s_OriginalEndScene ? s_OriginalEndScene(device) : S_OK;
+
+    auto callback = s_FrameCallback.load(std::memory_order_acquire);
+    if (callback) {
+        callback(device);
+    }
+    auto originalEndScene = s_OriginalEndScene.load(std::memory_order_acquire);
+    return originalEndScene ? originalEndScene(device) : S_OK;
 }
 
 bool DX7InterfaceHook::CaptureInterface(cIGZGDriver* pDriver)
@@ -43,18 +60,26 @@ bool DX7InterfaceHook::CaptureInterface(cIGZGDriver* pDriver)
     if (!candidate) {
         LOG_ERROR("DX7InterfaceHook::CaptureInterface: D3DX pointer null at offset 0x24C");
     }
+    if (candidate && (!candidate->GetD3DDevice() || !candidate->GetDD())) {
+        LOG_WARN("DX7InterfaceHook::CaptureInterface: D3DX interface not ready yet (d3dx={}, d3d={}, dd={})",
+            static_cast<void*>(candidate),
+            static_cast<void*>(candidate->GetD3DDevice()),
+            static_cast<void*>(candidate->GetDD()));
+        candidate = nullptr;
+    }
 
-    s_pD3DX = candidate;
-    return s_pD3DX != nullptr;
+    s_pD3DX.store(candidate, std::memory_order_release);
+    return candidate != nullptr;
 }
 
 bool DX7InterfaceHook::InitializeImGui(const HWND hwnd)
 {
-    if (!s_pD3DX || !hwnd || !IsWindow(hwnd)) {
-        LOG_ERROR("DX7InterfaceHook::InitializeImGui: invalid inputs (hwnd={}, is_window={}, s_pD3DX={})",
+    auto* d3dx = s_pD3DX.load(std::memory_order_acquire);
+    if (!d3dx || !hwnd || !IsWindow(hwnd)) {
+        LOG_ERROR("DX7InterfaceHook::InitializeImGui: invalid inputs (hwnd={}, is_window={}, d3dx={})",
             static_cast<void*>(hwnd),
             hwnd ? IsWindow(hwnd) : false,
-            static_cast<void*>(s_pD3DX));
+            static_cast<void*>(d3dx));
         return false;
     }
 
@@ -67,8 +92,8 @@ bool DX7InterfaceHook::InitializeImGui(const HWND hwnd)
 
     ImGui_ImplWin32_Init(hwnd);
 
-    auto* d3dDevice = s_pD3DX->GetD3DDevice();
-    auto* dd = s_pD3DX->GetDD();
+    auto* d3dDevice = d3dx->GetD3DDevice();
+    auto* dd = d3dx->GetDD();
     if (!d3dDevice || !dd) {
         LOG_ERROR("DX7InterfaceHook::InitializeImGui: D3D interfaces not ready (device={}, dd={})",
             static_cast<void*>(d3dDevice),
@@ -83,12 +108,13 @@ bool DX7InterfaceHook::InitializeImGui(const HWND hwnd)
 
 bool DX7InterfaceHook::InstallSceneHooks()
 {
-    if (!s_pD3DX) {
+    auto* d3dx = s_pD3DX.load(std::memory_order_acquire);
+    if (!d3dx) {
         LOG_ERROR("DX7InterfaceHook::InstallSceneHooks: D3DX interface not captured");
         return false;
     }
 
-    IDirect3DDevice7* device = s_pD3DX->GetD3DDevice();
+    IDirect3DDevice7* device = d3dx->GetD3DDevice();
     if (!device) {
         LOG_ERROR("DX7InterfaceHook::InstallSceneHooks: D3D device is null");
         return false;
@@ -100,12 +126,15 @@ bool DX7InterfaceHook::InstallSceneHooks()
         return false;
     }
 
-    if (s_HookedDevice == device && s_OriginalEndScene) {
+    auto hookedDevice = s_HookedDevice.load(std::memory_order_acquire);
+    auto origEndScene = s_OriginalEndScene.load(std::memory_order_acquire);
+    if (hookedDevice == device && origEndScene) {
         return true;
     }
 
-    s_OriginalEndScene = reinterpret_cast<decltype(s_OriginalEndScene)>(vtable[kEndSceneVTableIndex]);
-    if (!s_OriginalEndScene) {
+    auto* originalFunc = reinterpret_cast<HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice7*)>(
+        vtable[kEndSceneVTableIndex]);
+    if (!originalFunc) {
         LOG_ERROR("DX7InterfaceHook::InstallSceneHooks: original EndScene is null");
         return false;
     }
@@ -116,8 +145,17 @@ bool DX7InterfaceHook::InstallSceneHooks()
         return false;
     }
 
-    s_HookedDevice = device;
-    vtable[kEndSceneVTableIndex] = reinterpret_cast<void*>(&EndSceneHook);
+    // Store original function atomically before modifying vtable
+    s_OriginalEndScene.store(originalFunc, std::memory_order_release);
+
+    // Atomically swap the vtable entry using InterlockedExchange
+    void* hookFunc = reinterpret_cast<void*>(&EndSceneHook);
+    InterlockedExchange(reinterpret_cast<LONG*>(&vtable[kEndSceneVTableIndex]),
+                       reinterpret_cast<LONG>(hookFunc));
+
+    // Store hooked device atomically
+    s_HookedDevice.store(device, std::memory_order_release);
+
     VirtualProtect(&vtable[kEndSceneVTableIndex], sizeof(void*), oldProtect, &oldProtect);
     LOG_INFO("DX7InterfaceHook::InstallSceneHooks: hooked EndScene at index {}", kEndSceneVTableIndex);
     return true;
@@ -125,17 +163,27 @@ bool DX7InterfaceHook::InstallSceneHooks()
 
 void DX7InterfaceHook::SetFrameCallback(const FrameCallback callback)
 {
-    s_FrameCallback = callback;
+    s_FrameCallback.store(callback, std::memory_order_release);
+}
+
+cISGLDX7D3DX* DX7InterfaceHook::GetD3DXInterface()
+{
+    return s_pD3DX.load(std::memory_order_acquire);
 }
 
 void DX7InterfaceHook::ShutdownImGui()
 {
-    if (s_HookedDevice && s_OriginalEndScene) {
-        void** vtable = *reinterpret_cast<void***>(s_HookedDevice);
+    auto hookedDevice = s_HookedDevice.load(std::memory_order_acquire);
+    auto origEndScene = s_OriginalEndScene.load(std::memory_order_acquire);
+
+    if (hookedDevice && origEndScene) {
+        void** vtable = *reinterpret_cast<void***>(hookedDevice);
         if (vtable) {
             DWORD oldProtect = 0;
             if (VirtualProtect(&vtable[kEndSceneVTableIndex], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                vtable[kEndSceneVTableIndex] = reinterpret_cast<void*>(s_OriginalEndScene);
+                // Restore original function atomically
+                InterlockedExchange(reinterpret_cast<LONG*>(&vtable[kEndSceneVTableIndex]),
+                                   reinterpret_cast<LONG>(origEndScene));
                 VirtualProtect(&vtable[kEndSceneVTableIndex], sizeof(void*), oldProtect, &oldProtect);
             }
         }
@@ -143,11 +191,11 @@ void DX7InterfaceHook::ShutdownImGui()
     ImGui_ImplDX7_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
-    s_FrameCallback = nullptr;
-    s_OriginalEndScene = nullptr;
-    s_HookedDevice = nullptr;
-    s_pD3DX = nullptr;
+    s_FrameCallback.store(nullptr, std::memory_order_release);
+    s_OriginalEndScene.store(nullptr, std::memory_order_release);
+    s_HookedDevice.store(nullptr, std::memory_order_release);
+    s_pD3DX.store(nullptr, std::memory_order_release);
 }
 
 // Static member definitions
-cISGLDX7D3DX* DX7InterfaceHook::s_pD3DX = nullptr;
+std::atomic<cISGLDX7D3DX*> DX7InterfaceHook::s_pD3DX{nullptr};

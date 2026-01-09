@@ -1,5 +1,6 @@
 #pragma once
 #include <Windows.h>
+#include <atomic>
 #include "cIGZGDriver.h"
 #include "cISGLDX7D3DX.h"
 
@@ -13,5 +14,6 @@ public:
     static bool InstallSceneHooks();
     static void SetFrameCallback(FrameCallback callback);
     static void ShutdownImGui();
-    static cISGLDX7D3DX* s_pD3DX;
+    static cISGLDX7D3DX* GetD3DXInterface();
+    static std::atomic<cISGLDX7D3DX*> s_pD3DX;
 };

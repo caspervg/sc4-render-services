@@ -47,9 +47,9 @@ void Logger::Initialize(const std::string& logName, const std::string& userDir) 
         }
 
         s_logger = std::make_shared<spdlog::logger>(s_logName, sinks.begin(), sinks.end());
-        s_logger->set_level(spdlog::level::info);
+        s_logger->set_level(spdlog::level::debug);
         s_logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] [%l] %v");
-        s_logger->flush_on(spdlog::level::info);
+        s_logger->flush_on(spdlog::level::debug);
 
         s_initialized = true;
 
@@ -63,7 +63,7 @@ void Logger::Initialize(const std::string& logName, const std::string& userDir) 
         // Fallback to console-only logging if file creation fails
         auto consoleSink = std::make_shared<spdlog::sinks::msvc_sink_mt>();
         s_logger = std::make_shared<spdlog::logger>(s_logName, consoleSink);
-        s_logger->set_level(spdlog::level::info);
+        s_logger->set_level(spdlog::level::debug);
         s_logger->error("Failed to initialize file logging: {}", e.what());
         s_initialized = true;
     }

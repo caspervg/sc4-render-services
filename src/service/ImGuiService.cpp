@@ -6,6 +6,7 @@
 #include <ranges>
 #include <ddraw.h>
 #include <winerror.h>
+#include <atomic>
 
 #include "cIGZFrameWorkW32.h"
 #include "cIGZGraphicSystem2.h"
@@ -19,7 +20,8 @@
 #include "utils/Logger.h"
 
 namespace {
-    ImGuiService* g_instance = nullptr;
+    std::atomic<ImGuiService*> g_instance{nullptr};
+    std::atomic<DWORD> g_renderThreadId{0};
 
     struct Dx7ImGuiStateRestore {
         IDirect3DDevice7* device;
@@ -104,9 +106,8 @@ ImGuiService::ImGuiService()
     , nextTextureId_(1) {}
 
 ImGuiService::~ImGuiService() {
-    if (g_instance == this) {
-        g_instance = nullptr;
-    }
+    ImGuiService* expected = this;
+    g_instance.compare_exchange_strong(expected, nullptr, std::memory_order_release);
 }
 
 uint32_t ImGuiService::AddRef() {
@@ -136,7 +137,7 @@ bool ImGuiService::Init() {
     LOG_INFO("ImGuiService: initialized");
     SetServiceRunning(true);
     initialized_ = true;
-    g_instance = this;
+    g_instance.store(this, std::memory_order_release);
     return true;
 }
 
@@ -145,21 +146,27 @@ bool ImGuiService::Shutdown() {
         return true;
     }
 
-    for (const auto& panel : panels_) {
-        if (panel.desc.on_shutdown) {
-            panel.desc.on_shutdown(panel.desc.data);
+    {
+        std::lock_guard panelLock(panelsMutex_);
+        for (const auto& panel : panels_) {
+            if (panel.desc.on_shutdown) {
+                panel.desc.on_shutdown(panel.desc.data);
+            }
         }
+        panels_.clear();
     }
-    panels_.clear();
 
     // Clean up all textures before shutting down ImGui
-    for (auto& texture : textures_) {
-        if (texture.surface) {
-            texture.surface->Release();
-            texture.surface = nullptr;
+    {
+        std::lock_guard textureLock(texturesMutex_);
+        for (auto& texture : textures_) {
+            if (texture.surface) {
+                texture.surface->Release();
+                texture.surface = nullptr;
+            }
         }
+        textures_.clear();
     }
-    textures_.clear();
 
     RemoveWndProcHook_();
     DX7InterfaceHook::SetFrameCallback(nullptr);
@@ -167,7 +174,7 @@ bool ImGuiService::Shutdown() {
 
     imguiInitialized_ = false;
     hookInstalled_ = false;
-    deviceGeneration_ += 1;
+    deviceGeneration_.fetch_add(1, std::memory_order_release);
     SetServiceRunning(false);
     initialized_ = false;
     return true;
@@ -206,24 +213,29 @@ bool ImGuiService::RegisterPanel(const ImGuiPanelDesc& desc) {
         return false;
     }
 
-    const auto it = std::ranges::find_if(panels_, [&](const PanelEntry& entry) {
-        return entry.desc.id == desc.id;
-    });
-    if (it != panels_.end()) {
-        LOG_WARN("ImGuiService: rejected panel {} (duplicate id)", desc.id);
-        return false;
+    {
+        std::lock_guard lock(panelsMutex_);
+        const auto it = std::ranges::find_if(panels_, [&](const PanelEntry& entry) {
+            return entry.desc.id == desc.id;
+        });
+        if (it != panels_.end()) {
+            LOG_WARN("ImGuiService: rejected panel {} (duplicate id)", desc.id);
+            return false;
+        }
+
+        panels_.push_back(PanelEntry{desc, false});
+        SortPanels_();
     }
 
-    panels_.push_back(PanelEntry{desc, false});
     if (imguiInitialized_) {
         InitializePanels_();
     }
-    SortPanels_();
     LOG_INFO("ImGuiService: registered panel {} (order={})", desc.id, desc.order);
     return true;
 }
 
 bool ImGuiService::UnregisterPanel(uint32_t panelId) {
+    std::lock_guard lock(panelsMutex_);
     const auto it = std::ranges::find_if(panels_, [&](const PanelEntry& entry) {
         return entry.desc.id == panelId;
     });
@@ -242,6 +254,7 @@ bool ImGuiService::UnregisterPanel(uint32_t panelId) {
 }
 
 bool ImGuiService::SetPanelVisible(const uint32_t panelId, const bool visible) {
+    std::lock_guard lock(panelsMutex_);
     const auto it = std::ranges::find_if(panels_, [&](const PanelEntry& entry) {
         return entry.desc.id == panelId;
     });
@@ -261,12 +274,17 @@ bool ImGuiService::SetPanelVisible(const uint32_t panelId, const bool visible) {
 }
 
 bool ImGuiService::AcquireD3DInterfaces(IDirect3DDevice7** outD3D, IDirectDraw7** outDD) {
-    if (!outD3D || !outDD || !DX7InterfaceHook::s_pD3DX) {
+    if (!outD3D || !outDD) {
         return false;
     }
 
-    auto* d3d = DX7InterfaceHook::s_pD3DX->GetD3DDevice();
-    auto* dd = DX7InterfaceHook::s_pD3DX->GetDD();
+    auto* d3dx = DX7InterfaceHook::GetD3DXInterface();
+    if (!d3dx) {
+        return false;
+    }
+
+    auto* d3d = d3dx->GetD3DDevice();
+    auto* dd = d3dx->GetDD();
     if (!d3d || !dd) {
         return false;
     }
@@ -279,26 +297,49 @@ bool ImGuiService::AcquireD3DInterfaces(IDirect3DDevice7** outD3D, IDirectDraw7*
 }
 
 bool ImGuiService::IsDeviceReady() const {
-    return imguiInitialized_ && DX7InterfaceHook::s_pD3DX && DX7InterfaceHook::s_pD3DX->GetD3DDevice() &&
-        DX7InterfaceHook::s_pD3DX->GetDD();
+    if (!imguiInitialized_) {
+        return false;
+    }
+    auto* d3dx = DX7InterfaceHook::GetD3DXInterface();
+    return d3dx && d3dx->GetD3DDevice() && d3dx->GetDD();
 }
 
 uint32_t ImGuiService::GetDeviceGeneration() const {
-    return deviceGeneration_;
+    return deviceGeneration_.load(std::memory_order_acquire);
 }
 
 void ImGuiService::RenderFrameThunk_(IDirect3DDevice7* device) {
-    if (g_instance) {
-        g_instance->RenderFrame_(device);
+    auto* instance = g_instance.load(std::memory_order_acquire);
+    if (instance) {
+        instance->RenderFrame_(device);
     }
 }
 
 void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
     static auto loggedFirstRender = false;
-    if (!imguiInitialized_ || panels_.empty()) {
+    const DWORD threadId = GetCurrentThreadId();
+    const DWORD prevThreadId = g_renderThreadId.load(std::memory_order_acquire);
+    if (prevThreadId == 0) {
+        g_renderThreadId.store(threadId, std::memory_order_release);
+        LOG_DEBUG("ImGuiService::RenderFrame_: render thread id set to {}", threadId);
+    } else if (prevThreadId != threadId) {
+        LOG_WARN("ImGuiService::RenderFrame_: render thread id changed ({} -> {})",
+            prevThreadId, threadId);
+        g_renderThreadId.store(threadId, std::memory_order_release);
+    }
+    if (!imguiInitialized_) {
         return;
     }
-    if (!DX7InterfaceHook::s_pD3DX || device != DX7InterfaceHook::s_pD3DX->GetD3DDevice()) {
+
+    {
+        std::lock_guard lock(panelsMutex_);
+        if (panels_.empty()) {
+            return;
+        }
+    }
+
+    auto* d3dx = DX7InterfaceHook::GetD3DXInterface();
+    if (!d3dx || device != d3dx->GetD3DDevice()) {
         return;
     }
     if (!ImGui::GetCurrentContext()) {
@@ -307,7 +348,7 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
 
     InitializePanels_();
 
-    auto* dd = DX7InterfaceHook::s_pD3DX->GetDD();
+    auto* dd = d3dx->GetDD();
     if (!dd) {
         return;
     }
@@ -323,33 +364,37 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
         OnDeviceRestored_();
     }
 
-    ImGui_ImplDX7_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    ImGui_ImplDX7_NewFrame();
     ImGui::NewFrame();
 
-    for (auto& panel : panels_) {
-        if (panel.desc.visible && panel.desc.on_update) {
-            panel.desc.on_update(panel.desc.data);
+    {
+        std::lock_guard lock(panelsMutex_);
+        for (auto& panel : panels_) {
+            if (panel.desc.visible && panel.desc.on_update) {
+                panel.desc.on_update(panel.desc.data);
+            }
         }
-    }
 
-    for (auto& panel : panels_) {
-        if (panel.desc.visible && panel.desc.on_render) {
-            panel.desc.on_render(panel.desc.data);
+        for (auto& panel : panels_) {
+            if (panel.desc.visible && panel.desc.on_render) {
+                panel.desc.on_render(panel.desc.data);
+            }
         }
     }
 
     // Preserve game render state that we override for ImGui's draw pass.
     Dx7ImGuiStateRestore stateRestore(device);
 
-    // Reset texture coordinate generation/transform state that can be left     
-    // dirty by the game and cause garbled font sampling by the ImGui backend.  
+    // Reset texture coordinate generation/transform state that can be left
+    // dirty by the game and cause garbled font sampling by the ImGui backend.
     device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
     device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
     device->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 0);
     device->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
     device->SetRenderState(D3DRENDERSTATE_ALPHATESTENABLE, FALSE);
 
+    ImGui::EndFrame();
     ImGui::Render();
     ImGui_ImplDX7_RenderDrawData(ImGui::GetDrawData());
 
@@ -390,6 +435,14 @@ bool ImGuiService::EnsureInitialized_() {
         LOG_ERROR("ImGuiService: failed to capture D3DX interface");
         return false;
     }
+    auto* d3dx = DX7InterfaceHook::GetD3DXInterface();
+    if (!d3dx || !d3dx->GetD3DDevice() || !d3dx->GetDD()) {
+        LOG_WARN("ImGuiService: D3DX interface not ready yet (d3dx={}, d3d={}, dd={})",
+            static_cast<void*>(d3dx),
+            static_cast<void*>(d3dx ? d3dx->GetD3DDevice() : nullptr),
+            static_cast<void*>(d3dx ? d3dx->GetDD() : nullptr));
+        return false;
+    }
 
     cRZAutoRefCount<cIGZFrameWorkW32> pFrameworkW32;
     if (!RZGetFrameWork()->QueryInterface(GZIID_cIGZFrameWorkW32, pFrameworkW32.AsPPVoid())) {
@@ -414,7 +467,7 @@ bool ImGuiService::EnsureInitialized_() {
     }
 
     imguiInitialized_ = true;
-    deviceGeneration_ += 1;
+    deviceGeneration_.fetch_add(1, std::memory_order_release);
     warnedNoDriver_ = false;
     warnedMissingWindow_ = false;
 
@@ -495,15 +548,24 @@ LRESULT CALLBACK ImGuiService::WndProcHook(HWND hWnd, UINT msg, WPARAM wParam, L
         }
     }
 
-    if (!g_instance || !g_instance->originalWndProc_) {
+    auto* instance = g_instance.load(std::memory_order_acquire);
+    if (!instance || !instance->originalWndProc_) {
         return DefWindowProcW(hWnd, msg, wParam, lParam);
     }
-    return CallWindowProcW(g_instance->originalWndProc_, hWnd, msg, wParam, lParam);
+    return CallWindowProcW(instance->originalWndProc_, hWnd, msg, wParam, lParam);
 }
 
 // Texture management implementation
 
-ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
+ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {  
+    const DWORD threadId = GetCurrentThreadId();
+    const DWORD renderThreadId = g_renderThreadId.load(std::memory_order_acquire);
+    if (renderThreadId != 0 && renderThreadId != threadId) {
+        LOG_WARN("ImGuiService::CreateTexture: called off render thread (tid={}, render_tid={})",
+            threadId, renderThreadId);
+    } else {
+        LOG_DEBUG("ImGuiService::CreateTexture: thread id {}", threadId);
+    }
     // Validate parameters
     if (desc.width == 0 || desc.height == 0 || !desc.pixels) {
         LOG_ERROR("ImGuiService::CreateTexture: invalid parameters (width={}, height={}, pixels={})",
@@ -520,7 +582,7 @@ ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
     }
 
     const size_t pixelCount = static_cast<size_t>(desc.width) * desc.height;
-    
+
     // Ensure pixelCount * 4 doesn't overflow when computing byte size
     if (pixelCount > SIZE_MAX / 4) {
         LOG_ERROR("ImGuiService::CreateTexture: texture too large ({} pixels)", pixelCount);
@@ -531,12 +593,14 @@ ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
         LOG_WARN("ImGuiService::CreateTexture: device not ready, texture will be created on-demand");
     }
 
+    uint32_t currentGen = deviceGeneration_.load(std::memory_order_acquire);
+
     // Create managed texture entry
     ManagedTexture tex;
     tex.id = nextTextureId_++;
     tex.width = desc.width;
     tex.height = desc.height;
-    tex.creationGeneration = deviceGeneration_;
+    tex.creationGeneration = currentGen;
     tex.useSystemMemory = desc.useSystemMemory;
     tex.surface = nullptr;
     tex.needsRecreation = false;
@@ -557,11 +621,16 @@ ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
     }
 
     const uint32_t textureId = tex.id;
-    textures_.push_back(std::move(tex));
-    LOG_INFO("ImGuiService::CreateTexture: created texture id={} ({}x{}, gen={})",
-        textureId, desc.width, desc.height, deviceGeneration_);
 
-    return ImGuiTextureHandle{textureId, deviceGeneration_};
+    {
+        std::lock_guard lock(texturesMutex_);
+        textures_.push_back(std::move(tex));
+    }
+
+    LOG_INFO("ImGuiService::CreateTexture: created texture id={} ({}x{}, gen={})",
+        textureId, desc.width, desc.height, currentGen);
+
+    return ImGuiTextureHandle{textureId, currentGen};
 }
 
 bool ImGuiService::CreateSurfaceForTexture_(ManagedTexture& tex) {
@@ -659,16 +728,18 @@ bool ImGuiService::CreateSurfaceForTexture_(ManagedTexture& tex) {
 
     tex.surface = surface;
     tex.needsRecreation = false;
-    tex.creationGeneration = deviceGeneration_;
+    uint32_t currentGen = deviceGeneration_.load(std::memory_order_acquire);
+    tex.creationGeneration = currentGen;
 
     LOG_INFO("ImGuiService::CreateSurfaceForTexture_: surface created successfully (id={}, gen={})",
-        tex.id, deviceGeneration_);
+        tex.id, currentGen);
     return true;
 }
 
 void* ImGuiService::GetTextureID(ImGuiTextureHandle handle) {
     // Check device generation first - return nullptr if mismatch
-    if (handle.generation != deviceGeneration_) {
+    uint32_t currentGen = deviceGeneration_.load(std::memory_order_acquire);
+    if (handle.generation != currentGen) {
         return nullptr;
     }
 
@@ -676,6 +747,8 @@ void* ImGuiService::GetTextureID(ImGuiTextureHandle handle) {
     if (deviceLost_) {
         return nullptr;
     }
+
+    std::lock_guard lock(texturesMutex_);
 
     // Find texture by ID
     auto it = std::ranges::find_if(textures_, [&](const ManagedTexture& tex) {
@@ -713,6 +786,8 @@ void* ImGuiService::GetTextureID(ImGuiTextureHandle handle) {
 }
 
 void ImGuiService::ReleaseTexture(ImGuiTextureHandle handle) {
+    std::lock_guard lock(texturesMutex_);
+
     auto it = std::ranges::find_if(textures_, [&](const ManagedTexture& tex) {
         return tex.id == handle.id;
     });
@@ -731,7 +806,8 @@ void ImGuiService::ReleaseTexture(ImGuiTextureHandle handle) {
 }
 
 bool ImGuiService::IsTextureValid(ImGuiTextureHandle handle) const {
-    if (handle.generation != deviceGeneration_) {
+    uint32_t currentGen = deviceGeneration_.load(std::memory_order_acquire);
+    if (handle.generation != currentGen) {
         return false;
     }
 
@@ -739,6 +815,7 @@ bool ImGuiService::IsTextureValid(ImGuiTextureHandle handle) const {
         return false;
     }
 
+    std::lock_guard lock(texturesMutex_);
     const auto it = std::ranges::find_if(textures_, [&](const ManagedTexture& tex) {
         return tex.id == handle.id;
     });
@@ -750,31 +827,38 @@ void ImGuiService::OnDeviceLost_() {
     deviceLost_ = true;
 
     // Invalidate all texture surfaces
-    for (auto& tex : textures_) {
-        if (tex.surface) {
-            tex.surface->Release();
-            tex.surface = nullptr;
+    {
+        std::lock_guard lock(texturesMutex_);
+        for (auto& tex : textures_) {
+            if (tex.surface) {
+                tex.surface->Release();
+                tex.surface = nullptr;
+            }
+            tex.needsRecreation = true;
         }
-        tex.needsRecreation = true;
     }
 
     ImGui_ImplDX7_InvalidateDeviceObjects();
 
-    LOG_WARN("ImGuiService::OnDeviceLost_: device lost, invalidated {} texture(s)", textures_.size());
+    {
+        std::lock_guard lock(texturesMutex_);
+        LOG_WARN("ImGuiService::OnDeviceLost_: device lost, invalidated {} texture(s)", textures_.size());
+    }
 }
 
 void ImGuiService::OnDeviceRestored_() {
     deviceLost_ = false;
 
     // Increment device generation to invalidate old handles
-    deviceGeneration_ += 1;
+    uint32_t newGen = deviceGeneration_.fetch_add(1, std::memory_order_release) + 1;
 
     ImGui_ImplDX7_CreateDeviceObjects();
 
-    LOG_INFO("ImGuiService::OnDeviceRestored_: device restored (new gen={}), textures will recreate on-demand", deviceGeneration_);
+    LOG_INFO("ImGuiService::OnDeviceRestored_: device restored (new gen={}), textures will recreate on-demand", newGen);
 }
 
 void ImGuiService::InvalidateAllTextures_() {
+    std::lock_guard lock(texturesMutex_);
     for (auto& tex : textures_) {
         if (tex.surface) {
             tex.surface->Release();
