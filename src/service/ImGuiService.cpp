@@ -159,7 +159,7 @@ bool ImGuiService::Shutdown() {
     // Clean up all textures before shutting down ImGui
     {
         std::lock_guard textureLock(texturesMutex_);
-        for (auto& texture : textures_) {
+        for (auto& [id, texture] : textures_) {
             if (texture.surface) {
                 texture.surface->Release();
                 texture.surface = nullptr;
@@ -628,7 +628,7 @@ ImGuiTextureHandle ImGuiService::CreateTexture(const ImGuiTextureDesc& desc) {
 
     {
         std::lock_guard lock(texturesMutex_);
-        textures_.push_back(std::move(tex));
+        textures_.emplace(textureId, std::move(tex));
     }
 
     LOG_INFO("ImGuiService::CreateTexture: created texture id={} ({}x{}, gen={})",
@@ -755,15 +755,13 @@ void* ImGuiService::GetTextureID(ImGuiTextureHandle handle) {
     std::lock_guard lock(texturesMutex_);
 
     // Find texture by ID
-    auto it = std::ranges::find_if(textures_, [&](const ManagedTexture& tex) {
-        return tex.id == handle.id;
-    });
+    auto it = textures_.find(handle.id);
 
     if (it == textures_.end()) {
         return nullptr;
     }
 
-    ManagedTexture& tex = *it;
+    ManagedTexture& tex = it->second;
 
     // Recreate surface if needed
     if (tex.needsRecreation || !tex.surface) {
@@ -793,17 +791,15 @@ void* ImGuiService::GetTextureID(ImGuiTextureHandle handle) {
 void ImGuiService::ReleaseTexture(ImGuiTextureHandle handle) {
     std::lock_guard lock(texturesMutex_);
 
-    auto it = std::ranges::find_if(textures_, [&](const ManagedTexture& tex) {
-        return tex.id == handle.id;
-    });
+    auto it = textures_.find(handle.id);
 
     if (it == textures_.end()) {
         return;
     }
 
-    if (it->surface) {
-        it->surface->Release();
-        it->surface = nullptr;
+    if (it->second.surface) {
+        it->second.surface->Release();
+        it->second.surface = nullptr;
     }
 
     LOG_INFO("ImGuiService::ReleaseTexture: released texture (id={})", handle.id);
@@ -821,11 +817,7 @@ bool ImGuiService::IsTextureValid(ImGuiTextureHandle handle) const {
     }
 
     std::lock_guard lock(texturesMutex_);
-    const auto it = std::ranges::find_if(textures_, [&](const ManagedTexture& tex) {
-        return tex.id == handle.id;
-    });
-
-    return it != textures_.end();
+    return textures_.find(handle.id) != textures_.end();
 }
 
 void ImGuiService::OnDeviceLost_() {
@@ -834,7 +826,7 @@ void ImGuiService::OnDeviceLost_() {
     // Invalidate all texture surfaces
     {
         std::lock_guard lock(texturesMutex_);
-        for (auto& tex : textures_) {
+        for (auto& [id, tex] : textures_) {
             if (tex.surface) {
                 tex.surface->Release();
                 tex.surface = nullptr;
@@ -864,7 +856,7 @@ void ImGuiService::OnDeviceRestored_() {
 
 void ImGuiService::InvalidateAllTextures_() {
     std::lock_guard lock(texturesMutex_);
-    for (auto& tex : textures_) {
+    for (auto& [id, tex] : textures_) {
         if (tex.surface) {
             tex.surface->Release();
             tex.surface = nullptr;

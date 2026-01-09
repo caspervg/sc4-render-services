@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <d3d.h>
+#include <unordered_map>
 #include <vector>
 #include <Windows.h>
 #include <atomic>
@@ -92,7 +93,7 @@ private:
     std::vector<PanelEntry> panels_;
     mutable std::mutex panelsMutex_;
 
-    std::vector<ManagedTexture> textures_;
+    std::unordered_map<uint32_t, ManagedTexture> textures_;  // Key: texture ID
     mutable std::mutex texturesMutex_;
 
     HWND gameWindow_;
