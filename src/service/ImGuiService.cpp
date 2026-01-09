@@ -355,11 +355,15 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
 
     // Check for device loss
     HRESULT hr = dd->TestCooperativeLevel();
-    if (FAILED(hr)) {
+    if (hr == DDERR_SURFACELOST || hr == DDERR_WRONGMODE) {
+        // Treat only explicit device loss conditions as device lost
         if (!deviceLost_) {
             OnDeviceLost_();
         }
         return;  // Skip rendering when device is lost
+    } else if (FAILED(hr)) {
+        // Non-device-loss failure: skip rendering but do not change deviceLost_ state
+        return;
     } else if (deviceLost_) {
         OnDeviceRestored_();
     }
