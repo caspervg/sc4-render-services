@@ -38,12 +38,13 @@ public:
     }
 
     bool PostAppShutdown() override {
+        service.Shutdown();
         if (mpFrameWork) {
+            mpFrameWork->RemoveHook(this);
             mpFrameWork->RemoveFromTick(&service);
             mpFrameWork->RemoveSystemService(&service);
             LOG_INFO("ImGuiServiceDirector: service unregistered");
         }
-        service.Shutdown();
         return true;
     }
 
