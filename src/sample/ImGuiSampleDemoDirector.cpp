@@ -94,6 +94,7 @@ public:
         desc.on_render = &RenderDemoPanel;
         desc.on_shutdown = &ShutdownSampleDemo;
         desc.data = state;
+        desc.fontId = 0;
 
         if (!service->RegisterPanel(desc)) {
             LOG_WARN("ImGuiSampleDemo: failed to register panel");

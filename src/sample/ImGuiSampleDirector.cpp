@@ -66,7 +66,7 @@ namespace {
         void OnUnregister() override
         {
             LOG_INFO("ImGuiSample: unregister callback");
-            delete this;
+            // Don't delete here - panel will be deleted in OnShutdown
         }
 
     private:
@@ -127,6 +127,7 @@ public:
 
         auto* panel = new SamplePanel();
         ImGuiPanelDesc desc = ImGuiPanelAdapter<SamplePanel>::MakeDesc(panel, kSamplePanelId, 100, true);
+        desc.fontId = 0;
 
         if (!service->RegisterPanel(desc)) {
             LOG_WARN("ImGuiSample: failed to register panel");

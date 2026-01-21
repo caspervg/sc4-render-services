@@ -373,21 +373,21 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
     ImGui::NewFrame();
 
     {
-        std::lock_guard lock(panelsMutex_);
+        std::lock_guard panelUpdateLock(panelsMutex_);
         for (auto& panel : panels_) {
             if (panel.desc.visible && panel.desc.on_update) {
                 panel.desc.on_update(panel.desc.data);
             }
         }
+    }
 
     {
-        std::lock_guard lock(panelsMutex_);
+        std::lock_guard panelRenderLock(panelsMutex_);
         for (auto& panel : panels_) {
             if (panel.desc.visible && panel.desc.on_render) {
                 // Push the panel's font if specified
                 if (panel.desc.fontId != 0) {
-                    auto* font = static_cast<ImFont*>(GetFont(panel.desc.fontId));
-                    if (font) {
+                    if (auto* font = static_cast<ImFont*>(GetFont(panel.desc.fontId))) {
                         ImGui::PushFont(font, 0.0f);  // 0.0f preserves current font size
                     }
                 }
@@ -396,14 +396,12 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
 
                 // Pop the font if we pushed one
                 if (panel.desc.fontId != 0) {
-                    auto* font = static_cast<ImFont*>(GetFont(panel.desc.fontId));
-                    if (font) {
+                    if (auto* font = static_cast<ImFont*>(GetFont(panel.desc.fontId))) {
                         ImGui::PopFont();
                     }
                 }
             }
         }
-    }
     }
 
     // Preserve game render state that we override for ImGui's draw pass.

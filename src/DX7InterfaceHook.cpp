@@ -95,9 +95,10 @@ bool DX7InterfaceHook::InitializeImGui(const HWND hwnd)
     fontConfig.OversampleH = 3;  // Horizontal oversampling for crisper text
     fontConfig.OversampleV = 3;  // Vertical oversampling for crisper text
     fontConfig.PixelSnapH = true;  // Snap to pixel grid for sharper rendering
+    fontConfig.GlyphExtraAdvanceX = 1.0f;
 
     // Load ProggyClean font
-    ImFont* font = io.Fonts->AddFontFromFileTTF(R"(C:\Users\caspe\Downloads\ProggyVector-Regular.ttf)", 16.0f, &fontConfig);
+    ImFont* font = io.Fonts->AddFontFromFileTTF(R"(C:\Users\caspe\Downloads\Stoclet_ITC_TT_Bold.ttf)", 16.0f, &fontConfig);
     if (font) {
         io.FontDefault = font;
         LOG_INFO("DX7InterfaceHook::InitializeImGui: loaded ProggyClean font (size=13)");

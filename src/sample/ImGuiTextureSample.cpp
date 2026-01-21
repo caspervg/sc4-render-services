@@ -222,6 +222,7 @@ public:
         desc.on_render = &OnRender;
         desc.on_shutdown = &OnShutdown;
         desc.data = sampleData;
+        desc.fontId = 0;
 
         if (!service->RegisterPanel(desc)) {
             LOG_ERROR("ImGuiTextureSample: failed to register panel");

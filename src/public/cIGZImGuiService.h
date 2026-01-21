@@ -4,17 +4,17 @@
 
 struct ImGuiPanelDesc
 {
-    uint32_t id;
-    int32_t order;
-    bool visible;
-    void (*on_init)(void* data);
-    void (*on_render)(void* data);
-    void (*on_update)(void* data);
-    void (*on_visible_changed)(void* data, bool visible);
-    void (*on_shutdown)(void* data);
-    void (*on_unregister)(void* data);
-    void* data;
-    uint32_t fontId;  // Font ID for this panel; 0 = use default font
+    uint32_t id{};
+    int32_t order{};
+    bool visible{};
+    void (*on_init)(void* data){};
+    void (*on_render)(void* data){};
+    void (*on_update)(void* data){};
+    void (*on_visible_changed)(void* data, bool visible){};
+    void (*on_shutdown)(void* data){};
+    void (*on_unregister)(void* data){};
+    void* data{};
+    uint32_t fontId{0};  // 0 = use default font
 };
 
 struct IDirectDraw7;

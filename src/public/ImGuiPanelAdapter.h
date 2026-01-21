@@ -39,8 +39,7 @@ struct ImGuiPanelAdapter
         static_cast<T*>(data)->OnUnregister();
     }
 
-    static ImGuiPanelDesc MakeDesc(T* instance, const uint32_t panelId, const int32_t order, const bool visible)
-    {
+    static ImGuiPanelDesc MakeDesc(T* instance, const uint32_t panelId, const int32_t order, const bool visible, const uint32_t fontId) {
         ImGuiPanelDesc desc{};
         desc.id = panelId;
         desc.order = order;
@@ -52,7 +51,13 @@ struct ImGuiPanelAdapter
         desc.on_shutdown = &OnShutdown;
         desc.on_unregister = &OnUnregister;
         desc.data = instance;
+        desc.fontId = fontId;
         return desc;
+    }
+
+    static ImGuiPanelDesc MakeDesc(T* instance, const uint32_t panelId, const int32_t order, const bool visible)
+    {
+        return MakeDesc(instance, panelId, order, visible, 0);
     }
 
     static ImGuiPanelDesc MakeDesc(T* instance, const uint32_t panelId, const int32_t order)
