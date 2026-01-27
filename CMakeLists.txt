@@ -267,8 +267,37 @@ set_target_properties(SC4ImGuiTextureSample PROPERTIES
 )
 
 
+# World Projection sample DLL
+set(WORLD_PROJECTION_SAMPLE_SOURCES
+        ${CMAKE_SOURCE_DIR}/src/sample/WorldProjectionSampleDirector.cpp
+        ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
+)
+
+add_library(SC4WorldProjectionSample SHARED ${WORLD_PROJECTION_SAMPLE_SOURCES} SC4WorldProjectionSample.def)
+
+target_include_directories(SC4WorldProjectionSample PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/service
+        ${IMGUI_DIR}
+)
+
+target_link_libraries(SC4WorldProjectionSample PRIVATE
+        imgui
+        gzcom2
+        spdlog
+)
+
+target_compile_definitions(SC4WorldProjectionSample PRIVATE IMGUI_DLL_IMPORT)
+
+set_target_properties(SC4WorldProjectionSample PROPERTIES
+        OUTPUT_NAME "SC4WorldProjectionSample"
+        SUFFIX ".dll"
+        PREFIX ""
+)
+
+
 add_custom_target(SC4ImGuiAllTargets
-        DEPENDS imgui SC4ImGuiService SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample
+        DEPENDS imgui SC4ImGuiService SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample
 )
 
 # Automatic deployment to SC4 directories
@@ -280,6 +309,7 @@ if(WIN32 AND NOT DEFINED ENV{CI})
             "C:/Program Files/Maxis/SimCity 4 Deluxe"
             "C:/Program Files (x86)/Steam/steamapps/common/SimCity 4 Deluxe"
             "C:/Program Files/Steam/steamapps/common/SimCity 4 Deluxe"
+            "C:/Program Files (x86)/GOG Galaxy/Games/SimCity 4 Deluxe Edition"
     )
 
     foreach(SC4_PATH ${SC4_INSTALL_PATHS})
@@ -344,6 +374,14 @@ if(WIN32 AND NOT DEFINED ENV{CI})
                 COMMENT "Deploying SC4ImGuiTextureSample.dll to Plugins folder"
         )
 
+        add_custom_command(TARGET SC4WorldProjectionSample POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${SC4_PLUGINS_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:SC4WorldProjectionSample>
+                "${SC4_PLUGINS_DIR}/"
+                COMMENT "Deploying SC4WorldProjectionSample.dll to Plugins folder"
+        )
+
         message(STATUS "Deployment targets configured:")
         message(STATUS "  - imgui.dll -> ${SC4_INSTALL_DIR}/Apps/")
         message(STATUS "  - SC4ImGuiService.dll -> ${SC4_PLUGINS_DIR}/")
@@ -351,6 +389,7 @@ if(WIN32 AND NOT DEFINED ENV{CI})
         message(STATUS "  - SC4ImGuiSampleCity.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4ImGuiSampleDemo.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4ImGuiTextureSample.dll -> ${SC4_PLUGINS_DIR}/")
+        message(STATUS "  - SC4WorldProjectionSample.dll -> ${SC4_PLUGINS_DIR}/")
     else()
         message(WARNING "SC4 installation not found. Manual deployment required.")
     endif()
