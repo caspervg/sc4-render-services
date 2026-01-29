@@ -14,18 +14,28 @@
 #include "public/ImGuiTexture.h"
 #include "public/cIGZImGuiService.h"
 #include "public/ImGuiServiceIds.h"
+#ifndef NOMINMAX
+#define NOMINMAX 1
+#endif
 #include "SC4UI.h"
 #include "utils/Logger.h"
-#include <windows.h>
+#define WIN32_LEAN_AND_MEAN
+#include <ddraw.h>
 #include <gdiplus.h>
 #include <cmath>
 #include <vector>
+#include <algorithm>
+#include <limits>
+#include <cstdio>
+
+#include "DX7InterfaceHook.h"
+#include "ImGuiService.h"
 
 namespace {
     constexpr auto kWorldProjectionSampleDirectorID = 0xB7E4F2A9;
     constexpr uint32_t kWorldProjectionPanelId = 0x3D9C8B1F;
     constexpr const wchar_t* kBillboardImagePath =
-        L"C:\\Users\\caspe\\CLionProjects\\sc4-imgui-service\\assets\\nam49.jpg";
+        L"C:\\Users\\caspe\\CLionProjects\\sc4-imgui-backend\\assets\\nam49.jpg";
     bool gGdiplusStarted = false;
     ULONG_PTR gGdiplusToken = 0;
 
@@ -70,6 +80,285 @@ namespace {
         bool imageLoaded = false;
         cIGZImGuiService* imguiService = nullptr;
     };
+
+    struct DepthDebugState {
+        cIGZImGuiService* imguiService = nullptr;
+        ImGuiTexture depthTexture;
+        ImGuiTexture maskedOverlayTexture;
+        std::vector<uint8_t> rgbaPixels;
+        std::vector<uint32_t> depthRaw;
+        std::vector<float> histogram;  // normalized 0..1 values, 256 bins
+        uint32_t texWidth = 0;
+        uint32_t texHeight = 0;
+        float minDepth = 0.0f;
+        float maxDepth = 0.0f;
+        bool lastCaptureOk = false;
+        char status[128] = "Idle";
+        bool autoRefresh = false;  // safer default
+        // Demo overlay settings
+        bool showMaskedOverlay = true;
+        float overlaySize = 96.0f;
+        float overlayBias = 80.0f; // depth units; tune to avoid z-fighting
+        ImVec4 overlayColor = ImVec4(0.2f, 0.8f, 1.0f, 1.0f);
+    };
+
+    struct WorldProjectionData {
+        GridConfig grid;
+        DepthDebugState depth;
+    };
+
+    float ClampFloat(float value, float minValue, float maxValue);
+
+    ImU32 DepthColorRamp(float t) {
+        // Blue -> Cyan -> Green -> Yellow -> Red
+        t = ClampFloat(t, 0.0f, 1.0f);
+        float r = 0.0f, g = 0.0f, b = 0.0f;
+        if (t < 0.25f) {
+            const float k = t / 0.25f;
+            r = 0.0f; g = k; b = 1.0f;
+        }
+        else if (t < 0.5f) {
+            const float k = (t - 0.25f) / 0.25f;
+            r = 0.0f; g = 1.0f; b = 1.0f - k;
+        }
+        else if (t < 0.75f) {
+            const float k = (t - 0.5f) / 0.25f;
+            r = k; g = 1.0f; b = 0.0f;
+        }
+        else {
+            const float k = (t - 0.75f) / 0.25f;
+            r = 1.0f; g = 1.0f - k; b = 0.0f;
+        }
+        return IM_COL32(static_cast<int>(r * 255.0f),
+                        static_cast<int>(g * 255.0f),
+                        static_cast<int>(b * 255.0f),
+                        255);
+    }
+
+    bool CaptureDepthBuffer(DepthDebugState& state) {
+        if (!state.imguiService || !state.imguiService->IsDeviceReady()) {
+            sprintf_s(state.status, "ImGui device not ready");
+            state.lastCaptureOk = false;
+            return false;
+        }
+
+        IDirect3DDevice7* device = nullptr;
+        IDirectDraw7* dd = nullptr;
+        if (!state.imguiService->AcquireD3DInterfaces(&device, &dd) || !device || !dd) {
+            sprintf_s(state.status, "D3D/Draw not ready");
+            if (device) device->Release();
+            if (dd) dd->Release();
+            state.lastCaptureOk = false;
+            return false;
+        }
+
+        const HRESULT coop = dd->TestCooperativeLevel();
+        if (coop == DDERR_SURFACELOST || coop == DDERR_WRONGMODE || coop == DDERR_EXCLUSIVEMODEALREADYSET) {
+            sprintf_s(state.status, "Device not ready (0x%08X)", static_cast<uint32_t>(coop));
+            device->Release();
+            dd->Release();
+            state.lastCaptureOk = false;
+            return false;
+        }
+
+        IDirectDrawSurface7* colorSurface = nullptr;
+        HRESULT hr = device->GetRenderTarget(&colorSurface);
+        if (FAILED(hr) || !colorSurface) {
+            sprintf_s(state.status, "GetRenderTarget failed (0x%08X)", static_cast<uint32_t>(hr));
+            if (colorSurface) colorSurface->Release();
+            device->Release();
+            dd->Release();
+            state.lastCaptureOk = false;
+            return false;
+        }
+
+        DDSCAPS2 caps{};
+        caps.dwCaps = DDSCAPS_ZBUFFER;
+        IDirectDrawSurface7* zBuffer = nullptr;
+        hr = colorSurface->GetAttachedSurface(&caps, &zBuffer);
+        colorSurface->Release();
+        if (FAILED(hr) || !zBuffer) {
+            sprintf_s(state.status, "GetAttachedSurface(Z) failed (0x%08X)", static_cast<uint32_t>(hr));
+            if (zBuffer) zBuffer->Release();
+            device->Release();
+            dd->Release();
+            state.lastCaptureOk = false;
+            return false;
+        }
+
+        DDSURFACEDESC2 desc{};
+        desc.dwSize = sizeof(desc);
+        HRESULT hr2 = zBuffer->Lock(nullptr, &desc, DDLOCK_READONLY | DDLOCK_WAIT, nullptr);
+        if (FAILED(hr2)) {
+            sprintf_s(state.status, "Lock failed (0x%08X)", static_cast<uint32_t>(hr2));
+            zBuffer->Release();
+            device->Release();
+            dd->Release();
+            state.lastCaptureOk = false;
+            return false;
+        }
+
+        const uint32_t width = desc.dwWidth;
+        const uint32_t height = desc.dwHeight;
+        const uint32_t bitDepth = desc.ddpfPixelFormat.dwZBufferBitDepth;
+        const uint32_t bytesPerPixel = (bitDepth + 7) / 8;
+
+        if (bytesPerPixel != 2 && bytesPerPixel != 3 && bytesPerPixel != 4) {
+            sprintf_s(state.status, "Unsupported Z format: %u bpp", bitDepth);
+            zBuffer->Unlock(nullptr);
+            zBuffer->Release();
+            device->Release();
+            dd->Release();
+            state.lastCaptureOk = false;
+            return false;
+        }
+
+        uint32_t minVal = (std::numeric_limits<uint32_t>::max)();
+        uint32_t maxVal = 0;
+
+        auto* base = static_cast<uint8_t*>(desc.lpSurface);
+        state.depthRaw.resize(static_cast<size_t>(width) * height);
+
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t* row = base + y * desc.lPitch;
+            for (uint32_t x = 0; x < width; ++x) {
+                uint32_t value = 0;
+                switch (bytesPerPixel) {
+                    case 2: value = reinterpret_cast<const uint16_t*>(row)[x]; break;
+                    case 3: {
+                        const uint8_t* p = row + x * 3;
+                        value = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                                (static_cast<uint32_t>(p[2]) << 16);
+                        break;
+                    }
+                    case 4: value = reinterpret_cast<const uint32_t*>(row)[x]; break;
+                }
+                minVal = (std::min)(minVal, value);
+                maxVal = (std::max)(maxVal, value);
+            }
+        }
+
+        if (minVal == (std::numeric_limits<uint32_t>::max)()) {
+            sprintf_s(state.status, "No depth data");
+            zBuffer->Unlock(nullptr);
+            zBuffer->Release();
+            device->Release();
+            dd->Release();
+            state.lastCaptureOk = false;
+            return false;
+        }
+
+        const float denom = maxVal > minVal ? static_cast<float>(maxVal - minVal) : 1.0f;
+
+        state.rgbaPixels.resize(static_cast<size_t>(width) * height * 4);
+        std::vector<uint32_t> histogramCounts(256, 0);
+        uint32_t maxCount = 1;
+
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t* row = base + y * desc.lPitch;
+            for (uint32_t x = 0; x < width; ++x) {
+                uint32_t value = 0;
+                switch (bytesPerPixel) {
+                    case 2: value = reinterpret_cast<const uint16_t*>(row)[x]; break;
+                    case 3: {
+                        const uint8_t* p = row + x * 3;
+                        value = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                                (static_cast<uint32_t>(p[2]) << 16);
+                        break;
+                    }
+                    case 4: value = reinterpret_cast<const uint32_t*>(row)[x]; break;
+                }
+
+                state.depthRaw[static_cast<size_t>(y) * width + x] = value;
+
+                const float t = ClampFloat(static_cast<float>(value - minVal) / denom, 0.0f, 1.0f);
+                const ImU32 color = DepthColorRamp(t);
+                const size_t idx = (static_cast<size_t>(y) * width + x) * 4;
+                state.rgbaPixels[idx + 0] = static_cast<uint8_t>((color >> IM_COL32_R_SHIFT) & 0xFF);
+                state.rgbaPixels[idx + 1] = static_cast<uint8_t>((color >> IM_COL32_G_SHIFT) & 0xFF);
+                state.rgbaPixels[idx + 2] = static_cast<uint8_t>((color >> IM_COL32_B_SHIFT) & 0xFF);
+                state.rgbaPixels[idx + 3] = 255;
+
+                const uint32_t bin = (std::min)(255u, static_cast<uint32_t>(t * 255.0f + 0.5f));
+                maxCount = (std::max)(maxCount, ++histogramCounts[bin]);
+            }
+        }
+
+        zBuffer->Unlock(nullptr);
+        zBuffer->Release();
+        device->Release();
+        dd->Release();
+
+        state.histogram.resize(256);
+        for (size_t i = 0; i < histogramCounts.size(); ++i) {
+            state.histogram[i] = static_cast<float>(histogramCounts[i]) / static_cast<float>(maxCount);
+        }
+
+        state.texWidth = width;
+        state.texHeight = height;
+        state.minDepth = static_cast<float>(minVal);
+        state.maxDepth = static_cast<float>(maxVal);
+
+        state.depthTexture.Release();
+        if (!state.depthTexture.Create(state.imguiService, width, height, state.rgbaPixels.data(), true)) {
+            sprintf_s(state.status, "Texture upload failed");
+            state.lastCaptureOk = false;
+            return false;
+        }
+
+        sprintf_s(state.status, "Captured %ux%u, %u bpp", width, height, bitDepth);
+        state.lastCaptureOk = true;
+        return true;
+    }
+
+    void BuildMaskedOverlay(const DepthDebugState& depth, float screenX, float screenY) {
+        if (depth.texWidth == 0 || depth.texHeight == 0 || depth.depthRaw.empty() || !depth.imguiService) {
+            return;
+        }
+
+        const int sizePx = static_cast<int>(depth.overlaySize);
+        const int half = sizePx / 2;
+
+        std::vector<uint8_t> maskPixels(static_cast<size_t>(sizePx) * sizePx * 4, 0);
+        const float r = depth.overlayColor.x;
+        const float g = depth.overlayColor.y;
+        const float b = depth.overlayColor.z;
+        const uint32_t pitch = depth.texWidth;
+
+        const int baseX = static_cast<int>(screenX) - half;
+        const int baseY = static_cast<int>(screenY) - half;
+        const uint32_t bias = depth.overlayBias > 0.0f ? static_cast<uint32_t>(depth.overlayBias) : 0u;
+        const int centerX = std::clamp(static_cast<int>(screenX), 0, static_cast<int>(depth.texWidth) - 1);
+        const int centerY = std::clamp(static_cast<int>(screenY), 0, static_cast<int>(depth.texHeight) - 1);
+        const uint32_t overlayDepth = depth.depthRaw[static_cast<size_t>(centerY) * pitch + static_cast<size_t>(centerX)];
+
+        for (int y = 0; y < sizePx; ++y) {
+            int srcY = baseY + y;
+            if (srcY < 0 || srcY >= static_cast<int>(depth.texHeight)) {
+                continue;
+            }
+            for (int x = 0; x < sizePx; ++x) {
+                int srcX = baseX + x;
+                if (srcX < 0 || srcX >= static_cast<int>(depth.texWidth)) {
+                    continue;
+                }
+                const uint32_t sceneDepth = depth.depthRaw[static_cast<size_t>(srcY) * pitch + static_cast<size_t>(srcX)];
+                // Scene pixel is in front if it is closer (smaller depth) than our overlay center minus bias.
+                const bool sceneInFront = sceneDepth + bias < overlayDepth;
+
+                const size_t idx = (static_cast<size_t>(y) * sizePx + x) * 4;
+                maskPixels[idx + 0] = static_cast<uint8_t>(r * 255.0f);
+                maskPixels[idx + 1] = static_cast<uint8_t>(g * 255.0f);
+                maskPixels[idx + 2] = static_cast<uint8_t>(b * 255.0f);
+                maskPixels[idx + 3] = sceneInFront ? 0 : 255; // hide where building is in front
+            }
+        }
+
+        auto* service = depth.imguiService;
+        ImGuiTexture* tex = const_cast<ImGuiTexture*>(&depth.maskedOverlayTexture);
+        tex->Release();
+        tex->Create(service, sizePx, sizePx, maskPixels.data(), true);
+    }
 
     bool IsCityView() {
         const cISC4AppPtr app;
@@ -461,10 +750,15 @@ namespace {
             return;
         }
 
-        auto* config = static_cast<GridConfig*>(userData);
-        if (!config) {
+        auto* data = static_cast<WorldProjectionData*>(userData);
+        if (!data) {
             return;
         }
+        auto& config = data->grid;
+        auto& depth = data->depth;
+
+        float overlayScreenX = 0.0f, overlayScreenY = 0.0f;
+        bool overlayHasPos = false;
 
         // Get camera for rendering
         auto view3DWin = SC4UI::GetView3DWin();
@@ -481,10 +775,28 @@ namespace {
                             terrain = city->GetTerrain();
                         }
                     }
-                    DrawWorldGrid(camera, terrain, *config);
-                    DrawWorldText(camera, *config);
-                    DrawWorldImage(camera, terrain, *config);
+                    DrawWorldGrid(camera, terrain, config);
+                    DrawWorldText(camera, config);
+                    DrawWorldImage(camera, terrain, config);
+
+                    overlayHasPos = WorldToScreen(camera, config.centerX, config.centerY, config.centerZ,
+                                                  overlayScreenX, overlayScreenY, nullptr);
                 }
+            }
+        }
+
+        if (depth.autoRefresh) {
+            CaptureDepthBuffer(depth);
+        }
+
+        if (depth.showMaskedOverlay && depth.lastCaptureOk && overlayHasPos) {
+            BuildMaskedOverlay(depth, overlayScreenX, overlayScreenY);
+            if (void* maskTex = depth.maskedOverlayTexture.GetID()) {
+                const float half = depth.overlaySize * 0.5f;
+                ImGui::GetBackgroundDrawList()->AddImage(
+                    maskTex,
+                    ImVec2(overlayScreenX - half, overlayScreenY - half),
+                    ImVec2(overlayScreenX + half, overlayScreenY + half));
             }
         }
 
@@ -493,98 +805,139 @@ namespace {
 
         ImGui::Separator();
 
-        ImGui::Checkbox("Enable grid", &config->enabled);
+        ImGui::Checkbox("Enable grid", &config.enabled);
 
-        if (config->enabled) {
+        if (config.enabled) {
             ImGui::Spacing();
             ImGui::Text("Grid Configuration");
             ImGui::Separator();
 
-            ImGui::SliderInt("Spacing", &config->gridSpacing, 8, 256);
-            ImGui::SliderInt("Extent", &config->gridExtent, 64, 2048);
-            ImGui::SliderFloat("Line thickness", &config->lineThickness, 1.0f, 5.0f, "%.1f");
+            ImGui::SliderInt("Spacing", &config.gridSpacing, 8, 256);
+            ImGui::SliderInt("Extent", &config.gridExtent, 64, 2048);
+            ImGui::SliderFloat("Line thickness", &config.lineThickness, 1.0f, 5.0f, "%.1f");
 
             ImGui::Spacing();
             ImGui::Text("Grid center");
             ImGui::Separator();
 
-            ImGui::DragFloat("Center X", &config->centerX, 1.0f, 0.0f, 4096.0f, "%.1f");
-            ImGui::DragFloat("Center Y (Height)", &config->centerY, 0.5f, -100.0f, 500.0f, "%.1f");
-            ImGui::DragFloat("Center Z", &config->centerZ, 1.0f, 0.0f, 4096.0f, "%.1f");
+            ImGui::DragFloat("Center X", &config.centerX, 1.0f, 0.0f, 4096.0f, "%.1f");
+            ImGui::DragFloat("Center Y (Height)", &config.centerY, 0.5f, -100.0f, 500.0f, "%.1f");
+            ImGui::DragFloat("Center Z", &config.centerZ, 1.0f, 0.0f, 4096.0f, "%.1f");
 
             ImGui::Spacing();
             ImGui::Text("Appearance");
             ImGui::Separator();
 
-            ImGui::ColorEdit4("Color", reinterpret_cast<float*>(&config->gridColor));
+            ImGui::ColorEdit4("Color", reinterpret_cast<float*>(&config.gridColor));
 
             ImGui::Spacing();
-            ImGui::Checkbox("Draw marker", &config->drawCenterMarker);
-            if (config->drawCenterMarker) {
-                ImGui::SliderFloat("Marker size", &config->markerSize, 5.0f, 30.0f, "%.1f");
+            ImGui::Checkbox("Draw marker", &config.drawCenterMarker);
+            if (config.drawCenterMarker) {
+                ImGui::SliderFloat("Marker size", &config.markerSize, 5.0f, 30.0f, "%.1f");
             }
 
             ImGui::Spacing();
             ImGui::Text("Terrain conform");
             ImGui::Separator();
-            ImGui::Checkbox("Conform to terrain", &config->conformToTerrain);
-            if (config->conformToTerrain) {
-                ImGui::Checkbox("Snap to grid", &config->terrainSnapToGrid);
-                ImGui::SliderInt("Sample step (m)", &config->terrainSampleStep, 4, 64);
+            ImGui::Checkbox("Conform to terrain", &config.conformToTerrain);
+            if (config.conformToTerrain) {
+                ImGui::Checkbox("Snap to grid", &config.terrainSnapToGrid);
+                ImGui::SliderInt("Sample step (m)", &config.terrainSampleStep, 4, 64);
             }
 
             ImGui::Spacing();
             ImGui::Text("World text");
             ImGui::Separator();
 
-            ImGui::Checkbox("Draw text", &config->drawText);
-            if (config->drawText) {
-                ImGui::InputText("Text", config->text, IM_ARRAYSIZE(config->text));
-                ImGui::Checkbox("Billboard", &config->textBillboard);
-                if (!config->textBillboard) {
-                    ImGui::SliderFloat("Depth scale", &config->textDepthScale, 0.0005f, 0.01f, "%.4f");
+            ImGui::Checkbox("Draw text", &config.drawText);
+            if (config.drawText) {
+                ImGui::InputText("Text", config.text, IM_ARRAYSIZE(config.text));
+                ImGui::Checkbox("Billboard", &config.textBillboard);
+                if (!config.textBillboard) {
+                    ImGui::SliderFloat("Depth scale", &config.textDepthScale, 0.0005f, 0.01f, "%.4f");
                 }
-                ImGui::DragFloat2("Text offset", &config->textOffsetX, 1.0f, -200.0f, 200.0f, "%.1f");
-                ImGui::ColorEdit4("Text color", reinterpret_cast<float*>(&config->textColor));
-                ImGui::Checkbox("Leader line", &config->textLeaderLine);
-                ImGui::Checkbox("Background plate", &config->textBackground);
-                ImGui::Checkbox("Outline", &config->textOutline);
-                ImGui::Checkbox("Shadow", &config->textShadow);
+                ImGui::DragFloat2("Text offset", &config.textOffsetX, 1.0f, -200.0f, 200.0f, "%.1f");
+                ImGui::ColorEdit4("Text color", reinterpret_cast<float*>(&config.textColor));
+                ImGui::Checkbox("Leader line", &config.textLeaderLine);
+                ImGui::Checkbox("Background plate", &config.textBackground);
+                ImGui::Checkbox("Outline", &config.textOutline);
+                ImGui::Checkbox("Shadow", &config.textShadow);
             }
 
             ImGui::Spacing();
             ImGui::Text("Billboard image");
             ImGui::Separator();
 
-            ImGui::Checkbox("Draw image", &config->drawImage);
-            if (config->drawImage) {
+            ImGui::Checkbox("Draw image", &config.drawImage);
+            if (config.drawImage) {
                 ImGui::Text("Image: nam49.jpg");
                 ImGui::Text("Mode");
-                if (ImGui::RadioButton("Billboard (pixels)", config->imageBillboard)) {
-                    config->imageBillboard = true;
+                if (ImGui::RadioButton("Billboard (pixels)", config.imageBillboard)) {
+                    config.imageBillboard = true;
                 }
-                if (ImGui::RadioButton("Planar (world units)", !config->imageBillboard)) {
-                    config->imageBillboard = false;
+                if (ImGui::RadioButton("Planar (world units)", !config.imageBillboard)) {
+                    config.imageBillboard = false;
                 }
-                ImGui::SliderFloat("Image size", &config->imageSize, 16.0f, 256.0f, "%.1f");
-                if (config->imageBillboard) {
-                    ImGui::DragFloat2("Image offset (px)", &config->imageOffsetX, 1.0f, -200.0f, 200.0f, "%.1f");
+                ImGui::SliderFloat("Image size", &config.imageSize, 16.0f, 256.0f, "%.1f");
+                if (config.imageBillboard) {
+                    ImGui::DragFloat2("Image offset (px)", &config.imageOffsetX, 1.0f, -200.0f, 200.0f, "%.1f");
                 }
                 else {
-                    ImGui::DragFloat2("Image offset (world X/Z)", &config->imageOffsetX, 1.0f, -512.0f, 512.0f, "%.1f");
+                    ImGui::DragFloat2("Image offset (world X/Z)", &config.imageOffsetX, 1.0f, -512.0f, 512.0f, "%.1f");
                 }
             }
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Text("Depth buffer");
+        ImGui::Checkbox("Auto refresh each frame", &depth.autoRefresh);
+        ImGui::SameLine();
+        if (ImGui::Button("Capture now")) {
+            CaptureDepthBuffer(depth);
+        }
+        ImGui::TextColored(depth.lastCaptureOk ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) : ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                           "%s", depth.status);
+        ImGui::Text("Min depth: %.0f   Max depth: %.0f", depth.minDepth, depth.maxDepth);
+
+        if (!depth.histogram.empty()) {
+            ImGui::PlotHistogram("Depth histogram", depth.histogram.data(),
+                                 static_cast<int>(depth.histogram.size()), 0,
+                                 nullptr, 0.0f, 1.0f, ImVec2(0, 80));
+        }
+
+        if (void* texId = depth.depthTexture.GetID()) {
+            const float aspect = depth.texHeight > 0 ? static_cast<float>(depth.texHeight) / static_cast<float>(depth.texWidth) : 1.0f;
+            const float displayWidth = 512.0f;
+            ImGui::Image(texId, ImVec2(displayWidth, displayWidth * aspect));
+        } else {
+            ImGui::TextUnformatted("Depth texture not available yet.");
+        }
+
+        ImGui::Spacing();
+        ImGui::Text("Masked overlay PoC");
+        ImGui::Checkbox("Show masked overlay in scene", &depth.showMaskedOverlay);
+        ImGui::SliderFloat("Overlay size (px)", &depth.overlaySize, 32.0f, 256.0f, "%.0f");
+        ImGui::SliderFloat("Depth bias", &depth.overlayBias, 0.0f, 400.0f, "%.0f");
+        ImGui::ColorEdit4("Overlay color", reinterpret_cast<float*>(&depth.overlayColor));
+        if (void* masked = depth.maskedOverlayTexture.GetID()) {
+            ImGui::TextUnformatted("Preview:");
+            ImGui::Image(masked, ImVec2(depth.overlaySize, depth.overlaySize));
+        } else {
+            ImGui::TextUnformatted("Preview: (capture first)");
         }
 
         ImGui::End();
     }
 
     void ShutdownWorldProjection(void* userData) {
-        auto* config = static_cast<GridConfig*>(userData);
-        if (config) {
-            config->imageTexture.Release();
+        auto* data = static_cast<WorldProjectionData*>(userData);
+        if (data) {
+            data->grid.imageTexture.Release();
+            data->depth.depthTexture.Release();
+            data->depth.maskedOverlayTexture.Release();
         }
-        delete config;
+        delete data;
     }
 }
 
@@ -630,19 +983,20 @@ public:
 
         LOG_INFO("WorldProjectionSample: obtained ImGui service (api={})", service->GetApiVersion());
 
-        auto* config = new GridConfig();
-        config->imguiService = service;
+        auto* data = new WorldProjectionData();
+        data->grid.imguiService = service;
+        data->depth.imguiService = service;
         ImGuiPanelDesc desc{};
         desc.id = kWorldProjectionPanelId;
         desc.order = 200;  // Render after other panels
         desc.visible = true;
         desc.on_render = &RenderWorldProjectionPanel;
         desc.on_shutdown = &ShutdownWorldProjection;
-        desc.data = config;
+        desc.data = data;
 
         if (!service->RegisterPanel(desc)) {
             LOG_WARN("WorldProjectionSample: failed to register panel");
-            ShutdownWorldProjection(config);
+            ShutdownWorldProjection(data);
             service->Release();
             service = nullptr;
             return true;

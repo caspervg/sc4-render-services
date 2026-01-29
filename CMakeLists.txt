@@ -270,6 +270,7 @@ set_target_properties(SC4ImGuiTextureSample PROPERTIES
 # World Projection sample DLL
 set(WORLD_PROJECTION_SAMPLE_SOURCES
         ${CMAKE_SOURCE_DIR}/src/sample/WorldProjectionSampleDirector.cpp
+        ${CMAKE_SOURCE_DIR}/src/DX7InterfaceHook.cpp
         ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
 )
 

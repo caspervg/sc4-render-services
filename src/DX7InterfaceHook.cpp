@@ -96,7 +96,7 @@ bool DX7InterfaceHook::InitializeImGui(const HWND hwnd)
     fontConfig.OversampleH = 2;  // Horizontal oversampling for crisper text
     fontConfig.OversampleV = 2;  // Vertical oversampling for crisper text
     fontConfig.PixelSnapH = true;  // Snap to pixel grid for sharper rendering
-    fontConfig.GlyphExtraAdvanceX = 1.0f;
+    fontConfig.GlyphExtraAdvanceX = 0.0f;
 
     // Load ProggyClean font
     ImFont* font = io.Fonts->AddFontFromMemoryCompressedTTF(ProggyVector_compressed_data, ProggyVector_compressed_size, 13.0f, &fontConfig);
