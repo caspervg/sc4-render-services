@@ -118,35 +118,37 @@ include_directories(
         ${CMAKE_SOURCE_DIR}/src
 )
 
-# ImGui service DLL
-set(IMGUI_SERVICE_SOURCES
+# Combined ImGui + S3D Camera services DLL (641-gated)
+set(CUSTOM_SERVICES_SOURCES
         ${CMAKE_SOURCE_DIR}/src/service/ImGuiService.cpp
-        ${CMAKE_SOURCE_DIR}/src/service/ImGuiServiceDirector.cpp
+        ${CMAKE_SOURCE_DIR}/src/service/S3DCameraService.cpp
+        ${CMAKE_SOURCE_DIR}/src/service/CustomServicesDirector.cpp
+        ${CMAKE_SOURCE_DIR}/src/utils/VersionDetection.cpp
         ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
         ${CMAKE_SOURCE_DIR}/src/DX7InterfaceHook.cpp
 )
 
-add_library(SC4ImGuiService SHARED ${IMGUI_SERVICE_SOURCES} SC4ImGuiService.def)
+add_library(SC4CustomServices SHARED ${CUSTOM_SERVICES_SOURCES} SC4CustomServices.def)
 
-target_include_directories(SC4ImGuiService PRIVATE
+target_include_directories(SC4CustomServices PRIVATE
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/src/service
         ${IMGUI_DIR}
 )
 
-target_link_libraries(SC4ImGuiService PRIVATE
+target_link_libraries(SC4CustomServices PRIVATE
         imgui
         gzcom2
         spdlog
 )
-target_compile_definitions(SC4ImGuiService PRIVATE IMGUI_DLL_IMPORT)
+target_compile_definitions(SC4CustomServices PRIVATE IMGUI_DLL_IMPORT)
 
 if(WIN32)
-    target_link_libraries(SC4ImGuiService PRIVATE kernel32 user32 Version ddraw dxguid)
+    target_link_libraries(SC4CustomServices PRIVATE kernel32 user32 Version ddraw dxguid)
 endif()
 
-set_target_properties(SC4ImGuiService PROPERTIES
-        OUTPUT_NAME "SC4ImGuiService"
+set_target_properties(SC4CustomServices PROPERTIES
+        OUTPUT_NAME "SC4CustomServices"
         SUFFIX ".dll"
         PREFIX ""
 )
@@ -302,7 +304,7 @@ set_target_properties(SC4WorldProjectionSample PROPERTIES
 
 
 add_custom_target(SC4ImGuiAllTargets
-        DEPENDS imgui SC4ImGuiService SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample
+        DEPENDS imgui SC4CustomServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample
 )
 
 # Automatic deployment to SC4 directories
@@ -339,12 +341,12 @@ if(WIN32 AND NOT DEFINED ENV{CI})
                 COMMENT "Deploying imgui.dll to Apps folder"
         )
 
-        add_custom_command(TARGET SC4ImGuiService POST_BUILD
+        add_custom_command(TARGET SC4CustomServices POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${SC4_PLUGINS_DIR}"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                $<TARGET_FILE:SC4ImGuiService>
+                $<TARGET_FILE:SC4CustomServices>
                 "${SC4_PLUGINS_DIR}/"
-                COMMENT "Deploying SC4ImGuiService.dll to Plugins folder"
+                COMMENT "Deploying SC4CustomServices.dll to Plugins folder"
         )
 
         add_custom_command(TARGET SC4ImGuiSample POST_BUILD
@@ -389,7 +391,7 @@ if(WIN32 AND NOT DEFINED ENV{CI})
 
         message(STATUS "Deployment targets configured:")
         message(STATUS "  - imgui.dll -> ${SC4_INSTALL_DIR}/Apps/")
-        message(STATUS "  - SC4ImGuiService.dll -> ${SC4_PLUGINS_DIR}/")
+        message(STATUS "  - SC4CustomServices.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4ImGuiSample.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4ImGuiSampleCity.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4ImGuiSampleDemo.dll -> ${SC4_PLUGINS_DIR}/")

@@ -17,6 +17,7 @@
 #include "imgui_impl_dx7.h"
 #include "imgui_impl_win32.h"
 #include "public/ImGuiServiceIds.h"
+#include "utils/VersionDetection.h"
 #include "utils/Logger.h"
 
 namespace {
@@ -129,6 +130,12 @@ bool ImGuiService::QueryInterface(uint32_t riid, void** ppvObj) {
 }
 
 bool ImGuiService::Init() {
+    const auto version = VersionDetection::GetInstance().GetGameVersion();
+    if (version != 641) {
+        LOG_WARN("ImGuiService: not initializing, game version {} != 641", version);
+        return false;
+    }
+
     if (initialized_) {
         return true;
     }

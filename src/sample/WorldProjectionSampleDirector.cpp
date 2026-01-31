@@ -14,6 +14,8 @@
 #include "public/ImGuiTexture.h"
 #include "public/cIGZImGuiService.h"
 #include "public/ImGuiServiceIds.h"
+#include "public/cIGZS3DCameraService.h"
+#include "public/S3DCameraServiceIds.h"
 #ifndef NOMINMAX
 #define NOMINMAX 1
 #endif
@@ -38,19 +40,17 @@ namespace {
         L"C:\\Users\\caspe\\CLionProjects\\sc4-imgui-backend\\assets\\nam49.jpg";
     bool gGdiplusStarted = false;
     ULONG_PTR gGdiplusToken = 0;
-
-    // Function pointer type for SC4's camera Project function
-    typedef bool (__thiscall *ProjectFunc)(void* camera, float* worldPos, float* screenPos);
-    const auto ProjectFn = reinterpret_cast<ProjectFunc>(0x007fff10);
+    cIGZS3DCameraService* gCameraService = nullptr;
+    S3DCameraHandle gCameraHandle{nullptr, 0, false};
 
     struct GridConfig {
         bool enabled = true;
-        int gridSpacing = 64;    // World units between grid lines
-        int gridExtent = 512;    // How far from center to draw
-        float centerX = 512.0f;       // Center world position X
-        float centerY = 281.0f;         // Center world position Y (height)
-        float centerZ = 512.0f;       // Center world position Z
-        ImVec4 gridColor = ImVec4(0.0f, 1.0f, 0.0f, 0.8f);  // RGBA
+        int gridSpacing = 64; // World units between grid lines
+        int gridExtent = 512; // How far from center to draw
+        float centerX = 512.0f; // Center world position X
+        float centerY = 281.0f; // Center world position Y (height)
+        float centerZ = 512.0f; // Center world position Z
+        ImVec4 gridColor = ImVec4(0.0f, 1.0f, 0.0f, 0.8f); // RGBA
         float lineThickness = 2.0f;
         bool drawCenterMarker = true;
         float markerSize = 10.0f;
@@ -87,14 +87,14 @@ namespace {
         ImGuiTexture maskedOverlayTexture;
         std::vector<uint8_t> rgbaPixels;
         std::vector<uint32_t> depthRaw;
-        std::vector<float> histogram;  // normalized 0..1 values, 256 bins
+        std::vector<float> histogram; // normalized 0..1 values, 256 bins
         uint32_t texWidth = 0;
         uint32_t texHeight = 0;
         float minDepth = 0.0f;
         float maxDepth = 0.0f;
         bool lastCaptureOk = false;
         char status[128] = "Idle";
-        bool autoRefresh = false;  // safer default
+        bool autoRefresh = false; // safer default
         // Demo overlay settings
         bool showMaskedOverlay = true;
         float overlaySize = 96.0f;
@@ -105,6 +105,8 @@ namespace {
     struct WorldProjectionData {
         GridConfig grid;
         DepthDebugState depth;
+        cIGZS3DCameraService* cameraService = nullptr;
+        S3DCameraHandle cameraHandle{nullptr, 0, false};
     };
 
     float ClampFloat(float value, float minValue, float maxValue);
@@ -115,19 +117,27 @@ namespace {
         float r = 0.0f, g = 0.0f, b = 0.0f;
         if (t < 0.25f) {
             const float k = t / 0.25f;
-            r = 0.0f; g = k; b = 1.0f;
+            r = 0.0f;
+            g = k;
+            b = 1.0f;
         }
         else if (t < 0.5f) {
             const float k = (t - 0.25f) / 0.25f;
-            r = 0.0f; g = 1.0f; b = 1.0f - k;
+            r = 0.0f;
+            g = 1.0f;
+            b = 1.0f - k;
         }
         else if (t < 0.75f) {
             const float k = (t - 0.5f) / 0.25f;
-            r = k; g = 1.0f; b = 0.0f;
+            r = k;
+            g = 1.0f;
+            b = 0.0f;
         }
         else {
             const float k = (t - 0.75f) / 0.25f;
-            r = 1.0f; g = 1.0f - k; b = 0.0f;
+            r = 1.0f;
+            g = 1.0f - k;
+            b = 0.0f;
         }
         return IM_COL32(static_cast<int>(r * 255.0f),
                         static_cast<int>(g * 255.0f),
@@ -224,14 +234,16 @@ namespace {
             for (uint32_t x = 0; x < width; ++x) {
                 uint32_t value = 0;
                 switch (bytesPerPixel) {
-                    case 2: value = reinterpret_cast<const uint16_t*>(row)[x]; break;
-                    case 3: {
-                        const uint8_t* p = row + x * 3;
-                        value = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-                                (static_cast<uint32_t>(p[2]) << 16);
-                        break;
-                    }
-                    case 4: value = reinterpret_cast<const uint32_t*>(row)[x]; break;
+                case 2: value = reinterpret_cast<const uint16_t*>(row)[x];
+                    break;
+                case 3: {
+                    const uint8_t* p = row + x * 3;
+                    value = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                        (static_cast<uint32_t>(p[2]) << 16);
+                    break;
+                }
+                case 4: value = reinterpret_cast<const uint32_t*>(row)[x];
+                    break;
                 }
                 minVal = (std::min)(minVal, value);
                 maxVal = (std::max)(maxVal, value);
@@ -259,14 +271,16 @@ namespace {
             for (uint32_t x = 0; x < width; ++x) {
                 uint32_t value = 0;
                 switch (bytesPerPixel) {
-                    case 2: value = reinterpret_cast<const uint16_t*>(row)[x]; break;
-                    case 3: {
-                        const uint8_t* p = row + x * 3;
-                        value = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-                                (static_cast<uint32_t>(p[2]) << 16);
-                        break;
-                    }
-                    case 4: value = reinterpret_cast<const uint32_t*>(row)[x]; break;
+                case 2: value = reinterpret_cast<const uint16_t*>(row)[x];
+                    break;
+                case 3: {
+                    const uint8_t* p = row + x * 3;
+                    value = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                        (static_cast<uint32_t>(p[2]) << 16);
+                    break;
+                }
+                case 4: value = reinterpret_cast<const uint32_t*>(row)[x];
+                    break;
                 }
 
                 state.depthRaw[static_cast<size_t>(y) * width + x] = value;
@@ -330,7 +344,8 @@ namespace {
         const uint32_t bias = depth.overlayBias > 0.0f ? static_cast<uint32_t>(depth.overlayBias) : 0u;
         const int centerX = std::clamp(static_cast<int>(screenX), 0, static_cast<int>(depth.texWidth) - 1);
         const int centerY = std::clamp(static_cast<int>(screenY), 0, static_cast<int>(depth.texHeight) - 1);
-        const uint32_t overlayDepth = depth.depthRaw[static_cast<size_t>(centerY) * pitch + static_cast<size_t>(centerX)];
+        const uint32_t overlayDepth = depth.depthRaw[static_cast<size_t>(centerY) * pitch + static_cast<size_t>(
+            centerX)];
 
         for (int y = 0; y < sizePx; ++y) {
             int srcY = baseY + y;
@@ -342,7 +357,8 @@ namespace {
                 if (srcX < 0 || srcX >= static_cast<int>(depth.texWidth)) {
                     continue;
                 }
-                const uint32_t sceneDepth = depth.depthRaw[static_cast<size_t>(srcY) * pitch + static_cast<size_t>(srcX)];
+                const uint32_t sceneDepth = depth.depthRaw[static_cast<size_t>(srcY) * pitch + static_cast<size_t>(
+                    srcX)];
                 // Scene pixel is in front if it is closer (smaller depth) than our overlay center minus bias.
                 const bool sceneInFront = sceneDepth + bias < overlayDepth;
 
@@ -366,27 +382,6 @@ namespace {
             return false;
         }
         return app->GetCity() != nullptr;
-    }
-
-    bool WorldToScreen(cS3DCamera* camera, float worldX, float worldY, float worldZ,
-                       float& screenX, float& screenY, float* depth = nullptr) {
-        if (!camera) {
-            return false;
-        }
-
-        float worldPos[3] = {worldX, worldY, worldZ};
-        float screenPos[3] = {0.0f, 0.0f, 0.0f};
-
-        if (ProjectFn(camera, worldPos, screenPos)) {
-            screenX = screenPos[0];
-            screenY = screenPos[1];
-            if (depth) {
-                *depth = screenPos[2];
-            }
-            return true;
-        }
-
-        return false;
     }
 
     float ClampFloat(float value, float minValue, float maxValue) {
@@ -484,8 +479,10 @@ namespace {
 
             if (!config.conformToTerrain || !terrain) {
                 float screenX1, screenY1, screenX2, screenY2;
-                bool visible1 = WorldToScreen(camera, startX, config.centerY, worldZ, screenX1, screenY1);
-                bool visible2 = WorldToScreen(camera, endX, config.centerY, worldZ, screenX2, screenY2);
+                bool visible1 = gCameraService->WorldToScreen(gCameraHandle, startX, config.centerY, worldZ, screenX1,
+                                                              screenY1);
+                bool visible2 = gCameraService->WorldToScreen(gCameraHandle, endX, config.centerY, worldZ, screenX2,
+                                                              screenY2);
 
                 if (visible1 && visible2) {
                     drawList->AddLine(
@@ -510,7 +507,7 @@ namespace {
                                     ? terrain->GetAltitudeAtNearestGrid(x, worldZ)
                                     : terrain->GetAltitude(x, worldZ);
                 float sx, sy;
-                if (!WorldToScreen(camera, x, y, worldZ, sx, sy)) {
+                if (!gCameraService->WorldToScreen(gCameraHandle, x, y, worldZ, sx, sy)) {
                     hasPrev = false;
                     continue;
                 }
@@ -534,8 +531,10 @@ namespace {
 
             if (!config.conformToTerrain || !terrain) {
                 float screenX1, screenY1, screenX2, screenY2;
-                bool visible1 = WorldToScreen(camera, worldX, config.centerY, startZ, screenX1, screenY1);
-                bool visible2 = WorldToScreen(camera, worldX, config.centerY, endZ, screenX2, screenY2);
+                bool visible1 = gCameraService->WorldToScreen(gCameraHandle, worldX, config.centerY, startZ, screenX1,
+                                                              screenY1);
+                bool visible2 = gCameraService->WorldToScreen(gCameraHandle, worldX, config.centerY, endZ, screenX2,
+                                                              screenY2);
 
                 if (visible1 && visible2) {
                     drawList->AddLine(
@@ -560,7 +559,7 @@ namespace {
                                     ? terrain->GetAltitudeAtNearestGrid(worldX, z)
                                     : terrain->GetAltitude(worldX, z);
                 float sx, sy;
-                if (!WorldToScreen(camera, worldX, y, z, sx, sy)) {
+                if (!gCameraService->WorldToScreen(gCameraHandle, worldX, y, z, sx, sy)) {
                     hasPrev = false;
                     continue;
                 }
@@ -577,9 +576,10 @@ namespace {
         // Draw center marker
         if (config.drawCenterMarker) {
             float screenX, screenY;
-            if (WorldToScreen(camera, config.centerX, config.centerY, config.centerZ, screenX, screenY)) {
+            if (gCameraService->WorldToScreen(gCameraHandle, config.centerX, config.centerY, config.centerZ, screenX,
+                                              screenY)) {
                 // Draw crosshair at center
-                ImU32 markerColor = IM_COL32(255, 0, 0, 255);  // Red marker
+                ImU32 markerColor = IM_COL32(255, 0, 0, 255); // Red marker
                 drawList->AddCircleFilled(
                     ImVec2(screenX, screenY),
                     config.markerSize * 0.5f,
@@ -611,7 +611,8 @@ namespace {
         float screenX = 0.0f;
         float screenY = 0.0f;
         float depth = 0.0f;
-        if (!WorldToScreen(camera, config.centerX, config.centerY, config.centerZ, screenX, screenY, &depth)) {
+        if (!gCameraService->WorldToScreen(gCameraHandle, config.centerX, config.centerY, config.centerZ, screenX,
+                                           screenY, &depth)) {
             return;
         }
 
@@ -676,7 +677,8 @@ namespace {
         float screenX = 0.0f;
         float screenY = 0.0f;
         float depth = 0.0f;
-        if (!WorldToScreen(camera, config.centerX, config.centerY, config.centerZ, screenX, screenY, &depth)) {
+        if (!gCameraService->WorldToScreen(gCameraHandle, config.centerX, config.centerY, config.centerZ, screenX,
+                                           screenY, &depth)) {
             return;
         }
 
@@ -719,8 +721,9 @@ namespace {
             if (!config.conformToTerrain || !terrain || !terrain->LocationIsInBounds(x, z)) {
                 return config.centerY;
             }
-            return config.terrainSnapToGrid ? terrain->GetAltitudeAtNearestGrid(x, z)
-                                            : terrain->GetAltitude(x, z);
+            return config.terrainSnapToGrid
+                       ? terrain->GetAltitudeAtNearestGrid(x, z)
+                       : terrain->GetAltitude(x, z);
         };
 
         const float y1 = sampleHeight(worldX - halfSize, worldZ - halfSize);
@@ -729,10 +732,10 @@ namespace {
         const float y4 = sampleHeight(worldX - halfSize, worldZ + halfSize);
 
         float p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y;
-        if (!WorldToScreen(camera, worldX - halfSize, y1, worldZ - halfSize, p1x, p1y) ||
-            !WorldToScreen(camera, worldX + halfSize, y2, worldZ - halfSize, p2x, p2y) ||
-            !WorldToScreen(camera, worldX + halfSize, y3, worldZ + halfSize, p3x, p3y) ||
-            !WorldToScreen(camera, worldX - halfSize, y4, worldZ + halfSize, p4x, p4y)) {
+        if (!gCameraService->WorldToScreen(gCameraHandle, worldX - halfSize, y1, worldZ - halfSize, p1x, p1y) ||
+            !gCameraService->WorldToScreen(gCameraHandle, worldX + halfSize, y2, worldZ - halfSize, p2x, p2y) ||
+            !gCameraService->WorldToScreen(gCameraHandle, worldX + halfSize, y3, worldZ + halfSize, p3x, p3y) ||
+            !gCameraService->WorldToScreen(gCameraHandle, worldX - halfSize, y4, worldZ + halfSize, p4x, p4y)) {
             return;
         }
 
@@ -760,29 +763,33 @@ namespace {
         float overlayScreenX = 0.0f, overlayScreenY = 0.0f;
         bool overlayHasPos = false;
 
-        // Get camera for rendering
-        auto view3DWin = SC4UI::GetView3DWin();
-        if (view3DWin) {
-            cISC43DRender* renderer = view3DWin->GetRenderer();
-            if (renderer) {
-                cS3DCamera* camera = renderer->GetCamera();
-                if (camera) {
-                    cISC4AppPtr app;
-                    cISTETerrain* terrain = nullptr;
-                    if (app) {
-                        cISC4City* city = app->GetCity();
-                        if (city) {
-                            terrain = city->GetTerrain();
-                        }
-                    }
-                    DrawWorldGrid(camera, terrain, config);
-                    DrawWorldText(camera, config);
-                    DrawWorldImage(camera, terrain, config);
+        // Refresh camera handle from service each frame (handles device/lifetime changes).
+        if (data->cameraService) {
+            data->cameraHandle = data->cameraService->WrapActiveRendererCamera();
+            gCameraService = data->cameraService;
+            gCameraHandle = data->cameraHandle;
+        }
+        else {
+            gCameraService = nullptr;
+            gCameraHandle = {nullptr, 0, false};
+        }
 
-                    overlayHasPos = WorldToScreen(camera, config.centerX, config.centerY, config.centerZ,
-                                                  overlayScreenX, overlayScreenY, nullptr);
-                }
+        cS3DCamera* camera = static_cast<cS3DCamera*>(data->cameraHandle.ptr);
+        cISC4AppPtr app;
+        cISTETerrain* terrain = nullptr;
+        if (app) {
+            cISC4City* city = app->GetCity();
+            if (city) {
+                terrain = city->GetTerrain();
             }
+        }
+
+        if (camera) {
+            DrawWorldGrid(camera, terrain, config);
+            DrawWorldText(camera, config);
+            DrawWorldImage(camera, terrain, config);
+            overlayHasPos = gCameraService->WorldToScreen(gCameraHandle, config.centerX, config.centerY, config.centerZ,
+                                                          overlayScreenX, overlayScreenY, nullptr);
         }
 
         if (depth.autoRefresh) {
@@ -907,10 +914,13 @@ namespace {
         }
 
         if (void* texId = depth.depthTexture.GetID()) {
-            const float aspect = depth.texHeight > 0 ? static_cast<float>(depth.texHeight) / static_cast<float>(depth.texWidth) : 1.0f;
+            const float aspect = depth.texHeight > 0
+                                     ? static_cast<float>(depth.texHeight) / static_cast<float>(depth.texWidth)
+                                     : 1.0f;
             const float displayWidth = 512.0f;
             ImGui::Image(texId, ImVec2(displayWidth, displayWidth * aspect));
-        } else {
+        }
+        else {
             ImGui::TextUnformatted("Depth texture not available yet.");
         }
 
@@ -923,7 +933,8 @@ namespace {
         if (void* masked = depth.maskedOverlayTexture.GetID()) {
             ImGui::TextUnformatted("Preview:");
             ImGui::Image(masked, ImVec2(depth.overlaySize, depth.overlaySize));
-        } else {
+        }
+        else {
             ImGui::TextUnformatted("Preview: (capture first)");
         }
 
@@ -936,6 +947,12 @@ namespace {
             data->grid.imageTexture.Release();
             data->depth.depthTexture.Release();
             data->depth.maskedOverlayTexture.Release();
+            if (data->cameraService) {
+                data->cameraService->Release();
+                data->cameraService = nullptr;
+            }
+            gCameraService = nullptr;
+            gCameraHandle = {nullptr, 0, false};
         }
         delete data;
     }
@@ -945,8 +962,7 @@ class WorldProjectionSampleDirector final : public cRZCOMDllDirector {
 public:
     WorldProjectionSampleDirector()
         : service(nullptr),
-          panelRegistered(false) {
-    }
+          panelRegistered(false) {}
 
     [[nodiscard]] uint32_t GetDirectorID() const override {
         return kWorldProjectionSampleDirectorID;
@@ -981,14 +997,22 @@ public:
             return true;
         }
 
-        LOG_INFO("WorldProjectionSample: obtained ImGui service (api={})", service->GetApiVersion());
+        // Camera service (optional; 641-only)
+        cIGZS3DCameraService* cameraService = nullptr;
+        if (!mpFrameWork->GetSystemService(kS3DCameraServiceID, GZIID_cIGZS3DCameraService,
+                                           reinterpret_cast<void**>(&cameraService))) {
+            LOG_WARN("WorldProjectionSample: Camera service not available");
+        }
+
+        LOG_INFO("WorldProjectionSample: obtained ImGui service");
 
         auto* data = new WorldProjectionData();
         data->grid.imguiService = service;
         data->depth.imguiService = service;
+        data->cameraService = cameraService;
         ImGuiPanelDesc desc{};
         desc.id = kWorldProjectionPanelId;
-        desc.order = 200;  // Render after other panels
+        desc.order = 200; // Render after other panels
         desc.visible = true;
         desc.on_render = &RenderWorldProjectionPanel;
         desc.on_shutdown = &ShutdownWorldProjection;
