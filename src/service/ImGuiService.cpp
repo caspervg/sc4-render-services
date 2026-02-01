@@ -163,6 +163,16 @@ bool ImGuiService::Shutdown() {
         panels_.clear();
     }
 
+    {
+        std::lock_guard queueLock(renderQueueMutex_);
+        for (auto& item : renderQueue_) {
+            if (item.cleanup) {
+                item.cleanup(item.data);
+            }
+        }
+        renderQueue_.clear();
+    }
+
     // Clean up all textures before shutting down ImGui
     {
         std::lock_guard textureLock(texturesMutex_);
@@ -277,6 +287,16 @@ bool ImGuiService::SetPanelVisible(const uint32_t panelId, const bool visible) {
     if (it->desc.on_visible_changed) {
         it->desc.on_visible_changed(it->desc.data, visible);
     }
+    return true;
+}
+
+bool ImGuiService::QueueRender(ImGuiRenderCallback callback, void* data, ImGuiRenderCleanup cleanup) {
+    if (!callback) {
+        return false;
+    }
+
+    std::lock_guard lock(renderQueueMutex_);
+    renderQueue_.push_back(RenderQueueItem{callback, data, cleanup});
     return true;
 }
 
@@ -410,6 +430,23 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
                         ImGui::PopFont();
                     }
                 }
+            }
+        }
+    }
+
+    {
+        std::vector<RenderQueueItem> renderQueue;
+        {
+            std::lock_guard queueLock(renderQueueMutex_);
+            renderQueue.swap(renderQueue_);
+        }
+
+        for (auto& item : renderQueue) {
+            if (item.callback) {
+                item.callback(item.data);
+            }
+            if (item.cleanup) {
+                item.cleanup(item.data);
             }
         }
     }

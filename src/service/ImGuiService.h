@@ -4,7 +4,10 @@
 #include <d3d.h>
 #include <imgui.h>
 #include <mutex>
+#include <new>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <Windows.h>
 
@@ -37,6 +40,7 @@ public:
     bool RegisterPanel(const ImGuiPanelDesc& desc) override;
     bool UnregisterPanel(uint32_t panelId) override;
     bool SetPanelVisible(uint32_t panelId, bool visible) override;
+    bool QueueRender(ImGuiRenderCallback callback, void* data, ImGuiRenderCleanup cleanup = nullptr) override;
     bool AcquireD3DInterfaces(IDirect3DDevice7** outD3D, IDirectDraw7** outDD) override;
     [[nodiscard]] bool IsDeviceReady() const override;
     [[nodiscard]] uint32_t GetDeviceGeneration() const override;
@@ -50,6 +54,16 @@ public:
     bool RegisterFont(uint32_t fontId, const void* compressedFontData, int compressedFontDataSize, float sizePixels) override;
     bool UnregisterFont(uint32_t fontId) override;
     [[nodiscard]] void* GetFont(uint32_t fontId) const override;
+
+    template <typename Fn>
+    bool QueueRenderLambda(Fn&& fn) {
+        using FnType = std::decay_t<Fn>;
+        auto* heapFn = new (std::nothrow) FnType(std::forward<Fn>(fn));
+        if (!heapFn) {
+            return false;
+        }
+        return QueueRender(&ImGuiService::InvokeLambda_<FnType>, heapFn, &ImGuiService::DeleteLambda_<FnType>);
+    }
 
 private:
     struct PanelEntry
@@ -85,6 +99,23 @@ private:
             , useSystemMemory(false) {}
     };
 
+    struct RenderQueueItem
+    {
+        ImGuiRenderCallback callback;
+        void* data;
+        ImGuiRenderCleanup cleanup;
+    };
+
+    template <typename FnType>
+    static void InvokeLambda_(void* data) {
+        (*static_cast<FnType*>(data))();
+    }
+
+    template <typename FnType>
+    static void DeleteLambda_(void* data) {
+        delete static_cast<FnType*>(data);
+    }
+
     static void RenderFrameThunk_(IDirect3DDevice7* device);
     void RenderFrame_(IDirect3DDevice7* device);
     bool EnsureInitialized_();
@@ -103,6 +134,9 @@ private:
 private:
     std::vector<PanelEntry> panels_;
     mutable std::mutex panelsMutex_;
+
+    std::vector<RenderQueueItem> renderQueue_;
+    mutable std::mutex renderQueueMutex_;
 
     std::unordered_map<uint32_t, ManagedFont> fonts_;  // Key: font ID
     mutable std::mutex fontsMutex_;

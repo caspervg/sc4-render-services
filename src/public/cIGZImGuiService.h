@@ -20,6 +20,9 @@ struct ImGuiPanelDesc
 struct IDirectDraw7;
 struct IDirect3DDevice7;
 
+using ImGuiRenderCallback = void (*)(void* data);
+using ImGuiRenderCleanup = void (*)(void* data);
+
 // Texture handle with generation tracking
 struct ImGuiTextureHandle
 {
@@ -56,6 +59,11 @@ public:
 
     // Sets a panel's visibility; returns false if not found.
     virtual bool SetPanelVisible(uint32_t panelId, bool visible) = 0;
+
+    // Queues a render callback to execute on the next ImGui frame.
+    // The callback runs on the render thread between ImGui::NewFrame() and ImGui::EndFrame().
+    // If cleanup is provided, it is called after the callback (or during shutdown) to free data.
+    virtual bool QueueRender(ImGuiRenderCallback callback, void* data, ImGuiRenderCleanup cleanup = nullptr) = 0;
 
     // Acquire DX7 interfaces for advanced texture workflows.
     // On success, the service AddRef()'s both interfaces; callers must Release().
