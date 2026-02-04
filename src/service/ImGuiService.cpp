@@ -1012,11 +1012,10 @@ void ImGuiService::OnDeviceLost_() {
     deviceLost_ = true;
 
     {
-        std::lock_guard lock(panelsMutex_) {
-            for (auto& panel : panels_) {
-                if (panel.desc.on_device_lost) {
-                    panel.desc.on_device_lost(panel.desc.data);
-                }
+        std::lock_guard lock(panelsMutex_);
+        for (auto& panel : panels_) {
+            if (panel.desc.on_device_lost) {
+                panel.desc.on_device_lost(panel.desc.data);
             }
         }
     }
