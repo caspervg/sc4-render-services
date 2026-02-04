@@ -390,7 +390,7 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
             }
             return;
         } else if (deviceLost_) {
-            OnDeviceRestored();
+            OnDeviceRestored_();
         }
     } else {
         return;
