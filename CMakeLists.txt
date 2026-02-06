@@ -118,6 +118,8 @@ include_directories(
         ${CMAKE_SOURCE_DIR}/src
 )
 
+set(SC4_COMMON_DIRECTOR_DEF ${CMAKE_SOURCE_DIR}/SC4Director.def)
+
 # Combined ImGui + S3D Camera services DLL (641-gated)
 set(CUSTOM_SERVICES_SOURCES
         ${CMAKE_SOURCE_DIR}/src/service/ImGuiService.cpp
@@ -129,7 +131,7 @@ set(CUSTOM_SERVICES_SOURCES
         ${CMAKE_SOURCE_DIR}/src/DX7InterfaceHook.cpp
 )
 
-add_library(SC4CustomServices SHARED ${CUSTOM_SERVICES_SOURCES} SC4CustomServices.def)
+add_library(SC4CustomServices SHARED ${CUSTOM_SERVICES_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
 
 target_include_directories(SC4CustomServices PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -161,7 +163,7 @@ set(IMGUI_SAMPLE_SOURCES
         ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
 )
 
-add_library(SC4ImGuiSample SHARED ${IMGUI_SAMPLE_SOURCES} SC4ImGuiSample.def)
+add_library(SC4ImGuiSample SHARED ${IMGUI_SAMPLE_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
 
 target_include_directories(SC4ImGuiSample PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -189,7 +191,7 @@ set(IMGUI_SAMPLE_CITY_SOURCES
         ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
 )
 
-add_library(SC4ImGuiSampleCity SHARED ${IMGUI_SAMPLE_CITY_SOURCES} SC4ImGuiSampleCity.def)
+add_library(SC4ImGuiSampleCity SHARED ${IMGUI_SAMPLE_CITY_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
 
 target_include_directories(SC4ImGuiSampleCity PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -218,7 +220,7 @@ set(IMGUI_SAMPLE_DEMO_SOURCES
         ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
 )
 
-add_library(SC4ImGuiSampleDemo SHARED ${IMGUI_SAMPLE_DEMO_SOURCES} SC4ImGuiSampleDemo.def)
+add_library(SC4ImGuiSampleDemo SHARED ${IMGUI_SAMPLE_DEMO_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
 
 target_include_directories(SC4ImGuiSampleDemo PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -247,7 +249,7 @@ set(IMGUI_TEXTURE_SAMPLE_SOURCES
         ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
 )
 
-add_library(SC4ImGuiTextureSample SHARED ${IMGUI_TEXTURE_SAMPLE_SOURCES} SC4ImGuiTextureSample.def)
+add_library(SC4ImGuiTextureSample SHARED ${IMGUI_TEXTURE_SAMPLE_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
 
 target_include_directories(SC4ImGuiTextureSample PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -277,7 +279,7 @@ set(WORLD_PROJECTION_SAMPLE_SOURCES
         ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
 )
 
-add_library(SC4WorldProjectionSample SHARED ${WORLD_PROJECTION_SAMPLE_SOURCES} SC4WorldProjectionSample.def)
+add_library(SC4WorldProjectionSample SHARED ${WORLD_PROJECTION_SAMPLE_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
 
 target_include_directories(SC4WorldProjectionSample PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -309,7 +311,7 @@ set(S3D_CAMERA_DEBUG_SAMPLE_SOURCES
         ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
 )
 
-add_library(SC4S3DCameraDebugSample SHARED ${S3D_CAMERA_DEBUG_SAMPLE_SOURCES} SC4S3DCameraDebugSample.def)
+add_library(SC4S3DCameraDebugSample SHARED ${S3D_CAMERA_DEBUG_SAMPLE_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
 
 target_include_directories(SC4S3DCameraDebugSample PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -337,7 +339,7 @@ set(OVERLAY_MANAGER_SAMPLE_SOURCES
         ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
 )
 
-add_library(SC4OverlayManagerSample SHARED ${OVERLAY_MANAGER_SAMPLE_SOURCES} SC4OverlayManagerSample.def)
+add_library(SC4OverlayManagerSample SHARED ${OVERLAY_MANAGER_SAMPLE_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
 
 target_include_directories(SC4OverlayManagerSample PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -365,7 +367,7 @@ set(DRAW_SERVICE_SAMPLE_SOURCES
         ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
 )
 
-add_library(SC4DrawServiceSample SHARED ${DRAW_SERVICE_SAMPLE_SOURCES} SC4DrawServiceSample.def)
+add_library(SC4DrawServiceSample SHARED ${DRAW_SERVICE_SAMPLE_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
 
 target_include_directories(SC4DrawServiceSample PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -387,9 +389,39 @@ set_target_properties(SC4DrawServiceSample PROPERTIES
         PREFIX ""
 )
 
+# Road Decal sample DLL
+set(ROAD_DECAL_SAMPLE_SOURCES
+        ${CMAKE_SOURCE_DIR}/src/sample/road-decal/RoadDecalSampleDirector.cpp
+        ${CMAKE_SOURCE_DIR}/src/sample/road-decal/RoadDecalData.cpp
+        ${CMAKE_SOURCE_DIR}/src/sample/road-decal/RoadDecalInputControl.cpp
+        ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
+)
+
+add_library(SC4RoadDecalSample SHARED ${ROAD_DECAL_SAMPLE_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
+
+target_include_directories(SC4RoadDecalSample PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/service
+        ${IMGUI_DIR}
+)
+
+target_link_libraries(SC4RoadDecalSample PRIVATE
+        imgui
+        gzcom2
+        spdlog
+)
+
+target_compile_definitions(SC4RoadDecalSample PRIVATE IMGUI_DLL_IMPORT)
+
+set_target_properties(SC4RoadDecalSample PROPERTIES
+        OUTPUT_NAME "SC4RoadDecalSample"
+        SUFFIX ".dll"
+        PREFIX ""
+)
+
 
 add_custom_target(SC4ImGuiAllTargets
-        DEPENDS imgui SC4CustomServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample
+        DEPENDS imgui SC4CustomServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample SC4RoadDecalSample
 )
 
 # Automatic deployment to SC4 directories
@@ -482,6 +514,14 @@ if(WIN32 AND NOT DEFINED ENV{CI})
                 COMMENT "Deploying SC4DrawServiceSample.dll to Plugins folder"
         )
 
+        add_custom_command(TARGET SC4RoadDecalSample POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${SC4_PLUGINS_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:SC4RoadDecalSample>
+                "${SC4_PLUGINS_DIR}/"
+                COMMENT "Deploying SC4RoadDecalSample.dll to Plugins folder"
+        )
+
         message(STATUS "Deployment targets configured:")
         message(STATUS "  - imgui.dll -> ${SC4_INSTALL_DIR}/Apps/")
         message(STATUS "  - SC4CustomServices.dll -> ${SC4_PLUGINS_DIR}/")
@@ -491,6 +531,7 @@ if(WIN32 AND NOT DEFINED ENV{CI})
         message(STATUS "  - SC4ImGuiTextureSample.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4WorldProjectionSample.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4DrawServiceSample.dll -> ${SC4_PLUGINS_DIR}/")
+        message(STATUS "  - SC4RoadDecalSample.dll -> ${SC4_PLUGINS_DIR}/")
     else()
         message(WARNING "SC4 installation not found. Manual deployment required.")
     endif()
