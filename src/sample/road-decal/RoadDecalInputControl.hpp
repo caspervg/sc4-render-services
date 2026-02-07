@@ -27,9 +27,14 @@ public:
     bool OnMouseExit() override;
     bool OnKeyDown(int32_t vkCode, uint32_t modifiers) override;
 
-    void SetStyle(int styleId);
+    void SetMarkupType(RoadMarkupType type);
+    void SetPlacementMode(PlacementMode mode);
     void SetWidth(float width);
+    void SetLength(float length);
+    void SetRotation(float radians);
     void SetDashed(bool dashed);
+    void SetDashPattern(float dashLength, float gapLength);
+    void SetAutoAlign(bool enabled);
     void SetOnCancel(std::function<void()> onCancel);
 
 private:
@@ -49,11 +54,17 @@ private:
     bool isActive_;
     bool isDrawing_;
 
-    RoadDecalStroke currentStroke_;
+    RoadMarkupStroke currentStroke_;
     RoadDecalPoint lastSamplePoint_;
-    int styleId_;
+    RoadMarkupType markupType_;
+    PlacementMode placementMode_;
     float width_;
+    float length_;
+    float rotation_;
     bool dashed_;
+    float dashLength_;
+    float gapLength_;
+    bool autoAlign_;
 
     std::function<void()> onCancel_;
 };

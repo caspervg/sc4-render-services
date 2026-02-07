@@ -3,8 +3,20 @@
 #include "cISC43DRender.h"
 #include "utils/Logger.h"
 
+#include <algorithm>
 #include <cmath>
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 
 namespace
 {
@@ -12,18 +24,27 @@ namespace
     constexpr uint32_t kShiftModifierMask = 0x10000;
     constexpr float kSnapSubgridMeters = 2.0f;
     constexpr float kDecalHeightOffset = 0.05f;
+    constexpr float kMinSampleDist = 0.5f;
 
-    float SnapToSubgrid(const float value)
+    float SnapToSubgrid(float value)
     {
         return std::round(value / kSnapSubgridMeters) * kSnapSubgridMeters;
     }
 
-    bool IsHardCornerModifierActive(const uint32_t modifiers)
+    bool IsHardCornerModifierActive(uint32_t modifiers)
     {
         if ((modifiers & kShiftModifierMask) != 0) {
             return true;
         }
         return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    }
+
+    bool IsCtrlModifierActive(uint32_t modifiers)
+    {
+        if ((modifiers & kControlModifierMask) != 0) {
+            return true;
+        }
+        return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
     }
 }
 
@@ -33,9 +54,15 @@ RoadDecalInputControl::RoadDecalInputControl()
     , isDrawing_(false)
     , currentStroke_({})
     , lastSamplePoint_({})
-    , styleId_(0)
-    , width_(1.0f)
+    , markupType_(RoadMarkupType::SolidWhiteLine)
+    , placementMode_(PlacementMode::Freehand)
+    , width_(0.15f)
+    , length_(3.0f)
+    , rotation_(0.0f)
     , dashed_(false)
+    , dashLength_(3.0f)
+    , gapLength_(9.0f)
+    , autoAlign_(true)
     , onCancel_()
 {
 }
@@ -56,7 +83,6 @@ bool RoadDecalInputControl::Init()
 
 bool RoadDecalInputControl::Shutdown()
 {
-    LOG_INFO("RoadDecalInputControl shutting down");
     CancelStroke_();
     RequestFullRedraw_();
     return cSC4BaseViewInputControl::Shutdown();
@@ -70,12 +96,10 @@ void RoadDecalInputControl::Activate()
         return;
     }
     isActive_ = true;
-    LOG_INFO("RoadDecalInputControl activated");
 }
 
 void RoadDecalInputControl::Deactivate()
 {
-    LOG_INFO("RoadDecalInputControl deactivated");
     isActive_ = false;
     CancelStroke_();
     cSC4BaseViewInputControl::Deactivate();
@@ -90,7 +114,6 @@ bool RoadDecalInputControl::OnMouseDownL(int32_t x, int32_t z, uint32_t modifier
     if (!isDrawing_) {
         return BeginStroke_(x, z, modifiers);
     }
-
     return AddSamplePoint_(x, z, modifiers);
 }
 
@@ -99,15 +122,15 @@ bool RoadDecalInputControl::OnMouseMove(int32_t x, int32_t z, uint32_t)
     if (!isActive_ || !isDrawing_) {
         return false;
     }
-
     UpdatePreviewFromScreen_(x, z);
     return true;
 }
 
-bool RoadDecalInputControl::OnMouseUpL(int32_t x, int32_t z, uint32_t)
+bool RoadDecalInputControl::OnMouseUpL(int32_t x, int32_t z, uint32_t modifiers)
 {
     (void)x;
     (void)z;
+    (void)modifiers;
     return false;
 }
 
@@ -124,7 +147,6 @@ bool RoadDecalInputControl::OnMouseDownR(int32_t, int32_t, uint32_t)
         RebuildRoadDecalGeometry();
         RequestFullRedraw_();
     }
-
     return true;
 }
 
@@ -143,14 +165,13 @@ bool RoadDecalInputControl::OnKeyDown(int32_t vkCode, uint32_t modifiers)
 
     if (vkCode == VK_ESCAPE) {
         CancelStroke_();
-        LOG_INFO("RoadDecalInputControl: ESC pressed, canceling");
         if (onCancel_) {
             onCancel_();
         }
         return true;
     }
 
-    if (vkCode == 'Z' && (modifiers & kControlModifierMask) != 0) {
+    if (vkCode == 'Z' && IsCtrlModifierActive(modifiers)) {
         UndoLastStroke_();
         RebuildRoadDecalGeometry();
         RequestFullRedraw_();
@@ -172,22 +193,45 @@ bool RoadDecalInputControl::OnKeyDown(int32_t vkCode, uint32_t modifiers)
     return false;
 }
 
-void RoadDecalInputControl::SetStyle(const int styleId)
+void RoadDecalInputControl::SetMarkupType(RoadMarkupType type)
 {
-    styleId_ = styleId;
+    markupType_ = type;
+}
+
+void RoadDecalInputControl::SetPlacementMode(PlacementMode mode)
+{
+    placementMode_ = mode;
 }
 
 void RoadDecalInputControl::SetWidth(float width)
 {
-    if (width < 0.05f) {
-        width = 0.05f;
-    }
-    width_ = width;
+    width_ = std::max(0.05f, width);
 }
 
-void RoadDecalInputControl::SetDashed(const bool dashed)
+void RoadDecalInputControl::SetLength(float length)
+{
+    length_ = std::max(0.0f, length);
+}
+
+void RoadDecalInputControl::SetRotation(float radians)
+{
+    rotation_ = radians;
+}
+
+void RoadDecalInputControl::SetDashed(bool dashed)
 {
     dashed_ = dashed;
+}
+
+void RoadDecalInputControl::SetDashPattern(float dashLength, float gapLength)
+{
+    dashLength_ = std::max(0.05f, dashLength);
+    gapLength_ = std::max(0.0f, gapLength);
+}
+
+void RoadDecalInputControl::SetAutoAlign(bool enabled)
+{
+    autoAlign_ = enabled;
 }
 
 void RoadDecalInputControl::SetOnCancel(std::function<void()> onCancel)
@@ -198,22 +242,15 @@ void RoadDecalInputControl::SetOnCancel(std::function<void()> onCancel)
 bool RoadDecalInputControl::PickWorld_(int32_t screenX, int32_t screenZ, RoadDecalPoint& outPoint)
 {
     if (!view3D) {
-        LOG_WARN("RoadDecalInputControl: view3D not available");
         return false;
     }
-
     float worldCoords[3] = {0.0f, 0.0f, 0.0f};
     if (!view3D->PickTerrain(screenX, screenZ, worldCoords, false)) {
         return false;
     }
-
-    outPoint.x = worldCoords[0];
+    outPoint.x = SnapToSubgrid(worldCoords[0]);
     outPoint.y = worldCoords[1] + kDecalHeightOffset;
-    outPoint.z = worldCoords[2];
-
-    // Keep points on a 2m subgrid for cleaner, more road-like alignment.
-    outPoint.x = SnapToSubgrid(outPoint.x);
-    outPoint.z = SnapToSubgrid(outPoint.z);
+    outPoint.z = SnapToSubgrid(worldCoords[2]);
     return true;
 }
 
@@ -226,17 +263,28 @@ bool RoadDecalInputControl::BeginStroke_(int32_t screenX, int32_t screenZ, uint3
     p.hardCorner = IsHardCornerModifierActive(modifiers);
 
     if (!SetCapture()) {
-        LOG_WARN("RoadDecalInputControl: failed to SetCapture");
         return false;
     }
 
-    currentStroke_.points.clear();
-    currentStroke_.styleId = styleId_;
+    currentStroke_ = {};
+    currentStroke_.type = markupType_;
     currentStroke_.width = width_;
+    currentStroke_.length = length_;
+    currentStroke_.rotation = rotation_;
     currentStroke_.dashed = dashed_;
+    currentStroke_.dashLength = dashLength_;
+    currentStroke_.gapLength = gapLength_;
+    currentStroke_.visible = true;
+    currentStroke_.opacity = 1.0f;
+    currentStroke_.color = GetRoadMarkupProperties(markupType_).defaultColor;
     currentStroke_.points.push_back(p);
     lastSamplePoint_ = p;
     isDrawing_ = true;
+
+    if (placementMode_ == PlacementMode::SingleClick) {
+        return EndStroke_(true);
+    }
+
     RefreshActiveStroke_();
     ClearPreview_();
     RequestFullRedraw_();
@@ -251,12 +299,32 @@ bool RoadDecalInputControl::AddSamplePoint_(int32_t screenX, int32_t screenZ, ui
     }
     p.hardCorner = IsHardCornerModifierActive(modifiers);
 
+    if (placementMode_ == PlacementMode::TwoPoint || placementMode_ == PlacementMode::Rectangle) {
+        if (currentStroke_.points.size() == 1) {
+            currentStroke_.points.push_back(p);
+        } else {
+            currentStroke_.points[1] = p;
+        }
+
+        if (autoAlign_) {
+            const auto& a = currentStroke_.points[0];
+            const float dx = p.x - a.x;
+            const float dz = p.z - a.z;
+            if (std::fabs(dx) > kMinSampleDist || std::fabs(dz) > kMinSampleDist) {
+                currentStroke_.rotation = std::atan2(dz, dx);
+            }
+        }
+
+        RefreshActiveStroke_();
+        ClearPreview_();
+        RequestFullRedraw_();
+        return EndStroke_(true);
+    }
+
     const float dx = p.x - lastSamplePoint_.x;
     const float dy = p.y - lastSamplePoint_.y;
     const float dz = p.z - lastSamplePoint_.z;
     const float dist2 = dx * dx + dy * dy + dz * dz;
-    constexpr float kMinSampleDist = 0.5f;
-
     if (dist2 < kMinSampleDist * kMinSampleDist) {
         return false;
     }
@@ -271,9 +339,15 @@ bool RoadDecalInputControl::AddSamplePoint_(int32_t screenX, int32_t screenZ, ui
 
 bool RoadDecalInputControl::EndStroke_(bool commit)
 {
-    if (commit && currentStroke_.points.size() >= 2) {
-        gRoadDecalStrokes.push_back(currentStroke_);
-        RebuildRoadDecalGeometry();
+    if (commit) {
+        const auto category = GetMarkupCategory(currentStroke_.type);
+        const bool singlePoint = (category == RoadMarkupCategory::DirectionalArrow ||
+                                  placementMode_ == PlacementMode::SingleClick);
+        const bool valid = singlePoint ? !currentStroke_.points.empty() : currentStroke_.points.size() >= 2;
+        if (valid) {
+            AddRoadMarkupStrokeToActiveLayer(currentStroke_);
+            RebuildRoadDecalGeometry();
+        }
     }
 
     currentStroke_.points.clear();
@@ -307,14 +381,33 @@ void RoadDecalInputControl::UpdatePreviewFromScreen_(int32_t screenX, int32_t sc
         return;
     }
 
-    SetRoadDecalPreviewSegment(true, lastSamplePoint_, p, currentStroke_.styleId, currentStroke_.width, currentStroke_.dashed);
+    RoadMarkupStroke preview = currentStroke_;
+    if (preview.points.empty()) {
+        preview.points.push_back(p);
+    } else if (placementMode_ == PlacementMode::SingleClick) {
+        preview.points[0] = p;
+    } else if (placementMode_ == PlacementMode::TwoPoint || placementMode_ == PlacementMode::Rectangle) {
+        if (preview.points.size() == 1) {
+            preview.points.push_back(p);
+        } else {
+            preview.points[1] = p;
+        }
+    } else {
+        if (preview.points.size() == 1) {
+            preview.points.push_back(p);
+        } else {
+            preview.points.back() = p;
+        }
+    }
+
+    SetRoadDecalPreviewSegment(true, preview);
     RequestFullRedraw_();
 }
 
 void RoadDecalInputControl::ClearPreview_()
 {
-    const RoadDecalPoint zero{0.0f, 0.0f, 0.0f};
-    SetRoadDecalPreviewSegment(false, zero, zero, 0, 0.0f, false);
+    RoadMarkupStroke emptyStroke{};
+    SetRoadDecalPreviewSegment(false, emptyStroke);
 }
 
 void RoadDecalInputControl::RefreshActiveStroke_()
@@ -325,31 +418,14 @@ void RoadDecalInputControl::RefreshActiveStroke_()
 void RoadDecalInputControl::RequestFullRedraw_()
 {
     return;
-    //
-    // if (!view3D) {
-    //     return;
-    // }
-    //
-    // cISC43DRender* renderer = view3D->GetRenderer();
-    // if (!renderer) {
-    //     return;
-    // }
-    //
-    // renderer->ForceFullRedraw();
 }
 
 void RoadDecalInputControl::UndoLastStroke_()
 {
-    if (gRoadDecalStrokes.empty()) {
-        return;
-    }
-    gRoadDecalStrokes.pop_back();
+    UndoLastRoadMarkupStroke();
 }
 
 void RoadDecalInputControl::ClearAllStrokes_()
 {
-    if (gRoadDecalStrokes.empty()) {
-        return;
-    }
-    gRoadDecalStrokes.clear();
+    ClearAllRoadMarkupStrokes();
 }

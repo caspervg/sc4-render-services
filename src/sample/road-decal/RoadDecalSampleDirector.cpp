@@ -11,7 +11,6 @@
 #include "utils/Logger.h"
 #include "SC4UI.h"
 
-#include <array>
 #include <atomic>
 #include <cstdint>
 
@@ -19,12 +18,35 @@ namespace
 {
     constexpr uint32_t kRoadDecalDirectorID = 0xE59A5D21;
     constexpr uint32_t kRoadDecalPanelId = 0x9B4A7A11;
-    constexpr float kRoadDecalWidth = 0.8f;
 
     RoadDecalInputControl* gRoadDecalTool = nullptr;
     std::atomic<bool> gRoadDecalToolEnabled{false};
-    std::atomic<int> gRoadDecalStyle{0};
-    std::atomic<bool> gRoadDecalDashed{false};
+
+    RoadMarkupType gSelectedType = RoadMarkupType::SolidWhiteLine;
+    PlacementMode gPlacementMode = PlacementMode::Freehand;
+    float gWidth = 0.15f;
+    float gLength = 3.0f;
+    float gRotationDeg = 0.0f;
+    bool gDashed = false;
+    float gDashLength = 3.0f;
+    float gGapLength = 9.0f;
+    bool gAutoAlign = true;
+    char gSavePath[260] = "road_markups.dat";
+
+    void SyncToolSettings()
+    {
+        if (!gRoadDecalTool) {
+            return;
+        }
+        gRoadDecalTool->SetMarkupType(gSelectedType);
+        gRoadDecalTool->SetPlacementMode(gPlacementMode);
+        gRoadDecalTool->SetWidth(gWidth);
+        gRoadDecalTool->SetLength(gLength);
+        gRoadDecalTool->SetRotation(gRotationDeg * 3.1415926f / 180.0f);
+        gRoadDecalTool->SetDashed(gDashed);
+        gRoadDecalTool->SetDashPattern(gDashLength, gGapLength);
+        gRoadDecalTool->SetAutoAlign(gAutoAlign);
+    }
 
     bool EnableRoadDecalTool()
     {
@@ -34,23 +56,21 @@ namespace
 
         auto view3D = SC4UI::GetView3DWin();
         if (!view3D) {
-            LOG_WARN("RoadDecalSample: View3D not available");
+            LOG_WARN("RoadMarkup: View3D not available");
             return false;
         }
 
         if (!gRoadDecalTool) {
             gRoadDecalTool = new RoadDecalInputControl();
             gRoadDecalTool->AddRef();
-            gRoadDecalTool->SetStyle(gRoadDecalStyle.load(std::memory_order_relaxed));
-            gRoadDecalTool->SetWidth(kRoadDecalWidth);
-            gRoadDecalTool->SetDashed(gRoadDecalDashed.load(std::memory_order_relaxed));
             gRoadDecalTool->SetOnCancel([]() {});
             gRoadDecalTool->Activate();
         }
+        SyncToolSettings();
 
         if (!view3D->SetCurrentViewInputControl(gRoadDecalTool,
                                                 cISC4View3DWin::ViewInputControlStackOperation_RemoveCurrentControl)) {
-            LOG_WARN("RoadDecalSample: failed to set current view input control");
+            LOG_WARN("RoadMarkup: failed to set current view input control");
             return false;
         }
 
@@ -92,15 +112,42 @@ namespace
         DrawRoadDecals();
     }
 
+    void DrawTypeButtons(RoadMarkupCategory category)
+    {
+        const auto& types = GetRoadMarkupTypesForCategory(category);
+        for (size_t i = 0; i < types.size(); ++i) {
+            const auto type = types[i];
+            const auto& props = GetRoadMarkupProperties(type);
+            if (ImGui::Selectable(props.displayName, gSelectedType == type)) {
+                gSelectedType = type;
+                gWidth = props.defaultWidth > 0.0f ? props.defaultWidth : gWidth;
+                gLength = props.defaultLength > 0.0f ? props.defaultLength : gLength;
+                gDashed = props.supportsDashing;
+
+                if (category == RoadMarkupCategory::DirectionalArrow) {
+                    gPlacementMode = PlacementMode::SingleClick;
+                } else if (category == RoadMarkupCategory::Crossing) {
+                    gPlacementMode = PlacementMode::TwoPoint;
+                } else {
+                    gPlacementMode = PlacementMode::Freehand;
+                }
+            }
+            if ((i + 1) % 2 != 0 && (i + 1) < types.size()) {
+                ImGui::SameLine();
+            }
+        }
+    }
+
     class RoadDecalPanel final : public ImGuiPanel
     {
     public:
         void OnRender() override
         {
-            ImGui::Begin("Road Decals");
+            EnsureDefaultRoadMarkupLayer();
+            ImGui::Begin("Road Markings");
 
             bool toolEnabled = gRoadDecalToolEnabled.load(std::memory_order_relaxed);
-            if (ImGui::Checkbox("Enable", &toolEnabled)) {
+            if (ImGui::Checkbox("Enable Tool", &toolEnabled)) {
                 if (toolEnabled) {
                     toolEnabled = EnableRoadDecalTool();
                 } else {
@@ -109,39 +156,92 @@ namespace
                 gRoadDecalToolEnabled.store(toolEnabled, std::memory_order_relaxed);
             }
 
-            static const char* styleItems[] = {"White", "Yellow", "Red"};
-            int style = gRoadDecalStyle.load(std::memory_order_relaxed);
-            if (ImGui::Combo("Color", &style, styleItems, static_cast<int>(std::size(styleItems)))) {
-                gRoadDecalStyle.store(style, std::memory_order_relaxed);
-                if (gRoadDecalTool) {
-                    gRoadDecalTool->SetStyle(style);
+            if (ImGui::BeginTabBar("##RoadMarkupTabs")) {
+                if (ImGui::BeginTabItem("Lane Lines")) {
+                    DrawTypeButtons(RoadMarkupCategory::LaneDivider);
+                    ImGui::EndTabItem();
                 }
+                if (ImGui::BeginTabItem("Arrows")) {
+                    DrawTypeButtons(RoadMarkupCategory::DirectionalArrow);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Crossings")) {
+                    DrawTypeButtons(RoadMarkupCategory::Crossing);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Zones")) {
+                    DrawTypeButtons(RoadMarkupCategory::ZoneMarking);
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
             }
 
-            bool dashed = gRoadDecalDashed.load(std::memory_order_relaxed);
-            if (ImGui::Checkbox("Dashed", &dashed)) {
-                gRoadDecalDashed.store(dashed, std::memory_order_relaxed);
-                if (gRoadDecalTool) {
-                    gRoadDecalTool->SetDashed(dashed);
-                }
+            const auto& props = GetRoadMarkupProperties(gSelectedType);
+            ImGui::Text("Selected: %s", props.displayName);
+            ImGui::SliderFloat("Width", &gWidth, 0.05f, 4.0f, "%.2f m");
+            ImGui::SliderFloat("Length", &gLength, 0.5f, 12.0f, "%.2f m");
+            ImGui::Checkbox("Dashed", &gDashed);
+            if (gDashed) {
+                ImGui::SliderFloat("Dash Length", &gDashLength, 0.2f, 12.0f, "%.2f m");
+                ImGui::SliderFloat("Gap Length", &gGapLength, 0.1f, 12.0f, "%.2f m");
+            }
+            ImGui::Checkbox("Auto Align", &gAutoAlign);
+            if (!gAutoAlign) {
+                ImGui::SliderFloat("Rotation", &gRotationDeg, -180.0f, 180.0f, "%.0f deg");
             }
 
-            if (ImGui::Button("Undo")) {
-                if (!gRoadDecalStrokes.empty()) {
-                    gRoadDecalStrokes.pop_back();
-                    RebuildRoadDecalGeometry();
+            int mode = static_cast<int>(gPlacementMode);
+            if (ImGui::RadioButton("Freehand", mode == static_cast<int>(PlacementMode::Freehand))) mode = static_cast<int>(PlacementMode::Freehand);
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Two Point", mode == static_cast<int>(PlacementMode::TwoPoint))) mode = static_cast<int>(PlacementMode::TwoPoint);
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Single", mode == static_cast<int>(PlacementMode::SingleClick))) mode = static_cast<int>(PlacementMode::SingleClick);
+            gPlacementMode = static_cast<PlacementMode>(mode);
+
+            ImGui::Separator();
+            ImGui::Text("Layers");
+            for (size_t i = 0; i < gRoadMarkupLayers.size(); ++i) {
+                auto& layer = gRoadMarkupLayers[i];
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::Checkbox("##vis", &layer.visible);
+                ImGui::SameLine();
+                if (ImGui::Selectable(layer.name.c_str(), gActiveLayerIndex == static_cast<int>(i))) {
+                    gActiveLayerIndex = static_cast<int>(i);
                 }
+                ImGui::PopID();
+            }
+            if (ImGui::Button("New Layer")) {
+                AddRoadMarkupLayer("Layer");
             }
             ImGui::SameLine();
-            if (ImGui::Button("Clear")) {
-                if (!gRoadDecalStrokes.empty()) {
-                    gRoadDecalStrokes.clear();
-                    RebuildRoadDecalGeometry();
-                }
+            if (ImGui::Button("Delete Layer")) {
+                DeleteActiveRoadMarkupLayer();
             }
 
-            //ImGui::Text("Strokes: %u", static_cast<uint32_t>(gRoadDecalStrokes.size()));
-            //ImGui::TextUnformatted("LMB add points, Shift hard corner, RMB/Enter finish, Ctrl+Z undo, Delete clear.");
+            ImGui::Separator();
+            if (ImGui::Button("Undo")) {
+                UndoLastRoadMarkupStroke();
+                RebuildRoadDecalGeometry();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear All")) {
+                ClearAllRoadMarkupStrokes();
+                RebuildRoadDecalGeometry();
+            }
+
+            ImGui::InputText("File", gSavePath, sizeof(gSavePath));
+            if (ImGui::Button("Save")) {
+                SaveMarkupsToFile(gSavePath);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Load")) {
+                LoadMarkupsFromFile(gSavePath);
+            }
+
+            ImGui::Text("Markings: %u", static_cast<uint32_t>(GetTotalRoadMarkupStrokeCount()));
+            ImGui::TextUnformatted("LMB: place/draw  RMB: finish/clear  ESC: cancel  Ctrl+Z: undo");
+
+            SyncToolSettings();
             ImGui::End();
         }
     };
@@ -161,7 +261,6 @@ public:
     {
         cRZCOMDllDirector::OnStart(pCOM);
         Logger::Initialize("SC4RoadDecalSample", "");
-        LOG_INFO("RoadDecalSample: OnStart");
         if (mpFrameWork) {
             mpFrameWork->AddHook(this);
         }
@@ -177,38 +276,32 @@ public:
         if (!mpFrameWork->GetSystemService(kImGuiServiceID,
                                            GZIID_cIGZImGuiService,
                                            reinterpret_cast<void**>(&imguiService_))) {
-            LOG_WARN("RoadDecalSample: ImGui service not available");
+            LOG_WARN("RoadMarkup: ImGui service not available");
             return true;
         }
 
         auto* panel = new RoadDecalPanel();
-        const ImGuiPanelDesc desc =
-            ImGuiPanelAdapter<RoadDecalPanel>::MakeDesc(panel, kRoadDecalPanelId, 120, true);
-
+        const ImGuiPanelDesc desc = ImGuiPanelAdapter<RoadDecalPanel>::MakeDesc(panel, kRoadDecalPanelId, 120, true);
         if (!imguiService_->RegisterPanel(desc)) {
-            LOG_WARN("RoadDecalSample: failed to register panel");
             delete panel;
             imguiService_->Release();
             imguiService_ = nullptr;
             return true;
         }
-
         panelRegistered_ = true;
         gImGuiServiceForD3DOverlay.store(imguiService_, std::memory_order_release);
 
         if (!mpFrameWork->GetSystemService(kDrawServiceID,
                                            GZIID_cIGZDrawService,
                                            reinterpret_cast<void**>(&drawService_))) {
-            LOG_WARN("RoadDecalSample: Draw service not available; decals will not be drawn");
+            LOG_WARN("RoadMarkup: Draw service not available");
             return true;
         }
 
-        if (!drawService_->RegisterDrawPassCallback(DrawServicePass::PreDynamic,
-                                                    &DrawPassRoadDecalCallback,
-                                                    nullptr,
-                                                    &drawPassCallbackToken_)) {
-            LOG_WARN("RoadDecalSample: failed to subscribe to pre-dynamic draw pass");
-        }
+        drawService_->RegisterDrawPassCallback(DrawServicePass::PreDynamic,
+                                               &DrawPassRoadDecalCallback,
+                                               nullptr,
+                                               &drawPassCallbackToken_);
         return true;
     }
 
@@ -231,7 +324,6 @@ public:
             imguiService_->Release();
             imguiService_ = nullptr;
         }
-
         panelRegistered_ = false;
         return true;
     }
