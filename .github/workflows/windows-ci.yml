@@ -62,6 +62,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $buildDir = Join-Path $env:GITHUB_WORKSPACE "cmake-build-release-visual-studio/Release"
+          $rootDir = $env:GITHUB_WORKSPACE
           $outDir = Join-Path $env:GITHUB_WORKSPACE "artifacts"
           New-Item -ItemType Directory -Path $outDir -Force | Out-Null
           $dlls = @(
@@ -78,6 +79,8 @@ jobs:
             "SC4RoadDecalSample.dll"
           )
           $paths = $dlls | ForEach-Object { Join-Path $buildDir $_ }
+          # Include the default INI config file
+          $paths += Join-Path $rootDir "SC4RenderServices.ini"
           $archive = Join-Path $outDir ("sc4-render-services-" + "${{ github.ref_name }}" + "-win32-release.zip")
           Compress-Archive -Path $paths -DestinationPath $archive -Force
 

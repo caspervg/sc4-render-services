@@ -133,6 +133,10 @@ bool ImGuiService::QueryInterface(uint32_t riid, void** ppvObj) {
     return cRZBaseSystemService::QueryInterface(riid, ppvObj);
 }
 
+void ImGuiService::SetInitSettings(const ImGuiInitSettings& settings) {
+    initSettings_ = settings;
+}
+
 bool ImGuiService::Init() {
     const auto version = VersionDetection::GetInstance().GetGameVersion();
     if (version != 641) {
@@ -556,7 +560,7 @@ bool ImGuiService::EnsureInitialized_() {
         return false;
     }
 
-    if (!DX7InterfaceHook::InitializeImGui(hwnd)) {
+    if (!DX7InterfaceHook::InitializeImGui(hwnd, initSettings_)) {
         LOG_ERROR("ImGuiService: failed to initialize ImGui backends");
         return false;
     }

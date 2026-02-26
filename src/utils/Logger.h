@@ -11,7 +11,12 @@ public:
 
     // Initialize the logger (called once at startup)
     // If userDir is provided, logs will be written there; otherwise falls back to Documents\SimCity 4
-    static void Initialize(const std::string& logName = "UnknownDllMod", const std::string& userDir = "");
+    // If logToFile is false, only the MSVC debug output sink is created
+    static void Initialize(const std::string& logName = "UnknownDllMod", const std::string& userDir = "",
+                           bool logToFile = true);
+
+    // Set the log level (and flush level) at runtime
+    static void SetLevel(spdlog::level::level_enum logLevel);
 
     // Shutdown the logger (called at exit)
     static void Shutdown();

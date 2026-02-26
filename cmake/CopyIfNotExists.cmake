@@ -1,0 +1,6 @@
+if(NOT EXISTS "${DST}")
+    file(COPY_FILE "${SRC}" "${DST}")
+    message(STATUS "Copied ${SRC} -> ${DST}")
+else()
+    message(STATUS "Skipping ${DST} (already exists)")
+endif()

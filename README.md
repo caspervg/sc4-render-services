@@ -16,11 +16,63 @@ cmake -S . -B cmake-build-debug-visual-studio -G "Visual Studio 17 2022"
 cmake --build cmake-build-debug-visual-studio --config Debug
 ```
 
+## Installation
+
+1. Copy `imgui.dll` into your SimCity 4 **Apps** folder
+   (e.g. `C:\Program Files (x86)\SimCity 4 Deluxe Edition\Apps\`).
+2. Copy `SC4RenderServices.dll` and `SC4RenderServices.ini` into your
+   **Plugins** folder
+   (e.g. `Documents\SimCity 4\Plugins\`).
+3. (Optional) Copy any sample DLLs you want into the same **Plugins** folder.
+4. Edit `SC4RenderServices.ini` to customise logging, appearance, and which
+   services are loaded. See [Configuration](#configuration) below.
+
+## Configuration
+
+`SC4RenderServices.ini` must sit next to `SC4RenderServices.dll` in the
+Plugins folder. All settings are optional; if the file is missing or a key
+is absent the default value is used.
+
+```ini
+[SC4RenderServices]
+; Logging verbosity.
+; Valid values: trace, debug, info, warn, error, critical, off
+LogLevel=info
+
+; Write logs to file. Set to false for MSVC debug output only.
+LogToFile=true
+
+; ImGui base font size in pixels. Valid range: 8.0 - 32.0
+FontSize=13.0
+
+; Custom .ttf font file path (relative to DLL folder).
+; Leave empty to use the built-in ProggyVector font.
+FontFile=
+
+; Font oversampling level (1-3). Higher = crisper text, more memory.
+FontOversample=2
+
+; ImGui color theme. Valid values: dark, light, classic
+Theme=dark
+
+; Enable ImGui keyboard navigation.
+KeyboardNav=true
+
+; Global UI scale factor. Valid range: 0.5 - 3.0
+UIScale=1.0
+
+; Enable or disable individual services.
+EnableImGuiService=true
+EnableS3DCameraService=true
+EnableDrawService=true
+```
+
 ## Outputs
 
 Required:
 - `imgui.dll` (deployed to `...\SimCity 4 Deluxe Edition\Apps`)
 - `SC4RenderServices.dll` (deployed to `...\Documents\SimCity 4\Plugins\`)
+- `SC4RenderServices.ini` (deployed to `...\Documents\SimCity 4\Plugins\`)
 
 Optional samples (deployed to `...\Documents\SimCity 4\Plugins\`):
 - `SC4ImGuiSample.dll` (basic panel)

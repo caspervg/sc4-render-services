@@ -12,6 +12,7 @@
 #include <Windows.h>
 
 #include "cRZBaseSystemService.h"
+#include "DX7InterfaceHook.h"
 #include "public/cIGZImGuiService.h"
 
 // Forward declaration
@@ -29,6 +30,7 @@ public:
 
     bool QueryInterface(uint32_t riid, void** ppvObj) override;
 
+    void SetInitSettings(const ImGuiInitSettings& settings);
     bool Init() override;
     bool Shutdown() override;
     bool OnTick(uint32_t unknown1) override;
@@ -144,6 +146,7 @@ private:
     std::unordered_map<uint32_t, ManagedTexture> textures_;  // Key: texture ID
     mutable std::mutex texturesMutex_;
 
+    ImGuiInitSettings initSettings_;
     HWND gameWindow_;
     WNDPROC originalWndProc_;
     std::atomic<bool> initialized_;

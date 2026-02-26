@@ -57,6 +57,15 @@ endif()
 add_subdirectory(vendor/spdlog)
 add_subdirectory(vendor/gzcom-dll)
 
+set(MINI_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/mINI/src")
+if (NOT EXISTS "${MINI_INCLUDE_DIR}/mini/ini.h")
+    message(
+        FATAL_ERROR
+        "Missing vendor/mINI headers. Initialize submodules with: "
+        "'git submodule update --init --recursive'."
+    )
+endif ()
+
 # Keep CRT runtime consistent across all targets even if a subproject sets /MT(/d).
 if(MSVC)
     target_compile_options(gzcom_dll PRIVATE
@@ -113,6 +122,7 @@ set(CUSTOM_SERVICES_SOURCES
         ${CMAKE_SOURCE_DIR}/src/service/RenderServicesDirector.cpp
         ${CMAKE_SOURCE_DIR}/src/utils/VersionDetection.cpp
         ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
+        ${CMAKE_SOURCE_DIR}/src/utils/Settings.cpp
         ${CMAKE_SOURCE_DIR}/src/DX7InterfaceHook.cpp
 )
 
@@ -122,6 +132,7 @@ target_include_directories(SC4RenderServices PRIVATE
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/src/service
         ${IMGUI_DIR}
+        ${MINI_INCLUDE_DIR}
 )
 
 target_link_libraries(SC4RenderServices PRIVATE
@@ -448,7 +459,11 @@ if(WIN32 AND NOT DEFINED ENV{CI})
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 $<TARGET_FILE:SC4RenderServices>
                 "${SC4_PLUGINS_DIR}/"
-                COMMENT "Deploying SC4RenderServices.dll to Plugins folder"
+                COMMAND ${CMAKE_COMMAND}
+                -DSRC=${CMAKE_SOURCE_DIR}/SC4RenderServices.ini
+                -DDST=${SC4_PLUGINS_DIR}/SC4RenderServices.ini
+                -P ${CMAKE_SOURCE_DIR}/cmake/CopyIfNotExists.cmake
+                COMMENT "Deploying SC4RenderServices.dll to Plugins folder (INI only if missing)"
         )
 
         add_custom_command(TARGET SC4ImGuiSample POST_BUILD

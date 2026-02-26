@@ -13,7 +13,7 @@ std::shared_ptr<spdlog::logger> Logger::Get() {
     return s_logger;
 }
 
-void Logger::Initialize(const std::string& logName, const std::string& userDir) {
+void Logger::Initialize(const std::string& logName, const std::string& userDir, const bool logToFile) {
     if (s_initialized && s_logger) {
         return;
     }
@@ -41,7 +41,7 @@ void Logger::Initialize(const std::string& logName, const std::string& userDir) 
             }
         }
 
-        if (!logDir.empty()) {
+        if (logToFile && !logDir.empty()) {
             std::filesystem::create_directories(logDir);
             std::string logPath = (logDir / (s_logName + ".log")).string();
             sinks.push_back(std::make_shared<spdlog::sinks::basic_file_sink_mt>(logPath, true));
@@ -67,6 +67,13 @@ void Logger::Initialize(const std::string& logName, const std::string& userDir) 
         s_logger->set_level(spdlog::level::info);
         s_logger->error("Failed to initialize file logging: {}", e.what());
         s_initialized = true;
+    }
+}
+
+void Logger::SetLevel(const spdlog::level::level_enum logLevel) {
+    if (s_logger) {
+        s_logger->set_level(logLevel);
+        s_logger->flush_on(logLevel);
     }
 }
 

@@ -1,6 +1,7 @@
 #include "DX7InterfaceHook.h"
 
 #include <atomic>
+#include <filesystem>
 #include <Windows.h>
 
 #include "imgui.h"
@@ -73,7 +74,7 @@ bool DX7InterfaceHook::CaptureInterface(cIGZGDriver* pDriver)
     return candidate != nullptr;
 }
 
-bool DX7InterfaceHook::InitializeImGui(const HWND hwnd)
+bool DX7InterfaceHook::InitializeImGui(const HWND hwnd, const ImGuiInitSettings& settings)
 {
     auto* d3dx = s_pD3DX.load(std::memory_order_acquire);
     if (!d3dx || !hwnd || !IsWindow(hwnd)) {
@@ -87,24 +88,62 @@ bool DX7InterfaceHook::InitializeImGui(const HWND hwnd)
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    ImGui::StyleColorsDark();
+    if (settings.keyboardNav) {
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    }
 
-    // Configure font with improved rendering
+    // Apply theme
+    if (settings.theme == "light") {
+        ImGui::StyleColorsLight();
+    } else if (settings.theme == "classic") {
+        ImGui::StyleColorsClassic();
+    } else {
+        ImGui::StyleColorsDark();
+    }
+
+    // Apply UI scale
+    if (settings.uiScale != 1.0f) {
+        ImGui::GetStyle().ScaleAllSizes(settings.uiScale);
+    }
+
+    // Configure font rendering
     ImFontConfig fontConfig;
-    fontConfig.OversampleH = 2;  // Horizontal oversampling for crisper text
-    fontConfig.OversampleV = 2;  // Vertical oversampling for crisper text
-    fontConfig.PixelSnapH = true;  // Snap to pixel grid for sharper rendering
+    fontConfig.OversampleH = settings.fontOversample;
+    fontConfig.OversampleV = settings.fontOversample;
+    fontConfig.PixelSnapH = true;
     fontConfig.GlyphExtraAdvanceX = 0.0f;
 
-    // Load ProggyClean font
-    ImFont* font = io.Fonts->AddFontFromMemoryCompressedTTF(ProggyVector_compressed_data, ProggyVector_compressed_size, 13.0f, &fontConfig);
+    const float scaledFontSize = settings.fontSize * settings.uiScale;
+
+    // Load font: custom TTF file or built-in ProggyVector
+    ImFont* font = nullptr;
+    if (!settings.fontFile.empty()) {
+        const std::filesystem::path fontPath(settings.fontFile);
+        if (std::filesystem::exists(fontPath)) {
+            font = io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), scaledFontSize, &fontConfig);
+            if (font) {
+                LOG_INFO("DX7InterfaceHook::InitializeImGui: loaded custom font from {}", fontPath.string());
+            } else {
+                LOG_WARN("DX7InterfaceHook::InitializeImGui: failed to load font from {}, falling back to built-in", fontPath.string());
+            }
+        } else {
+            LOG_WARN("DX7InterfaceHook::InitializeImGui: font file not found: {}, falling back to built-in", fontPath.string());
+        }
+    }
+
+    if (!font) {
+        font = io.Fonts->AddFontFromMemoryCompressedTTF(
+            ProggyVector_compressed_data, ProggyVector_compressed_size, scaledFontSize, &fontConfig);
+        if (font) {
+            LOG_INFO("DX7InterfaceHook::InitializeImGui: loaded built-in font (size={})", scaledFontSize);
+        } else {
+            LOG_WARN("DX7InterfaceHook::InitializeImGui: failed to load built-in font, will use the d3d7imgui default");
+        }
+    }
+
     if (font) {
         io.FontDefault = font;
-        LOG_INFO("DX7InterfaceHook::InitializeImGui: loaded custom font");
-    } else {
-        LOG_WARN("DX7InterfaceHook::InitializeImGui: failed to load custom font, will use the d3d7imgui default");
     }
 
     ImGui_ImplWin32_Init(hwnd);
