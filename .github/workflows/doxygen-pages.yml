@@ -26,8 +26,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y doxygen graphviz
 
-      - name: Generate Docs
+      - name: Generate docs (interactive)
         run: doxygen docs/Doxyfile
+
+      - name: Generate docs (plain)
+        run: doxygen docs/Doxyfile.ai
+
+      - name: Merge outputs
+        run: |
+          touch docs/doxygen/html/.nojekyll
+          mv docs/doxygen-plain/html docs/doxygen/html/plain
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/doxygen/html
 
       - name: Upload Pages Artifact
         uses: actions/upload-pages-artifact@v3
