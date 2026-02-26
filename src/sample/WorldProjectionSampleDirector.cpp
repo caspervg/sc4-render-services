@@ -37,7 +37,7 @@ namespace {
     constexpr auto kWorldProjectionSampleDirectorID = 0xB7E4F2A9;
     constexpr uint32_t kWorldProjectionPanelId = 0x3D9C8B1F;
     constexpr const wchar_t* kBillboardImagePath =
-        L"C:\\Users\\caspe\\CLionProjects\\sc4-imgui-backend\\assets\\nam49.jpg";
+        L"C:\\Users\\caspe\\CLionProjects\\sc4-render-services\\assets\\nam49.jpg";
     bool gGdiplusStarted = false;
     ULONG_PTR gGdiplusToken = 0;
     cIGZS3DCameraService* gCameraService = nullptr;

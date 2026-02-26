@@ -370,3 +370,4 @@ vcpkg_installed/
 *.iml
 extra-info/
 fonts/
+docs/doxygen/

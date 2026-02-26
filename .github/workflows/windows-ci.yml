@@ -66,14 +66,19 @@ jobs:
           New-Item -ItemType Directory -Path $outDir -Force | Out-Null
           $dlls = @(
             "imgui.dll",
-            "SC4CustomServices.dll",
+            "SC4RenderServices.dll",
             "SC4ImGuiSample.dll",
             "SC4ImGuiSampleCity.dll",
             "SC4ImGuiSampleDemo.dll",
-            "SC4WorldProjectionSample.dll"
+            "SC4ImGuiTextureSample.dll",
+            "SC4WorldProjectionSample.dll",
+            "SC4S3DCameraDebugSample.dll",
+            "SC4OverlayManagerSample.dll",
+            "SC4DrawServiceSample.dll",
+            "SC4RoadDecalSample.dll"
           )
           $paths = $dlls | ForEach-Object { Join-Path $buildDir $_ }
-          $archive = Join-Path $outDir ("sc4-imgui-backend-" + "${{ github.ref_name }}" + "-win32-release.zip")
+          $archive = Join-Path $outDir ("sc4-render-services-" + "${{ github.ref_name }}" + "-win32-release.zip")
           Compress-Archive -Path $paths -DestinationPath $archive -Force
 
       - name: Create Release

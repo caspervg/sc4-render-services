@@ -140,7 +140,7 @@ bool ImGuiService::Init() {
         return true;
     }
 
-    Logger::Initialize("SC4ImGuiService", "");
+    Logger::Initialize("ImGuiService", "");
     LOG_INFO("ImGuiService: initialized");
     SetServiceRunning(true);
     initialized_ = true;

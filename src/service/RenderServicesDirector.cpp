@@ -1,5 +1,5 @@
-#include "ImGuiService.h"
 #include "DrawService.h"
+#include "ImGuiService.h"
 #include "S3DCameraService.h"
 
 #include "cIGZFrameWork.h"
@@ -7,25 +7,25 @@
 #include "utils/Logger.h"
 
 namespace {
-    constexpr auto kCustomServicesDirectorID = 0xC17F4B21; // reuse previous ImGui director ID to avoid duplicates
+    constexpr auto kRenderServicesDirectorID = 0xC17F4B21;
 }
 
-class CustomServicesDirector final : public cRZCOMDllDirector {
+class RenderServicesDirector final : public cRZCOMDllDirector {
 public:
-    CustomServicesDirector() = default;
+    RenderServicesDirector() = default;
 
     [[nodiscard]] uint32_t GetDirectorID() const override {
-        return kCustomServicesDirectorID;
+        return kRenderServicesDirectorID;
     }
 
     bool OnStart(cIGZCOM* pCOM) override {
         cRZCOMDllDirector::OnStart(pCOM);
 
-        Logger::Initialize("SC4CustomServices", "");
-        LOG_INFO("CustomServicesDirector: OnStart");
+        Logger::Initialize("SC4RenderServices", "");
+        LOG_INFO("RenderServicesDirector: OnStart");
 
         if (!mpFrameWork) {
-            LOG_WARN("CustomServicesDirector: framework not available");
+            LOG_WARN("RenderServicesDirector: framework not available");
             return true;
         }
 
@@ -34,32 +34,32 @@ public:
             mpFrameWork->AddHook(this);
             mpFrameWork->AddSystemService(&imguiService_);
             mpFrameWork->AddToTick(&imguiService_);
-            LOG_INFO("CustomServicesDirector: ImGuiService registered");
+            LOG_INFO("RenderServicesDirector: ImGuiService registered");
         } else {
-            LOG_WARN("CustomServicesDirector: ImGuiService not registered (version check failed)");
+            LOG_WARN("RenderServicesDirector: ImGuiService not registered (version check failed)");
         }
 
         // Register camera service (641-gated inside Init)
         if (cameraService_.Init()) {
             mpFrameWork->AddSystemService(&cameraService_);
-            LOG_INFO("CustomServicesDirector: S3DCameraService registered");
+            LOG_INFO("RenderServicesDirector: S3DCameraService registered");
         } else {
-            LOG_WARN("CustomServicesDirector: S3DCameraService not registered (version check failed)");
+            LOG_WARN("RenderServicesDirector: S3DCameraService not registered (version check failed)");
         }
 
         // Register draw service (641-gated inside Init)
         if (drawService_.Init()) {
             mpFrameWork->AddSystemService(&drawService_);
-            LOG_INFO("CustomServicesDirector: DrawService registered");
+            LOG_INFO("RenderServicesDirector: DrawService registered");
         } else {
-            LOG_WARN("CustomServicesDirector: DrawService not registered (version check failed)");
+            LOG_WARN("RenderServicesDirector: DrawService not registered (version check failed)");
         }
 
         return true;
     }
 
     bool PostAppShutdown() override {
-        LOG_INFO("CustomServicesDirector: PostAppShutdown");
+        LOG_INFO("RenderServicesDirector: PostAppShutdown");
 
         if (mpFrameWork) {
             mpFrameWork->RemoveFromTick(&imguiService_);
@@ -81,7 +81,7 @@ private:
     DrawService drawService_;
 };
 
-static CustomServicesDirector sDirector;
+static RenderServicesDirector sDirector;
 
 cRZCOMDllDirector* RZGetCOMDllDirector() {
     static auto sAddedRef = false;

@@ -8,12 +8,13 @@
 static constexpr auto kDrawServiceID = 0xD6A70C11;
 static constexpr auto GZIID_cIGZDrawService = 0xA43BF2E7;
 
-// Opaque handle returned by the draw service. Version tag guards cross-build use.
+/// Opaque handle returned by the draw service. Version tag guards cross-build use.
 struct SC4DrawContextHandle {
     void* ptr;
     uint16_t version;
 };
 
+/// Render pass identifiers used by DrawService callbacks.
 enum class DrawServicePass : uint8_t {
     PreStatic = 0,
     Static,
@@ -23,13 +24,21 @@ enum class DrawServicePass : uint8_t {
     PostDynamic
 };
 
+/// Callback invoked before and after a render pass.
 using DrawPassCallback = void (*)(DrawServicePass pass, bool begin, void* userData);
 
 // ReSharper disable once CppPolymorphicClassWithNonVirtualPublicDestructor
+/// Draw service interface.
 class cIGZDrawService : public cIGZUnknown {
 public:
-    [[nodiscard]] virtual uint32_t GetServiceID() const = 0; // kDrawServiceID
+    /** @name Service Info */
+    ///@{
+    /// Returns the service ID (kDrawServiceID).
+    [[nodiscard]] virtual uint32_t GetServiceID() const = 0;
+    ///@}
 
+    /** @name Draw Context Helpers */
+    ///@{
     // Wrap an existing draw context pointer.
     virtual SC4DrawContextHandle WrapDrawContext(void* existingDrawContextPtr) = 0;
     // Convenience: wraps the active renderer draw context (if available).
@@ -42,10 +51,20 @@ public:
     virtual void RendererDrawPreDynamicView() = 0;
     virtual void RendererDrawDynamicView() = 0;
     virtual void RendererDrawPostDynamicView() = 0;
+    ///@}
+
+    /** @name Render Pass Callbacks */
+    ///@{
+    /// Registers a callback for a render pass.
+    /// The callback is invoked before (begin=true) and after (begin=false) the pass.
     virtual bool RegisterDrawPassCallback(DrawServicePass pass, DrawPassCallback callback,
                                           void* userData, uint32_t* outToken) = 0;
+    /// Unregisters a previously registered callback token.
     virtual void UnregisterDrawPassCallback(uint32_t token) = 0;
+    ///@}
 
+    /** @name Render State and Drawing */
+    ///@{
     virtual void SetHighlightColor(SC4DrawContextHandle handle, int highlightType,
                                    float r, float g, float b, float a) = 0;
     virtual void SetRenderStateHighlight(SC4DrawContextHandle handle, int highlightType) = 0;
@@ -108,4 +127,5 @@ public:
     virtual void DrawPrimsIndexedRaw(SC4DrawContextHandle handle, uint32_t primType, uint32_t indexBuffer,
                                      uint32_t indexCount, uint32_t flags) = 0;
     virtual void DrawRect(SC4DrawContextHandle handle, void* drawTarget, int* rect) = 0;
+    ///@}
 };

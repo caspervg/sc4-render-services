@@ -57,7 +57,7 @@ namespace {
 
             ImGui::Text("Service pointer: %p", cameraService_);
             if (!cameraService_) {
-                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Camera service unavailable (check SC4CustomServices load/version)");
+                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Camera service unavailable (check SC4RenderServices load/version)");
                 ImGui::End();
                 return;
             }

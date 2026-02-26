@@ -2,37 +2,51 @@
 
 #include "cIGZUnknown.h"
 
+/// Panel descriptor for ImGui-managed panels.
 struct ImGuiPanelDesc
 {
+    /// Unique panel ID; must be non-zero.
     uint32_t id{};
+    /// Sort order; smaller values render first.
     int32_t order{};
+    /// Initial visibility.
     bool visible{};
+    /// Called once after ImGui initializes.
     void (*on_init)(void* data){};
+    /// Called every frame when visible; should issue ImGui draw calls.
     void (*on_render)(void* data){};
+    /// Called every frame when visible, before on_render.
     void (*on_update)(void* data){};
+    /// Called when visibility changes via SetPanelVisible.
     void (*on_visible_changed)(void* data, bool visible){};
+    /// Called during service shutdown.
     void (*on_shutdown)(void* data){};
+    /// Called when the panel is unregistered.
     void (*on_unregister)(void* data){};
 	void (*on_device_lost)(void* data){};
 	void (*on_device_restored)(void* data){};
+    /// User data passed back to callbacks.
     void* data{};
-    uint32_t fontId{0};  // 0 = use default font
+    /// Font ID to use for this panel (0 = default).
+    uint32_t fontId{0};
 };
 
 struct IDirectDraw7;
 struct IDirect3DDevice7;
 
+/// One-shot render callback executed on the next ImGui frame.
 using ImGuiRenderCallback = void (*)(void* data);
+/// Cleanup callback executed after the render callback or during shutdown if queued.
 using ImGuiRenderCleanup = void (*)(void* data);
 
-// Texture handle with generation tracking
+/// Texture handle with device generation tracking.
 struct ImGuiTextureHandle
 {
     uint32_t id;              // Unique texture ID
     uint32_t generation;      // Device generation when created
 };
 
-// Texture creation descriptor
+/// Texture creation descriptor.
 struct ImGuiTextureDesc
 {
     uint32_t width;           // Texture width in pixels
@@ -42,76 +56,78 @@ struct ImGuiTextureDesc
 };
 
 // ReSharper disable once CppPolymorphicClassWithNonVirtualPublicDestructor
+/// ImGui service interface.
+/// Threading: callbacks and texture APIs are intended for the render thread.
 class cIGZImGuiService : public cIGZUnknown {
 public:
-    // Returns the service ID (kImGuiServiceID).
+    /// Returns the service ID (kImGuiServiceID).
     [[nodiscard]] virtual uint32_t GetServiceID() const = 0;
 
-    // Returns the API version (kImGuiServiceApiVersion).
+    /// Returns the API version (kImGuiServiceApiVersion).
     [[nodiscard]] virtual uint32_t GetApiVersion() const = 0;
 
-    // Returns the ImGui context pointer, or nullptr if not ready.
+    /// Returns the ImGui context pointer, or nullptr if not ready.
     [[nodiscard]] virtual void* GetContext() const = 0;
 
-    // Registers a panel; returns false on duplicate ID or missing callbacks.
+    /// Registers a panel; returns false on duplicate ID or missing callbacks.
     virtual bool RegisterPanel(const ImGuiPanelDesc& desc) = 0;
 
-    // Unregisters a panel; returns false if not found.
+    /// Unregisters a panel; returns false if not found.
     virtual bool UnregisterPanel(uint32_t panelId) = 0;
 
-    // Sets a panel's visibility; returns false if not found.
+    /// Sets a panel's visibility; returns false if not found.
     virtual bool SetPanelVisible(uint32_t panelId, bool visible) = 0;
 
-    // Queues a render callback to execute on the next ImGui frame.
-    // The callback runs on the render thread between ImGui::NewFrame() and ImGui::EndFrame().
-    // If cleanup is provided, it is called after the callback (or during shutdown) to free data.
+    /// Queues a render callback to execute on the next ImGui frame.
+    /// The callback runs on the render thread between ImGui::NewFrame() and ImGui::EndFrame().
+    /// If cleanup is provided, it is called after the callback (or during shutdown) to free data.
     virtual bool QueueRender(ImGuiRenderCallback callback, void* data, ImGuiRenderCleanup cleanup = nullptr) = 0;
 
-    // Acquire DX7 interfaces for advanced texture workflows.
-    // On success, the service AddRef()'s both interfaces; callers must Release().
-    // Prefer acquiring per operation/frame rather than caching across frames.
+    /// Acquire DX7 interfaces for advanced texture workflows.
+    /// On success, the service AddRef()'s both interfaces; callers must Release().
+    /// Prefer acquiring per operation/frame rather than caching across frames.
     virtual bool AcquireD3DInterfaces(IDirect3DDevice7** outD3D, IDirectDraw7** outDD) = 0;
 
-    // Returns true when the DX7 interfaces are ready for use.
+    /// Returns true when the DX7 interfaces are ready for use.
     [[nodiscard]] virtual bool IsDeviceReady() const = 0;
 
-    // Generation increments when the DX7 device/context is reinitialized.
-    // Callers should rebuild cached textures when this changes.
+    /// Generation increments when the DX7 device/context is reinitialized.
+    /// Callers should rebuild cached textures when this changes.
     [[nodiscard]] virtual uint32_t GetDeviceGeneration() const = 0;
 
-    // Creates a managed texture from RGBA32 pixel data.
-    // The service stores source data for automatic recreation after device loss.
-    // Returns a handle with the current device generation.
-    // Thread safety: Must be called from the render thread only.
+    /// Creates a managed texture from RGBA32 pixel data.
+    /// The service stores source data for automatic recreation after device loss.
+    /// Returns a handle with the current device generation.
+    /// Thread safety: Must be called from the render thread only.
     virtual ImGuiTextureHandle CreateTexture(const ImGuiTextureDesc& desc) = 0;
 
-    // Gets a texture ID for use with ImGui::Image().
-    // Returns nullptr if handle is invalid or from a stale device generation.
-    // The texture surface is recreated on-demand if device was lost.
-    // Thread safety: Must be called from the render thread only.
+    /// Gets a texture ID for use with ImGui::Image().
+    /// Returns nullptr if handle is invalid or from a stale device generation.
+    /// The texture surface is recreated on-demand if device was lost.
+    /// Thread safety: Must be called from the render thread only.
     [[nodiscard]] virtual void* GetTextureID(ImGuiTextureHandle handle) = 0;
 
-    // Releases a texture and frees associated resources.
-    // Safe to call with invalid handles (no-op).
-    // Thread safety: Must be called from the render thread only.
+    /// Releases a texture and frees associated resources.
+    /// Safe to call with invalid handles (no-op).
+    /// Thread safety: Must be called from the render thread only.
     virtual void ReleaseTexture(ImGuiTextureHandle handle) = 0;
 
-    // Checks if a texture handle is valid and matches the current device generation.
-    // Thread safety: Must be called from the render thread only.
+    /// Checks if a texture handle is valid and matches the current device generation.
+    /// Thread safety: Must be called from the render thread only.
     [[nodiscard]] virtual bool IsTextureValid(ImGuiTextureHandle handle) const = 0;
 
-    // Loads a TTF font from file and registers it with the given ID.
-    // Returns true on success, false if font cannot be loaded or ID is already registered.
+    /// Loads a TTF font from file and registers it with the given ID.
+    /// Returns true on success, false if font cannot be loaded or ID is already registered.
     virtual bool RegisterFont(uint32_t fontId, const char* filePath, float sizePixels) = 0;
 
-    // Loads a compressed TTF font from memory and registers it with the given ID.
-    // See https://github.com/ocornut/imgui/blob/master/docs/FONTS.md#loading-font-data-embedded-in-source-code
-    // Returns true on success, false if font cannot be loaded or ID is already registered
+    /// Loads a compressed TTF font from memory and registers it with the given ID.
+    /// See https://github.com/ocornut/imgui/blob/master/docs/FONTS.md#loading-font-data-embedded-in-source-code
+    /// Returns true on success, false if font cannot be loaded or ID is already registered.
     virtual bool RegisterFont(uint32_t fontId, const void* compressedFontData, int compressedFontDataSize, float sizePixels) = 0;
 
-    // Unregisters a font; returns false if not found.
+    /// Unregisters a font; returns false if not found.
     virtual bool UnregisterFont(uint32_t fontId) = 0;
 
-    // Gets the ImFont* for a registered font ID, or nullptr if not found.
+    /// Gets the ImFont* for a registered font ID, or nullptr if not found.
     [[nodiscard]] virtual void* GetFont(uint32_t fontId) const = 0;
 };

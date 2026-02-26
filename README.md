@@ -1,6 +1,6 @@
-# sc4-imgui-service
+# sc4-render-services
 
-ImGui service and samples for SimCity 4 DLL plugins using the gzcom-dll SDK.
+Render services and samples (ImGui, Draw, S3D Camera) for SimCity 4 DLL plugins using the gzcom-dll SDK.
 
 ![Screenshot](docs/assets/preview.jpg)
 
@@ -20,18 +20,25 @@ cmake --build cmake-build-debug-visual-studio --config Debug
 
 Required:
 - `imgui.dll` (deployed to `...\SimCity 4 Deluxe Edition\Apps`)
-- `SC4ImGuiService.dll` (deployed to `...\Documents\SimCity 4\Plugins\`)
+- `SC4RenderServices.dll` (deployed to `...\Documents\SimCity 4\Plugins\`)
 
 Optional samples (deployed to `...\Documents\SimCity 4\Plugins\`):
 - `SC4ImGuiSample.dll` (basic panel)
 - `SC4ImGuiSampleCity.dll` (city-view only)
 - `SC4ImGuiSampleDemo.dll` (ImGui demo window)
 - `SC4ImGuiTextureSample.dll` (texture management example)
+- `SC4WorldProjectionSample.dll` (world projection helpers)
+- `SC4S3DCameraDebugSample.dll` (camera debug tooling)
+- `SC4OverlayManagerSample.dll` (overlay manager example)
+- `SC4DrawServiceSample.dll` (draw service UI + hooks)
+- `SC4RoadDecalSample.dll` (road decal rendering)
 
 ## Provided Services
 
-`SC4CustomServices.dll` registers three services (currently gated for SimCity 4
+`SC4RenderServices.dll` registers three services (currently gated for SimCity 4
 version `1.1.641`).
+
+Detailed reference: [docs/services.md](docs/services.md)
 
 ### 1) ImGui service
 
