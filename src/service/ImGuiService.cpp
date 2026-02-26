@@ -153,14 +153,19 @@ bool ImGuiService::Shutdown() {
         return true;
     }
 
+    std::vector<ImGuiPanelDesc> panelsToShutdown;
     {
         std::lock_guard panelLock(panelsMutex_);
+        panelsToShutdown.reserve(panels_.size());
         for (const auto& panel : panels_) {
-            if (panel.desc.on_shutdown) {
-                panel.desc.on_shutdown(panel.desc.data);
-            }
+            panelsToShutdown.push_back(panel.desc);
         }
         panels_.clear();
+    }
+    for (const auto& desc : panelsToShutdown) {
+        if (desc.on_shutdown) {
+            desc.on_shutdown(desc.data);
+        }
     }
 
     {
@@ -263,40 +268,48 @@ bool ImGuiService::RegisterPanel(const ImGuiPanelDesc& desc) {
 }
 
 bool ImGuiService::UnregisterPanel(uint32_t panelId) {
-    std::lock_guard lock(panelsMutex_);
-    const auto it = std::ranges::find_if(panels_, [&](const PanelEntry& entry) {
-        return entry.desc.id == panelId;
-    });
-    if (it == panels_.end()) {
-        LOG_WARN("ImGuiService: unregister failed for panel {}", panelId);
-        return false;
+    ImGuiPanelDesc desc{};
+    {
+        std::lock_guard lock(panelsMutex_);
+        const auto it = std::ranges::find_if(panels_, [&](const PanelEntry& entry) {
+            return entry.desc.id == panelId;
+        });
+        if (it == panels_.end()) {
+            LOG_WARN("ImGuiService: unregister failed for panel {}", panelId);
+            return false;
+        }
+        desc = it->desc;
+        panels_.erase(it);
     }
 
-    if (it->desc.on_unregister) {
-        it->desc.on_unregister(it->desc.data);
+    if (desc.on_unregister) {
+        desc.on_unregister(desc.data);
     }
-
-    panels_.erase(it);
     LOG_INFO("ImGuiService: unregistered panel {}", panelId);
     return true;
 }
 
 bool ImGuiService::SetPanelVisible(const uint32_t panelId, const bool visible) {
-    std::lock_guard lock(panelsMutex_);
-    const auto it = std::ranges::find_if(panels_, [&](const PanelEntry& entry) {
-        return entry.desc.id == panelId;
-    });
-    if (it == panels_.end()) {
-        return false;
+    ImGuiPanelDesc desc{};
+    {
+        std::lock_guard lock(panelsMutex_);
+        const auto it = std::ranges::find_if(panels_, [&](const PanelEntry& entry) {
+            return entry.desc.id == panelId;
+        });
+        if (it == panels_.end()) {
+            return false;
+        }
+
+        if (it->desc.visible == visible) {
+            return true;
+        }
+
+        it->desc.visible = visible;
+        desc = it->desc;
     }
 
-    if (it->desc.visible == visible) {
-        return true;
-    }
-
-    it->desc.visible = visible;
-    if (it->desc.on_visible_changed) {
-        it->desc.on_visible_changed(it->desc.data, visible);
+    if (desc.on_visible_changed) {
+        desc.on_visible_changed(desc.data, visible);
     }
     return true;
 }
@@ -406,34 +419,43 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
     ImGui_ImplDX7_NewFrame();
     ImGui::NewFrame();
 
+    std::vector<ImGuiPanelDesc> panelsToUpdate;
+    std::vector<ImGuiPanelDesc> panelsToRender;
     {
-        std::lock_guard panelUpdateLock(panelsMutex_);
-        for (auto& panel : panels_) {
-            if (panel.desc.visible && panel.desc.on_update) {
-                panel.desc.on_update(panel.desc.data);
+        std::lock_guard panelLock(panelsMutex_);
+        panelsToUpdate.reserve(panels_.size());
+        panelsToRender.reserve(panels_.size());
+        for (const auto& panel : panels_) {
+            if (!panel.desc.visible) {
+                continue;
+            }
+            if (panel.desc.on_update) {
+                panelsToUpdate.push_back(panel.desc);
+            }
+            if (panel.desc.on_render) {
+                panelsToRender.push_back(panel.desc);
             }
         }
     }
 
-    {
-        std::lock_guard panelRenderLock(panelsMutex_);
-        for (auto& panel : panels_) {
-            if (panel.desc.visible && panel.desc.on_render) {
-                // Push the panel's font if specified
-                if (panel.desc.fontId != 0) {
-                    if (auto* font = static_cast<ImFont*>(GetFont(panel.desc.fontId))) {
-                        ImGui::PushFont(font, 0.0f); // 0.0f preserves current font size
-                    }
-                }
+    for (const auto& desc : panelsToUpdate) {
+        desc.on_update(desc.data);
+    }
 
-                panel.desc.on_render(panel.desc.data);
+    for (const auto& desc : panelsToRender) {
+        // Push the panel's font if specified
+        if (desc.fontId != 0) {
+            if (auto* font = static_cast<ImFont*>(GetFont(desc.fontId))) {
+                ImGui::PushFont(font, 0.0f); // 0.0f preserves current font size
+            }
+        }
 
-                // Pop the font if we pushed one
-                if (panel.desc.fontId != 0) {
-                    if (auto* font = static_cast<ImFont*>(GetFont(panel.desc.fontId))) {
-                        ImGui::PopFont();
-                    }
-                }
+        desc.on_render(desc.data);
+
+        // Pop the font if we pushed one
+        if (desc.fontId != 0) {
+            if (auto* font = static_cast<ImFont*>(GetFont(desc.fontId))) {
+                ImGui::PopFont();
             }
         }
     }
@@ -555,13 +577,22 @@ void ImGuiService::InitializePanels_() {
         return;
     }
 
-    for (auto& panel : panels_) {
-        if (!panel.initialized) {
-            if (panel.desc.on_init) {
-                panel.desc.on_init(panel.desc.data);
+    std::vector<ImGuiPanelDesc> panelsToInit;
+    {
+        std::lock_guard lock(panelsMutex_);
+        panelsToInit.reserve(panels_.size());
+        for (auto& panel : panels_) {
+            if (!panel.initialized) {
+                panel.initialized = true;
+                if (panel.desc.on_init) {
+                    panelsToInit.push_back(panel.desc);
+                }
             }
-            panel.initialized = true;
         }
+    }
+
+    for (const auto& desc : panelsToInit) {
+        desc.on_init(desc.data);
     }
 }
 
@@ -756,11 +787,13 @@ void* ImGuiService::GetTextureID(const ImGuiTextureHandle handle) {
 void ImGuiService::ReleaseTexture(ImGuiTextureHandle handle) {
     std::lock_guard lock(texturesMutex_);
 
-    if (textures_.contains(handle.id)) {
-        auto tex = textures_[handle.id];
-        tex.surface->Release();
-        tex.surface = nullptr;
-        textures_.erase(handle.id);
+    auto it = textures_.find(handle.id);
+    if (it != textures_.end()) {
+        if (it->second.surface) {
+            it->second.surface->Release();
+            it->second.surface = nullptr;
+        }
+        textures_.erase(it);
     }
 
     LOG_INFO("ImGuiService::ReleaseTexture: released texture (id={})", handle.id);
@@ -1005,13 +1038,19 @@ bool ImGuiService::CreateSurfaceForTexture_(ManagedTexture& tex) {
 void ImGuiService::OnDeviceLost_() {
     deviceLost_ = true;
 
+    std::vector<ImGuiPanelDesc> panelsToNotify;
     {
         std::lock_guard lock(panelsMutex_);
-        for (auto& panel : panels_) {
+        panelsToNotify.reserve(panels_.size());
+        for (const auto& panel : panels_) {
             if (panel.desc.on_device_lost) {
-                panel.desc.on_device_lost(panel.desc.data);
+                panelsToNotify.push_back(panel.desc);
             }
         }
+    }
+
+    for (const auto& desc : panelsToNotify) {
+        desc.on_device_lost(desc.data);
     }
 
     ImGui_ImplDX7_InvalidateDeviceObjects();
@@ -1029,13 +1068,19 @@ void ImGuiService::OnDeviceRestored_() {
 
     ImGui_ImplDX7_CreateDeviceObjects();
 
+    std::vector<ImGuiPanelDesc> panelsToNotify;
     {
         std::lock_guard lock(panelsMutex_);
-        for (auto& panel : panels_) {
+        panelsToNotify.reserve(panels_.size());
+        for (const auto& panel : panels_) {
             if (panel.desc.on_device_restored) {
-                panel.desc.on_device_restored(panel.desc.data);
+                panelsToNotify.push_back(panel.desc);
             }
         }
+    }
+
+    for (const auto& desc : panelsToNotify) {
+        desc.on_device_restored(desc.data);
     }
 
     LOG_INFO("ImGuiService::OnDeviceRestored_: device restored (new gen={}) and notified panels", newGen);

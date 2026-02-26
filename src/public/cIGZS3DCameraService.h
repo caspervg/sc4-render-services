@@ -17,6 +17,7 @@ class cIGZS3DCameraService : public cIGZUnknown {
 public:
     [[nodiscard]] virtual uint32_t GetServiceID() const = 0; // kS3DCameraServiceID
 
+    // Not supported by the built-in service; returns a null handle.
     virtual S3DCameraHandle CreateCamera() = 0;
     virtual void DestroyCamera(S3DCameraHandle handle) = 0;
     // Wrap an existing camera allocated by the game/renderer.

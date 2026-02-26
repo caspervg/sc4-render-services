@@ -668,11 +668,14 @@ void DrawService::UninstallCallSitePatchLocked_(CallSitePatch& patch) {
 
     auto* site = reinterpret_cast<uint8_t*>(patch.callSiteAddress);
     DWORD oldProtect = 0;
-    if (VirtualProtect(site + 1, sizeof(patch.originalRel), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        std::memcpy(site + 1, &patch.originalRel, sizeof(patch.originalRel));
-        FlushInstructionCache(GetCurrentProcess(), site, kHookByteCount);
-        VirtualProtect(site + 1, sizeof(patch.originalRel), oldProtect, &oldProtect);
+    if (!VirtualProtect(site + 1, sizeof(patch.originalRel), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        LOG_ERROR("DrawService: VirtualProtect failed while uninstalling {}", patch.name);
+        return;
     }
+
+    std::memcpy(site + 1, &patch.originalRel, sizeof(patch.originalRel));
+    FlushInstructionCache(GetCurrentProcess(), site, kHookByteCount);
+    VirtualProtect(site + 1, sizeof(patch.originalRel), oldProtect, &oldProtect);
 
     patch.installed = false;
     patch.originalTarget = 0;
@@ -736,19 +739,27 @@ void DrawService::DispatchDrawPassCallbacksLocked_(const DrawServicePass pass, c
 }
 
 void DrawService::OnPassHook(const DrawServicePass pass, void* self) {
-    uintptr_t originalTarget;
+    uintptr_t originalTarget = 0;
+    std::vector<DrawPassCallbackRegistration> callbacks;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         originalTarget = GetOriginalTargetForPassLocked_(pass);
-        DispatchDrawPassCallbacksLocked_(pass, true);
+        callbacks.reserve(passCallbacks_.size());
+        for (const auto& reg : passCallbacks_) {
+            if (reg.pass == pass && reg.callback) {
+                callbacks.push_back(reg);
+            }
+        }
+    }
+    for (const auto& reg : callbacks) {
+        reg.callback(pass, true, reg.userData);
     }
     if (originalTarget) {
         const auto fn = reinterpret_cast<void(__thiscall*)(void*)>(originalTarget);
         fn(self);
     }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        DispatchDrawPassCallbacksLocked_(pass, false);
+    for (const auto& reg : callbacks) {
+        reg.callback(pass, false, reg.userData);
     }
 }
 

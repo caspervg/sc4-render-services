@@ -35,11 +35,12 @@ uint32_t S3DCameraService::GetServiceID() const {
 }
 
 S3DCameraHandle S3DCameraService::CreateCamera() {
-    if (!thunks_.create) {
-        return {nullptr, 0, false};
+    static bool warned = false;
+    if (!warned) {
+        LOG_WARN("S3DCameraService: CreateCamera not supported; use WrapCamera/WrapActiveRendererCamera");
+        warned = true;
     }
-    cS3DCamera* cam = thunks_.create();
-    return {cam, versionTag_, true};
+    return {nullptr, 0, false};
 }
 
 void S3DCameraService::DestroyCamera(const S3DCameraHandle handle) {
