@@ -43,7 +43,7 @@
             "configurePreset": "vs2022-win32-debug",
             "configuration": "Debug",
             "targets": [
-                "SC4ImGuiAllTargets"
+                "SC4RenderServicesAllTargets"
             ]
         },
         {
@@ -58,7 +58,7 @@
             "configurePreset": "vs2022-win32-release",
             "configuration": "Release",
             "targets": [
-                "SC4ImGuiAllTargets"
+                "SC4RenderServicesAllTargets"
             ]
         }
     ]
