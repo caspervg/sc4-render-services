@@ -154,16 +154,16 @@ private:
         void (__thiscall* setModelTransform)(void* drawContext, const void* transform4x4);
         void (__thiscall* setModelTransformFloats)(void* drawContext, float* transform4x4);
         void (__thiscall* setModelViewTransformChanged)(void* drawContext, int changed);
-        void (__fastcall* resetModelViewTransform)(void* drawContext);
+        void (__thiscall* resetModelViewTransform)(void* drawContext);
         void (__thiscall* getModelViewMatrix)(void* drawContext, void* outMatrix4x4);
         void (__thiscall* setModelShade)(void* drawContext, void* modelInstance, const float* rgba);
         void (__thiscall* setShade)(void* drawContext, const float* rgba);
         void (__thiscall* setSelfLitShade)(void* drawContext, void* selfLitShade);
-        void (__fastcall* resetShade)(void* drawContext);
+        void (__thiscall* resetShade)(void* drawContext);
         void (__thiscall* setRenderState)(void* drawContext, void* packedRenderState, void* materialState);
         void (__thiscall* setRenderStatePacked)(void* drawContext, uint32_t* packedRenderState);
-        void (__fastcall* setDefaultRenderState)(void* drawContext);
-        void (__fastcall* setDefaultRenderStateUnilaterally)(void* drawContext);
+        void (__thiscall* setDefaultRenderState)(void* drawContext);
+        void (__thiscall* setDefaultRenderStateUnilaterally)(void* drawContext);
         void (__thiscall* setEmulatedSecondStageRenderState)(void* drawContext);
         void (__thiscall* renderMesh)(void* drawContext, void* mesh);
         void (__thiscall* renderModelInstance)(void* drawContext, int* modelCount,
@@ -178,7 +178,7 @@ private:
         void (__thiscall* setTexTransform4)(void* drawContext, void* transform4x4, int stage);
         void (__thiscall* clearTexTransform)(void* drawContext, int stage);
         void (__thiscall* setTexCoord)(void* drawContext, int texCoord, int stage);
-        void (__fastcall* setVertexBuffer)(void* drawContext);
+        void (__thiscall* setVertexBuffer)(void* drawContext);
         void (__thiscall* setIndexBuffer)(void* drawContext, uint32_t indexBuffer, uint32_t indexFormat);
         void (__thiscall* enableBlendStateFlag)(void* drawContext, char enabled);
         void (__thiscall* enableAlphaTestFlag)(void* drawContext, bool enabled);
@@ -190,13 +190,13 @@ private:
         void (__thiscall* setAlphaFunc)(void* drawContext, uint32_t alphaFunc, float alphaRef);
         void (__thiscall* setDepthFunc)(void* drawContext, uint32_t depthFunc);
         void (__thiscall* setDepthOffset)(void* drawContext, int depthOffset);
-        void (__fastcall* setTransparency)(void* drawContext);
-        void (__fastcall* resetTransparency)(void* drawContext);
-        uint8_t (__fastcall* getLighting)(void* drawContext);
+        void (__thiscall* setTransparency)(void* drawContext);
+        void (__thiscall* resetTransparency)(void* drawContext);
+        uint8_t (__thiscall* getLighting)(void* drawContext);
         void (__thiscall* setLighting)(void* drawContext, bool enableLighting);
         void (__thiscall* setFog)(void* drawContext, bool enableFog, float* fogColorRgb, float fogStart, float fogEnd);
         void (__thiscall* setCamera)(void* drawContext, int camera);
-        void (__fastcall* initContext)(void* drawContext);
+        void (__thiscall* initContext)(void* drawContext);
         void (__thiscall* shutdownContext)(void* drawContext);
         void (__thiscall* drawBoundingBox)(void* drawContext, float* bbox, const void* color);
         void (__thiscall* drawPrims)(void* drawContext, uint32_t primType, uint32_t startVertex, uint32_t primitiveCount, uint32_t flags);
