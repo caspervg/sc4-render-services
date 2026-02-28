@@ -8,6 +8,7 @@
 #include "utils/Settings.h"
 
 #include <filesystem>
+#include <imgui.h>
 #include <stdexcept>
 #include <vector>
 
@@ -16,6 +17,15 @@
 namespace {
     constexpr auto kRenderServicesDirectorID = 0xC17F4B21;
     constexpr std::string_view kSettingsFileName = "SC4RenderServices.ini";
+    constexpr auto kDemoPanelId = 0xA17E0001u;
+    constexpr auto kDemoPanelOrder = 0;
+    #ifndef SC4RS_PRODUCT_VERSION_STR
+    #define SC4RS_PRODUCT_VERSION_STR "dev"
+    #endif
+
+    struct DemoPanelState {
+        bool showDemoWindow;
+    };
 
     std::wstring GetModulePath(HMODULE moduleHandle) {
         std::vector<wchar_t> pathBuffer(MAX_PATH);
@@ -115,6 +125,9 @@ public:
                 mpFrameWork->AddHook(this);
                 mpFrameWork->AddSystemService(&imguiService_);
                 mpFrameWork->AddToTick(&imguiService_);
+                if (settings.GetShowDemoPanel()) {
+                    RegisterDemoPanel_();
+                }
                 LOG_INFO("RenderServicesDirector: ImGuiService registered");
             } else {
                 LOG_WARN("RenderServicesDirector: ImGuiService not registered (version check failed)");
@@ -168,9 +181,57 @@ public:
     }
 
 private:
+    void RegisterDemoPanel_() {
+        demoPanelState_.showDemoWindow = false;
+
+        ImGuiPanelDesc desc{};
+        desc.id = kDemoPanelId;
+        desc.order = kDemoPanelOrder;
+        desc.visible = true;
+        desc.on_render = &RenderServicesDirector::RenderDemoPanel_;
+        desc.on_shutdown = &RenderServicesDirector::OnDemoPanelShutdown_;
+        desc.data = &demoPanelState_;
+
+        if (imguiService_.RegisterPanel(desc)) {
+            LOG_INFO("RenderServicesDirector: DemoPanel registered");
+        } else {
+            LOG_WARN("RenderServicesDirector: failed to register DemoPanel");
+        }
+    }
+
+    static void RenderDemoPanel_(void* data) {
+        auto* state = static_cast<DemoPanelState*>(data);
+        if (!state) {
+            return;
+        }
+
+        ImGui::SetNextWindowSize(ImVec2(430.0f, 0.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("SC4RenderServices")) {
+            ImGui::TextUnformatted("SC4RenderServices loaded successfully.");
+            ImGui::Separator();
+            ImGui::Text("Version: %s", SC4RS_PRODUCT_VERSION_STR);
+            ImGui::TextUnformatted("ImGui is active and the service is running.");
+            ImGui::Spacing();
+            ImGui::Checkbox("Show DearImGui demo window", &state->showDemoWindow);
+        }
+        ImGui::End();
+
+        if (state->showDemoWindow) {
+            ImGui::ShowDemoWindow(&state->showDemoWindow);
+        }
+    }
+
+    static void OnDemoPanelShutdown_(void* data) {
+        auto* state = static_cast<DemoPanelState*>(data);
+        if (state) {
+            state->showDemoWindow = false;
+        }
+    }
+
     ImGuiService imguiService_;
     S3DCameraService cameraService_;
     DrawService drawService_;
+    DemoPanelState demoPanelState_{true};
 };
 
 static RenderServicesDirector sDirector;

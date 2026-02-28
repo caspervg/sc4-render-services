@@ -23,6 +23,7 @@ namespace {
     constexpr float kDefaultUIScale = 1.0f;
     constexpr float kMinUIScale = 0.25f;
     constexpr float kMaxUIScale = 4.0f;
+    constexpr bool kDefaultShowDemoPanel = false;
     constexpr bool kDefaultEnableImGuiService = true;
     constexpr bool kDefaultEnableS3DCameraService = true;
     constexpr bool kDefaultEnableDrawService = true;
@@ -108,6 +109,7 @@ Settings::Settings()
     , theme_(kDefaultTheme)
     , keyboardNav_(kDefaultKeyboardNav)
     , uiScale_(kDefaultUIScale)
+    , showDemoPanel_(kDefaultShowDemoPanel)
     , enableImGuiService_(kDefaultEnableImGuiService)
     , enableS3DCameraService_(kDefaultEnableS3DCameraService)
     , enableDrawService_(kDefaultEnableDrawService) {}
@@ -233,6 +235,17 @@ void Settings::Load(const std::filesystem::path& settingsFilePath) {
             }
         }
 
+        // ShowDemoPanel
+        if (section.has("ShowDemoPanel")) {
+            bool valid = false;
+            const std::string text = section.get("ShowDemoPanel");
+            showDemoPanel_ = ParseBool(text, valid);
+            if (!valid) {
+                showDemoPanel_ = kDefaultShowDemoPanel;
+                LOG_ERROR("Invalid ShowDemoPanel value '{}' in {}. Using default false.", text, settingsFilePath.string());
+            }
+        }
+
         // EnableImGuiService
         if (section.has("EnableImGuiService")) {
             bool valid = false;
@@ -280,6 +293,7 @@ int Settings::GetFontOversample() const noexcept { return fontOversample_; }
 std::string Settings::GetTheme() const noexcept { return theme_; }
 bool Settings::GetKeyboardNav() const noexcept { return keyboardNav_; }
 float Settings::GetUIScale() const noexcept { return uiScale_; }
+bool Settings::GetShowDemoPanel() const noexcept { return showDemoPanel_; }
 bool Settings::GetEnableImGuiService() const noexcept { return enableImGuiService_; }
 bool Settings::GetEnableS3DCameraService() const noexcept { return enableS3DCameraService_; }
 bool Settings::GetEnableDrawService() const noexcept { return enableDrawService_; }

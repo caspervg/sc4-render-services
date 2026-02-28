@@ -178,7 +178,10 @@ target_link_libraries(SC4RenderServices PRIVATE
         gzcom2
         spdlog
 )
-target_compile_definitions(SC4RenderServices PRIVATE IMGUI_DLL_IMPORT)
+target_compile_definitions(SC4RenderServices PRIVATE
+        IMGUI_DLL_IMPORT
+        SC4RS_PRODUCT_VERSION_STR="${SC4RS_PRODUCT_VERSION_STR}"
+)
 
 if(WIN32)
     target_link_libraries(SC4RenderServices PRIVATE kernel32 user32 Version ddraw dxguid)
