@@ -456,9 +456,32 @@ set_target_properties(SC4RoadDecalSample PROPERTIES
         PREFIX ""
 )
 
+# RDTSC patch DLL
+set(RDTSC_PATCH_SOURCES
+        ${CMAKE_SOURCE_DIR}/src/sample/RDTSCPatchDirector.cpp
+        ${CMAKE_SOURCE_DIR}/src/utils/Logger.cpp
+)
+
+add_library(SC4RDTSCPatch SHARED ${RDTSC_PATCH_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
+
+target_include_directories(SC4RDTSCPatch PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(SC4RDTSCPatch PRIVATE
+        gzcom2
+        spdlog
+)
+
+set_target_properties(SC4RDTSCPatch PROPERTIES
+        OUTPUT_NAME "SC4RDTSCPatch"
+        SUFFIX ".dll"
+        PREFIX ""
+)
+
 
 add_custom_target(SC4RenderServicesAllTargets
-        DEPENDS imgui SC4RenderServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample SC4RoadDecalSample
+        DEPENDS imgui SC4RenderServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample SC4RoadDecalSample SC4RDTSCPatch
 )
 
 # Automatic deployment to SC4 directories
@@ -563,6 +586,14 @@ if(WIN32 AND NOT DEFINED ENV{CI})
                 COMMENT "Deploying SC4RoadDecalSample.dll to Plugins folder"
         )
 
+        add_custom_command(TARGET SC4RDTSCPatch POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${SC4_PLUGINS_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:SC4RDTSCPatch>
+                "${SC4_PLUGINS_DIR}/"
+                COMMENT "Deploying SC4RDTSCPatch.dll to Plugins folder"
+        )
+
         message(STATUS "Deployment targets configured:")
         message(STATUS "  - imgui.dll -> ${SC4_INSTALL_DIR}/Apps/")
         message(STATUS "  - SC4RenderServices.dll -> ${SC4_PLUGINS_DIR}/")
@@ -573,6 +604,7 @@ if(WIN32 AND NOT DEFINED ENV{CI})
         message(STATUS "  - SC4WorldProjectionSample.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4DrawServiceSample.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4RoadDecalSample.dll -> ${SC4_PLUGINS_DIR}/")
+        message(STATUS "  - SC4RDTSCPatch.dll -> ${SC4_PLUGINS_DIR}/")
     else()
         message(WARNING "SC4 installation not found. Manual deployment required.")
     endif()
