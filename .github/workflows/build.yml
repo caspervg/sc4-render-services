@@ -49,7 +49,7 @@ jobs:
         run: choco install nsis -y
 
       - name: Configure (Release)
-        run: cmake --preset vs2022-win32-release -DSC4RS_RELEASE_VERSION=${{ github.ref_name }}
+        run: cmake --preset vs2022-win32-release "-DSC4RS_RELEASE_VERSION=${{ github.ref_name }}"
 
       - name: Build (Release, all DLLs)
         run: cmake --build --preset vs2022-win32-release-all
