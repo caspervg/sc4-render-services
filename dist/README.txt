@@ -2,7 +2,7 @@ SC4 Render Services
 
 This release archive contains:
 - the Windows installer
-- LICENSE
+- LICENSE.txt
 - ThirdPartyNotices.txt
 
 Installation:

@@ -27,7 +27,7 @@
   !define README_PATH "README.txt"
 !endif
 !ifndef LICENSE_PATH
-  !define LICENSE_PATH "..\LICENSE"
+  !define LICENSE_PATH "..\LICENSE.txt"
 !endif
 
 !define SERVICE_REG_KEY "Software\SC4RenderServices"
@@ -291,7 +291,7 @@ Section "Uninstall"
   Delete "$GameRoot\Apps\imgui.dll"
   Delete "$SC4PluginsDir\SC4RenderServices.dll"
   Delete "$SupportDir\README.txt"
-  Delete "$SupportDir\LICENSE"
+  Delete "$SupportDir\LICENSE.txt"
   Delete "$SupportDir\ThirdPartyNotices.txt"
   Delete "$SupportDir\Uninstall-SC4RenderServices.exe"
   RMDir "$SupportDir"
