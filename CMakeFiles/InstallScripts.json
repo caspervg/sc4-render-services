@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"C:/Users/caspe/CLionProjects/sc4-advanced-plop/vendor/sc4-imgui-service/cmake_install.cmake",
-		"C:/Users/caspe/CLionProjects/sc4-advanced-plop/vendor/sc4-imgui-service/vendor/spdlog/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
