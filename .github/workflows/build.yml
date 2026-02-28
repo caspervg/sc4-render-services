@@ -1,0 +1,107 @@
+name: Windows CI
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "4.0.2"
+
+      - name: Configure (Debug)
+        run: cmake --preset vs2022-win32-debug
+
+      - name: Build (Debug, all DLLs)
+        run: cmake --build --preset vs2022-win32-debug-all
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "4.0.2"
+
+      - name: Install NSIS
+        run: choco install nsis -y
+
+      - name: Configure (Release)
+        run: cmake --preset vs2022-win32-release -DSC4RS_RELEASE_VERSION=${{ github.ref_name }}
+
+      - name: Build (Release, all DLLs)
+        run: cmake --build --preset vs2022-win32-release-all
+
+      - name: Build Installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $rootDir = $env:GITHUB_WORKSPACE
+          $outDir = Join-Path $env:GITHUB_WORKSPACE "artifacts"
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          $buildDir = Join-Path $rootDir "cmake-build-release-visual-studio/Release"
+          $refName = "${{ github.ref_name }}"
+          $version = if ($refName -match '^v(.+)') { $Matches[1] } else { "${{ github.sha }}".Substring(0, 7) }
+          $installerPath = Join-Path $outDir ("SC4RenderServices-" + $version + "-Setup.exe")
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Building installer for version: $version"
+          Set-Location (Join-Path $rootDir "dist")
+          & "C:\Program Files (x86)\NSIS\makensis.exe" `
+            /DAPP_VERSION=$version `
+            /DINSTALLER_OUTPUT=..\artifacts\$(Split-Path -Leaf $installerPath) `
+            /DIMGUI_DLL_PATH=..\cmake-build-release-visual-studio\Release\imgui.dll `
+            /DRENDER_SERVICES_DLL_PATH=..\cmake-build-release-visual-studio\Release\SC4RenderServices.dll `
+            /DRENDER_SERVICES_INI_PATH=..\SC4RenderServices.ini `
+            SC4RenderServicesInstaller.nsi
+          if ($LASTEXITCODE -ne 0) {
+            throw "makensis failed with exit code $LASTEXITCODE"
+          }
+          Write-Host "Installer contents:"
+          Get-ChildItem -Path ..\artifacts -Filter "*.exe" | Select-Object Name, Length
+
+      - name: Package Release Zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $rootDir = $env:GITHUB_WORKSPACE
+          $outDir = Join-Path $env:GITHUB_WORKSPACE "artifacts"
+          $installerPath = Join-Path $outDir ("SC4RenderServices-" + $env:RELEASE_VERSION + "-Setup.exe")
+          Copy-Item -Path (Join-Path $rootDir "dist\README.txt") -Destination (Join-Path $outDir "README.txt") -Force
+          Copy-Item -Path (Join-Path $rootDir "LICENSE") -Destination (Join-Path $outDir "LICENSE") -Force
+          Copy-Item -Path (Join-Path $rootDir "dist\ThirdPartyNotices.txt") -Destination (Join-Path $outDir "ThirdPartyNotices.txt") -Force
+
+          $paths = @(
+            $installerPath,
+            (Join-Path $outDir "README.txt"),
+            (Join-Path $outDir "LICENSE"),
+            (Join-Path $outDir "ThirdPartyNotices.txt")
+          )
+          $archive = Join-Path $outDir ("sc4-render-services-" + $env:RELEASE_VERSION + "-win32-release.zip")
+          Compress-Archive -Path $paths -DestinationPath $archive -Force
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip

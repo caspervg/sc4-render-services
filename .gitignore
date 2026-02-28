@@ -371,3 +371,4 @@ vcpkg_installed/
 extra-info/
 fonts/
 docs/doxygen/
+dist/*.exe
