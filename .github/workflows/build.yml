@@ -89,14 +89,14 @@ jobs:
           $outDir = Join-Path $env:GITHUB_WORKSPACE "artifacts"
           $installerPath = Join-Path $outDir ("SC4RenderServices-" + $env:RELEASE_VERSION + "-Setup.exe")
           Copy-Item -Path (Join-Path $rootDir "dist\README.txt") -Destination (Join-Path $outDir "README.txt") -Force
-          Copy-Item -Path (Join-Path $rootDir "LICENSE") -Destination (Join-Path $outDir "LICENSE") -Force
-          Copy-Item -Path (Join-Path $rootDir "dist\ThirdPartyNotices.txt") -Destination (Join-Path $outDir "ThirdPartyNotices.txt") -Force
+          Copy-Item -Path (Join-Path $rootDir "LICENSE.txt") -Destination (Join-Path $outDir "LICENSE.txt") -Force
+          Copy-Item -Path (Join-Path $rootDir "dist\THIRD_PARTY_NOTICES.txt") -Destination (Join-Path $outDir "THIRD_PARTY_NOTICES.txt") -Force
 
           $paths = @(
             $installerPath,
             (Join-Path $outDir "README.txt"),
-            (Join-Path $outDir "LICENSE"),
-            (Join-Path $outDir "ThirdPartyNotices.txt")
+            (Join-Path $outDir "LICENSE.txt"),
+            (Join-Path $outDir "THIRD_PARTY_NOTICES.txt")
           )
           $archive = Join-Path $outDir ("sc4-render-services-" + $env:RELEASE_VERSION + "-win32-release.zip")
           Compress-Archive -Path $paths -DestinationPath $archive -Force

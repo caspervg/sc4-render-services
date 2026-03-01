@@ -12,7 +12,7 @@
   !define INSTALLER_OUTPUT "SC4RenderServices-${APP_VERSION}-Setup.exe"
 !endif
 !ifndef THIRD_PARTY_NOTICES_PATH
-  !define THIRD_PARTY_NOTICES_PATH "ThirdPartyNotices.txt"
+  !define THIRD_PARTY_NOTICES_PATH "THIRD_PARTY_NOTICES.txt"
 !endif
 !ifndef IMGUI_DLL_PATH
   !define IMGUI_DLL_PATH "..\cmake-build-release-visual-studio\Release\imgui.dll"
@@ -292,7 +292,7 @@ Section "Uninstall"
   Delete "$SC4PluginsDir\SC4RenderServices.dll"
   Delete "$SupportDir\README.txt"
   Delete "$SupportDir\LICENSE.txt"
-  Delete "$SupportDir\ThirdPartyNotices.txt"
+  Delete "$SupportDir\THIRD_PARTY_NOTICES.txt"
   Delete "$SupportDir\Uninstall-SC4RenderServices.exe"
   RMDir "$SupportDir"
 
