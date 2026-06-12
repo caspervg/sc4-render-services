@@ -92,6 +92,10 @@ Important fields:
 - `decalInfo.aspectMultiplier`, `uvScaleU`, `uvScaleV`, `uvOffset`: extra
   decal transform controls forwarded to the renderer.
 - `opacity`, `enabled`, `color`, `drawMode`: common runtime properties.
+- `flags` bit `kTerrainDecalFlagMirror` (`0x80000000`): mirrors the texture in
+  place (`u' = 1 - u`, the SC4 lot-texture orientation convention). Combined
+  with `rotationTurns` this reaches every mirrored orientation. Requires the
+  custom clipped renderer.
 - `hasUvWindow` + `uvWindow`: optional atlas/subrect override.
 
 Minimal example:
@@ -187,9 +191,10 @@ state.uvWindow.mode = TerrainDecalUvMode::StretchSubrect;
   overlay manager.
 - `baseSize` must be greater than zero.
 - UV window bounds must satisfy `u1 <= u2` and `v1 <= v2`.
-- `flags` are preserved in snapshots and save data, but the current runtime
-  implementation does not push `TerrainDecalState::flags` back into the game
-  overlay manager during create/update.
+- `flags` are preserved in snapshots and save data; the mirror bit
+  (`kTerrainDecalFlagMirror`) is consumed by the custom renderer, but
+  `TerrainDecalState::flags` is not pushed into the game overlay manager
+  during create/update.
 - The service owns decal persistence only for decals created through this API.
   Existing unmanaged overlays are not automatically imported into the registry.
 

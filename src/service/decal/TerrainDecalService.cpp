@@ -697,6 +697,7 @@ namespace
         overrides.uvScaleU = state.decalInfo.uvScaleU;
         overrides.uvScaleV = state.decalInfo.uvScaleV;
         overrides.uvOffset = state.decalInfo.uvOffset;
+        overrides.mirror = (state.flags & kTerrainDecalFlagMirror) != 0;
         overrides.depthOffset = state.depthOffset;
     }
 }
