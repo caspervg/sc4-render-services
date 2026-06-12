@@ -59,6 +59,8 @@ namespace TerrainDecal
         float uvScaleU = 1.0f;
         float uvScaleV = 1.0f;
         float uvOffset = 0.0f;
+        // Mirror the texture in place (u' = 1 - u), per kTerrainDecalFlagMirror.
+        bool mirror = false;
         // -1 means "use RendererOptions::customDefaultDepthOffset".
         int depthOffset = -1;
     };
@@ -66,7 +68,7 @@ namespace TerrainDecal
     [[nodiscard]] inline bool HasDecalModifiers(const TerrainDecalOverlayOverrides& o) noexcept
     {
         return o.aspectMultiplier != 1.0f || o.uvScaleU != 1.0f ||
-               o.uvScaleV != 1.0f || o.uvOffset != 0.0f;
+               o.uvScaleV != 1.0f || o.uvOffset != 0.0f || o.mirror;
     }
 
     using OverlayOverridesResolver = bool (*)(void* overlayManager, uint32_t overlayId,

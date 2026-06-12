@@ -404,7 +404,8 @@ namespace
         const float aspectMultiplier,
         const float uvScaleU,
         const float uvScaleV,
-        const float uvOffset) noexcept
+        const float uvOffset,
+        const bool mirror) noexcept
     {
         TextureTransformOverride result{};
         if (!baseTransform) {
@@ -442,6 +443,15 @@ namespace
             }
         }
 
+        if (mirror) {
+            // u' = 1 - u keeps UVs inside [0,1]; applied before the UV window so
+            // the flip happens within the chosen sub-rect.
+            for (size_t i = 0; i < std::size(uColumn); ++i) {
+                result.adjusted[uColumn[i]] =
+                    result.adjusted[wColumn[i]] - result.adjusted[uColumn[i]];
+            }
+        }
+
         if (applyUvWindow) {
             const float width = uvRect.u2 - uvRect.u1;
             const float height = uvRect.v2 - uvRect.v1;
@@ -454,7 +464,7 @@ namespace
             }
         }
 
-        result.active = applyModifiers || applyUvWindow;
+        result.active = applyModifiers || mirror || applyUvWindow;
         return result;
     }
 
@@ -1039,7 +1049,8 @@ namespace TerrainDecal
                                                 overrides.aspectMultiplier,
                                                 overrides.uvScaleU,
                                                 overrides.uvScaleV,
-                                                overrides.uvOffset)
+                                                overrides.uvOffset,
+                                                overrides.mirror)
                 : TextureTransformOverride{};
         if (applyUvWindowToTransform && !texTransformOverride.active) {
             LOG_WARN("TerrainDecalRenderer: UV override exists for overlay {} but transform override could not be built",

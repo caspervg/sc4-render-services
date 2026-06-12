@@ -26,6 +26,14 @@ struct TerrainDecalUvWindow {
     TerrainDecalUvMode mode = TerrainDecalUvMode::StretchSubrect;
 };
 
+// Service-defined bit in TerrainDecalState::flags. The flags dword is persisted
+// but not pushed to the game's overlay manager, so the top bits are free for
+// service semantics. Bit 31 follows the SC4 lot-texture orientation convention
+// (0x80000000 = mirrored): the texture is flipped in place as u' = 1 - u.
+// Combined with rotationTurns this spans every mirrored orientation.
+// Requires the custom clipped renderer (EnableCustomTerrainDecalRenderer).
+static constexpr uint32_t kTerrainDecalFlagMirror = 0x80000000u;
+
 struct TerrainDecalState {
     cGZPersistResourceKey textureKey{};
     cISTETerrainView::tOverlayManagerType overlayType = cISTETerrainView::tOverlayManagerType::DynamicLand;
