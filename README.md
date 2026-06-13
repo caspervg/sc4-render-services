@@ -3,6 +3,8 @@
 Render services and samples (ImGui, Draw, S3D Camera, Terrain Decals) for
 SimCity 4 DLL plugins using the gzcom-dll SDK.
 
+Simtropolis file download page: https://community.simtropolis.com/files/file/37423-sc4renderservices-dll/
+
 ![Screenshot](docs/assets/preview.jpg)
 
 ## Build
