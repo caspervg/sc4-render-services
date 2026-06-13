@@ -53,6 +53,9 @@ jobs:
     runs-on: windows-2022
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -128,6 +131,13 @@ jobs:
           )
           $archive = Join-Path $outDir ("sc4-render-services-" + $env:RELEASE_VERSION + "-win32-release.zip")
           Compress-Archive -Path $paths -DestinationPath $archive -Force
+
+      - name: Attest Release Artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            artifacts/*.zip
+            artifacts/SC4RenderServices.spdx.json
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
