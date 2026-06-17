@@ -29,18 +29,26 @@ namespace {
     // SimCity 4.exe 1.1.641 absolute addresses.
     constexpr uintptr_t kCalculateNormalsCallSite = 0x007498CD;
     constexpr uintptr_t kOriginalCalculateNormalsAndAssignCliffTextures = 0x00743B60;
+    constexpr uintptr_t kTerrainGetAltitudeVTableEntry = 0x00AB3D4C;
+    constexpr uintptr_t kOriginalTerrainGetAltitude = 0x00741260;
     constexpr uintptr_t kFlipInternalTriangulation = 0x00741180;
+
+    constexpr float kCellSize = 16.0f;
+    constexpr float kOneOverCellSize = 1.0f / kCellSize;
 
     constexpr uint32_t kTerrainCellCountXOffset = 0x28;
     constexpr uint32_t kTerrainCellCountZOffset = 0x2C;
     constexpr uint32_t kTerrainMaxCellXOffset = 0x30;
     constexpr uint32_t kTerrainMaxCellZOffset = 0x34;
     constexpr uint32_t kTerrainRowStrideOffset = 0x38;
+    constexpr uint32_t kTerrainWorldMaxXOffset = 0x50;
+    constexpr uint32_t kTerrainWorldMaxZOffset = 0x54;
     constexpr uint32_t kTerrainVertexDataOffset = 0x6C;
     constexpr uint32_t kTerrainCellRecordSize = 0x24;
     constexpr uint32_t kTerrainCellFlagsOffset = 0x22;
     constexpr uint16_t kCliffFlipMarkerFlag = 0x0800;
     constexpr uint16_t kInternalFlipFlag = 0x1000;
+    constexpr uint16_t kExternalFlipFlag = 0x2000;
 
     struct SC4RectLong {
         int32_t left;
@@ -52,6 +60,7 @@ namespace {
     struct TerrainDiagonalFixSettings {
         bool enabled = true;
         bool clearNonCandidates = true;
+        bool matchHeightQueriesToFlippedCells = true;
         float minHeightDelta = 12.0f;
         float diagonalHysteresis = 0.05f;
         uint32_t logEveryNChanges = 2048;
@@ -63,7 +72,76 @@ namespace {
     uint64_t gChangedCells = 0;
 
     using CalculateNormalsFn = void(__thiscall*)(void* terrain, SC4RectLong* rect);
+    using GetAltitudeFn = float(__thiscall*)(void* terrain, float x, float z);
     using FlipInternalTriangulationFn = void(__thiscall*)(void* terrain, uint32_t x, uint32_t z, bool flip);
+
+    class VTableEntryPatch final {
+    public:
+        void Configure(const char* name, const uintptr_t entryAddress, const uintptr_t expectedTarget, void* hookFn) {
+            name_ = name;
+            entryAddress_ = entryAddress;
+            expectedTarget_ = expectedTarget;
+            hookFn_ = reinterpret_cast<uintptr_t>(hookFn);
+        }
+
+        bool Install() {
+            if (installed_ || entryAddress_ == 0 || hookFn_ == 0) {
+                return false;
+            }
+
+            auto* const entry = reinterpret_cast<uintptr_t*>(entryAddress_);
+            originalTarget_ = *entry;
+            if (originalTarget_ != expectedTarget_) {
+                LOG_ERROR("{}: vtable entry 0x{:08X} targets 0x{:08X}, expected 0x{:08X}.",
+                          name_,
+                          static_cast<uint32_t>(entryAddress_),
+                          static_cast<uint32_t>(originalTarget_),
+                          static_cast<uint32_t>(expectedTarget_));
+                return false;
+            }
+
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(entry, sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                LOG_ERROR("{}: VirtualProtect failed for vtable entry 0x{:08X} (error {}).",
+                          name_,
+                          static_cast<uint32_t>(entryAddress_),
+                          GetLastError());
+                return false;
+            }
+
+            *entry = hookFn_;
+
+            DWORD ignored = 0;
+            VirtualProtect(entry, sizeof(uintptr_t), oldProtect, &ignored);
+            FlushInstructionCache(GetCurrentProcess(), entry, sizeof(uintptr_t));
+            installed_ = true;
+            return true;
+        }
+
+        void Uninstall() {
+            if (!installed_) {
+                return;
+            }
+
+            auto* const entry = reinterpret_cast<uintptr_t*>(entryAddress_);
+            DWORD oldProtect = 0;
+            if (VirtualProtect(entry, sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                *entry = originalTarget_;
+                DWORD ignored = 0;
+                VirtualProtect(entry, sizeof(uintptr_t), oldProtect, &ignored);
+                FlushInstructionCache(GetCurrentProcess(), entry, sizeof(uintptr_t));
+            }
+            installed_ = false;
+        }
+
+    private:
+        const char* name_ = "";
+        uintptr_t entryAddress_ = 0;
+        uintptr_t expectedTarget_ = 0;
+        uintptr_t hookFn_ = 0;
+        uintptr_t originalTarget_ = 0;
+        bool installed_ = false;
+    };
 
     template <typename T>
     T ReadField(void* base, const uint32_t offset) {
@@ -152,6 +230,11 @@ namespace {
         if (section.has("ClearNonCandidates")) {
             gSettings.clearNonCandidates = ParseBool(section.get("ClearNonCandidates"), gSettings.clearNonCandidates);
         }
+        if (section.has("MatchHeightQueriesToFlippedCells")) {
+            gSettings.matchHeightQueriesToFlippedCells = ParseBool(
+                section.get("MatchHeightQueriesToFlippedCells"),
+                gSettings.matchHeightQueriesToFlippedCells);
+        }
         if (section.has("MinHeightDelta")) {
             gSettings.minHeightDelta = std::max(0.0f, ParseFloat(section.get("MinHeightDelta"), gSettings.minHeightDelta));
         }
@@ -163,12 +246,61 @@ namespace {
         }
 
         LOG_INFO("TerrainDiagonalFix: settings enabled={}, clearNonCandidates={}, minHeightDelta={}, "
-                 "diagonalHysteresis={}, logEveryNChanges={}",
+                 "diagonalHysteresis={}, matchHeightQueriesToFlippedCells={}, logEveryNChanges={}",
                  gSettings.enabled,
                  gSettings.clearNonCandidates,
                  gSettings.minHeightDelta,
                  gSettings.diagonalHysteresis,
+                 gSettings.matchHeightQueriesToFlippedCells,
                  gSettings.logEveryNChanges);
+    }
+
+    bool TryGetCellFromWorldPosition(
+        void* terrain,
+        const float x,
+        const float z,
+        uint32_t& cellX,
+        uint32_t& cellZ,
+        float& localX,
+        float& localZ) {
+        if (terrain == nullptr || ReadField<uintptr_t>(terrain, kTerrainVertexDataOffset) == 0) {
+            return false;
+        }
+
+        const float maxX = ReadField<float>(terrain, kTerrainWorldMaxXOffset);
+        const float maxZ = ReadField<float>(terrain, kTerrainWorldMaxZOffset);
+        if (x < 0.0f || z < 0.0f || x >= maxX || z >= maxZ || std::isnan(x) || std::isnan(z)) {
+            return false;
+        }
+
+        cellX = static_cast<uint32_t>(std::floor(x * kOneOverCellSize));
+        cellZ = static_cast<uint32_t>(std::floor(z * kOneOverCellSize));
+        cellX = std::min(cellX, ReadField<uint32_t>(terrain, kTerrainMaxCellXOffset));
+        cellZ = std::min(cellZ, ReadField<uint32_t>(terrain, kTerrainMaxCellZOffset));
+
+        localX = (x - static_cast<float>(cellX) * kCellSize) * kOneOverCellSize;
+        localZ = (z - static_cast<float>(cellZ) * kCellSize) * kOneOverCellSize;
+        localX = std::clamp(localX, 0.0f, 1.0f);
+        localZ = std::clamp(localZ, 0.0f, 1.0f);
+        return true;
+    }
+
+    float GetFlippedCellAltitude(
+        void* terrain,
+        const uint32_t cellX,
+        const uint32_t cellZ,
+        const float localX,
+        const float localZ) {
+        const float h00 = GetCellHeight(terrain, cellX, cellZ);
+        const float h10 = GetCellHeight(terrain, cellX + 1, cellZ);
+        const float h01 = GetCellHeight(terrain, cellX, cellZ + 1);
+        const float h11 = GetCellHeight(terrain, cellX + 1, cellZ + 1);
+
+        if (localX + localZ <= 1.0f) {
+            return h00 + (h10 - h00) * localX + (h01 - h00) * localZ;
+        }
+
+        return h10 * (1.0f - localZ) + h01 * (1.0f - localX) + h11 * (localX + localZ - 1.0f);
     }
 
     void ApplyNearCliffDiagonalFix(void* terrain, const SC4RectLong* rect) {
@@ -265,6 +397,28 @@ namespace {
         original(terrain, rect);
         ApplyNearCliffDiagonalFix(terrain, rect);
     }
+
+    float __fastcall GetAltitudeFixed(void* terrain, void* /*edx*/, const float x, const float z) {
+        const auto original = reinterpret_cast<GetAltitudeFn>(kOriginalTerrainGetAltitude);
+        if (!gSettings.enabled || !gSettings.matchHeightQueriesToFlippedCells) {
+            return original(terrain, x, z);
+        }
+
+        uint32_t cellX = 0;
+        uint32_t cellZ = 0;
+        float localX = 0.0f;
+        float localZ = 0.0f;
+        if (!TryGetCellFromWorldPosition(terrain, x, z, cellX, cellZ, localX, localZ)) {
+            return original(terrain, x, z);
+        }
+
+        const uint16_t flags = GetCellFlags(terrain, cellX, cellZ);
+        if ((flags & (kInternalFlipFlag | kExternalFlipFlag)) == 0) {
+            return original(terrain, x, z);
+        }
+
+        return GetFlippedCellAltitude(terrain, cellX, cellZ, localX, localZ);
+    }
 }
 
 class TerrainDiagonalFixDirector final : public cRZMessage2COMDirector {
@@ -314,10 +468,25 @@ public:
         LOG_INFO("TerrainDiagonalFix: installed (call site 0x{:08X} -> wrapper, original 0x{:08X}).",
                  static_cast<uint32_t>(kCalculateNormalsCallSite),
                  static_cast<uint32_t>(kOriginalCalculateNormalsAndAssignCliffTextures));
+
+        if (gSettings.matchHeightQueriesToFlippedCells) {
+            heightQueryPatch_.Configure(
+                "TerrainDiagonalFix.GetAltitude",
+                kTerrainGetAltitudeVTableEntry,
+                kOriginalTerrainGetAltitude,
+                reinterpret_cast<void*>(&GetAltitudeFixed));
+            if (heightQueryPatch_.Install()) {
+                LOG_INFO("TerrainDiagonalFix: installed height-query vtable patch "
+                         "(entry 0x{:08X}, original 0x{:08X}).",
+                         static_cast<uint32_t>(kTerrainGetAltitudeVTableEntry),
+                         static_cast<uint32_t>(kOriginalTerrainGetAltitude));
+            }
+        }
         return true;
     }
 
     bool PostAppShutdown() override {
+        heightQueryPatch_.Uninstall();
         patch_.Uninstall();
         if (mpFrameWork) {
             mpFrameWork->RemoveHook(this);
@@ -331,6 +500,7 @@ public:
 
 private:
     TerrainDecal::RelativeCallPatch patch_{};
+    VTableEntryPatch heightQueryPatch_{};
 };
 
 static TerrainDiagonalFixDirector sDirector;
