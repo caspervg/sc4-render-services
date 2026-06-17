@@ -549,8 +549,71 @@ set_target_properties(SC4DateJumperSample PROPERTIES
 )
 
 
+# Fixed-size pool growth crash fix (guards the GZ pool `grow` call site against
+# block-ring saturation; see docs/sc4-fixed-pool-growth-crash.md)
+set(POOL_GROWTH_FIX_SOURCES
+        ${SC4RS_ROOT}/src/sample/pool-growth-fix/PoolGrowthFixDirector.cpp
+        ${SC4RS_ROOT}/src/service/decal/RelativeCallPatch.cpp
+        ${SC4RS_ROOT}/src/utils/VersionDetection.cpp
+        ${SC4RS_ROOT}/src/utils/Logger.cpp
+)
+
+add_library(SC4FixedPoolGrowthFixSample SHARED ${POOL_GROWTH_FIX_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
+
+target_include_directories(SC4FixedPoolGrowthFixSample PRIVATE
+        ${SC4RS_ROOT}/src
+)
+
+target_link_libraries(SC4FixedPoolGrowthFixSample PRIVATE
+        gzcom2
+        spdlog
+)
+
+if(WIN32)
+    target_link_libraries(SC4FixedPoolGrowthFixSample PRIVATE Version)
+endif()
+
+set_target_properties(SC4FixedPoolGrowthFixSample PROPERTIES
+        OUTPUT_NAME "SC4FixedPoolGrowthFixSample"
+        SUFFIX ".dll"
+        PREFIX ""
+)
+
+# Terrain diagonal near-cliff triangulation fix. This patches the terrain
+# redisplay pass after cliff texture classification and only changes quad
+# triangulation flags for non-cliff cells.
+set(TERRAIN_DIAGONAL_FIX_SOURCES
+        ${SC4RS_ROOT}/src/sample/terrain-diagonal-fix/TerrainDiagonalFixDirector.cpp
+        ${SC4RS_ROOT}/src/service/decal/RelativeCallPatch.cpp
+        ${SC4RS_ROOT}/src/utils/VersionDetection.cpp
+        ${SC4RS_ROOT}/src/utils/Logger.cpp
+)
+
+add_library(SC4TerrainDiagonalFixSample SHARED ${TERRAIN_DIAGONAL_FIX_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
+
+target_include_directories(SC4TerrainDiagonalFixSample PRIVATE
+        ${SC4RS_ROOT}/src
+        ${MINI_INCLUDE_DIR}
+)
+
+target_link_libraries(SC4TerrainDiagonalFixSample PRIVATE
+        gzcom2
+        spdlog
+)
+
+if(WIN32)
+    target_link_libraries(SC4TerrainDiagonalFixSample PRIVATE Version)
+endif()
+
+set_target_properties(SC4TerrainDiagonalFixSample PROPERTIES
+        OUTPUT_NAME "SC4TerrainDiagonalFixSample"
+        SUFFIX ".dll"
+        PREFIX ""
+)
+
+
 add_custom_target(SC4RenderServicesAllTargets
-        DEPENDS imgui SC4RenderServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample SC4RoadDecalSample SC4TerrainDecalSample SC4CameraViewInputSample SC4DateJumperSample
+        DEPENDS imgui SC4RenderServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample SC4RoadDecalSample SC4TerrainDecalSample SC4CameraViewInputSample SC4DateJumperSample SC4FixedPoolGrowthFixSample SC4TerrainDiagonalFixSample
 )
 
 # Automatic deployment to SC4 directories
@@ -680,6 +743,26 @@ if(WIN32 AND NOT DEFINED ENV{CI})
                 COMMENT "Deploying SC4DateJumperSample.dll to Plugins folder"
         )
 
+        add_custom_command(TARGET SC4FixedPoolGrowthFixSample POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${SC4_PLUGINS_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:SC4FixedPoolGrowthFixSample>
+                "${SC4_PLUGINS_DIR}/"
+                COMMENT "Deploying SC4FixedPoolGrowthFixSample.dll to Plugins folder"
+        )
+
+        add_custom_command(TARGET SC4TerrainDiagonalFixSample POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${SC4_PLUGINS_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:SC4TerrainDiagonalFixSample>
+                "${SC4_PLUGINS_DIR}/"
+                COMMAND ${CMAKE_COMMAND}
+                -DSRC=${SC4RS_ROOT}/SC4TerrainDiagonalFix.ini
+                -DDST=${SC4_PLUGINS_DIR}/SC4TerrainDiagonalFix.ini
+                -P ${SC4RS_ROOT}/cmake/CopyIfNotExists.cmake
+                COMMENT "Deploying SC4TerrainDiagonalFixSample.dll to Plugins folder (INI only if missing)"
+        )
+
         message(STATUS "Deployment targets configured:")
         message(STATUS "  - imgui.dll -> ${SC4_INSTALL_DIR}/Apps/")
         message(STATUS "  - SC4RenderServices.dll -> ${SC4_PLUGINS_DIR}/")
@@ -692,6 +775,8 @@ if(WIN32 AND NOT DEFINED ENV{CI})
         message(STATUS "  - SC4RoadDecalSample.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4TerrainDecalSample.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4CameraViewInputSample.dll -> ${SC4_PLUGINS_DIR}/")
+        message(STATUS "  - SC4FixedPoolGrowthFixSample.dll -> ${SC4_PLUGINS_DIR}/")
+        message(STATUS "  - SC4TerrainDiagonalFixSample.dll -> ${SC4_PLUGINS_DIR}/")
     else()
         message(WARNING "SC4 installation not found. Manual deployment required.")
     endif()
