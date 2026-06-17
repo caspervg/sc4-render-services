@@ -1,7 +1,16 @@
 #include "cIGZCOM.h"
+#include "cIGZCheatCodeManager.h"
 #include "cIGZFrameWork.h"
 #include "cIGZMessage2.h"
+#include "cIGZMessage2Standard.h"
+#include "cISC4App.h"
+#include "cISC4City.h"
+#include "cISTETerrain.h"
+#include "cRZAutoRefCount.h"
+#include "cRZBaseString.h"
 #include "cRZMessage2COMDirector.h"
+#include "GZServPtrs.h"
+#include "SC4Rect.h"
 
 #include "mini/ini.h"
 
@@ -21,10 +30,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace {
     constexpr uint32_t kDirectorID = 0xD1A90A1F;
     constexpr uint16_t kSupportedGameVersion = 641;
+    constexpr uint32_t kCheatCodeMessageType = 0x230E27AC;
+    constexpr uint32_t kCheatRefreshTerrainDiagonals = 0xD1A90A20;
 
     // SimCity 4.exe 1.1.641 absolute addresses.
     constexpr uintptr_t kCalculateNormalsCallSite = 0x007498CD;
@@ -74,6 +86,118 @@ namespace {
     using CalculateNormalsFn = void(__thiscall*)(void* terrain, SC4RectLong* rect);
     using GetAltitudeFn = float(__thiscall*)(void* terrain, float x, float z);
     using FlipInternalTriangulationFn = void(__thiscall*)(void* terrain, uint32_t x, uint32_t z, bool flip);
+
+    class DirtyTerrainRects final {
+    public:
+        DirtyTerrainRects(const int32_t maxCellX, const int32_t maxCellZ)
+            : maxCellX_(maxCellX), maxCellZ_(maxCellZ) {
+        }
+
+        void AddChangedCell(const int32_t x, const int32_t z) {
+            ++changedCellCount_;
+
+            if (runActive_ && z == runZ_ && x <= runRight_ + kHorizontalMergeGap) {
+                runRight_ = x;
+                return;
+            }
+
+            FlushRun();
+            runActive_ = true;
+            runZ_ = z;
+            runLeft_ = x;
+            runRight_ = x;
+        }
+
+        void Finish() {
+            FlushRun();
+            rects_.insert(rects_.end(), activeRects_.begin(), activeRects_.end());
+            activeRects_.clear();
+        }
+
+        [[nodiscard]] const std::vector<SC4RectLong>& GetRects() const {
+            return rects_;
+        }
+
+        [[nodiscard]] uint32_t GetChangedCellCount() const {
+            return changedCellCount_;
+        }
+
+    private:
+        static constexpr int32_t kPadding = 1;
+        static constexpr int32_t kHorizontalMergeGap = 2;
+
+        static bool TouchesOrOverlaps(const SC4RectLong& a, const SC4RectLong& b) {
+            return a.left <= b.right + 1 &&
+                   b.left <= a.right + 1 &&
+                   a.top <= b.bottom + 1 &&
+                   b.top <= a.bottom + 1;
+        }
+
+        static void UnionInto(SC4RectLong& target, const SC4RectLong& source) {
+            target.left = std::min(target.left, source.left);
+            target.top = std::min(target.top, source.top);
+            target.right = std::max(target.right, source.right);
+            target.bottom = std::max(target.bottom, source.bottom);
+        }
+
+        void FlushRun() {
+            if (!runActive_) {
+                return;
+            }
+
+            SC4RectLong rect{
+                std::max(0, runLeft_ - kPadding),
+                std::max(0, runZ_ - kPadding),
+                std::min(maxCellX_, runRight_ + kPadding),
+                std::min(maxCellZ_, runZ_ + kPadding),
+            };
+
+            PruneActiveRects(rect.top);
+            MergeActiveRect(rect);
+            runActive_ = false;
+        }
+
+        void PruneActiveRects(const int32_t nextTop) {
+            auto it = activeRects_.begin();
+            while (it != activeRects_.end()) {
+                if (it->bottom + 1 < nextTop) {
+                    rects_.push_back(*it);
+                    it = activeRects_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        void MergeActiveRect(SC4RectLong rect) {
+            bool merged = true;
+            while (merged) {
+                merged = false;
+                auto it = activeRects_.begin();
+                while (it != activeRects_.end()) {
+                    if (TouchesOrOverlaps(rect, *it)) {
+                        UnionInto(rect, *it);
+                        it = activeRects_.erase(it);
+                        merged = true;
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+
+            activeRects_.push_back(rect);
+        }
+
+        int32_t maxCellX_;
+        int32_t maxCellZ_;
+        bool runActive_ = false;
+        int32_t runZ_ = 0;
+        int32_t runLeft_ = 0;
+        int32_t runRight_ = 0;
+        uint32_t changedCellCount_ = 0;
+        std::vector<SC4RectLong> activeRects_;
+        std::vector<SC4RectLong> rects_;
+    };
 
     class VTableEntryPatch final {
     public:
@@ -303,7 +427,25 @@ namespace {
         return h10 * (1.0f - localZ) + h01 * (1.0f - localX) + h11 * (localX + localZ - 1.0f);
     }
 
-    void ApplyNearCliffDiagonalFix(void* terrain, const SC4RectLong* rect) {
+    bool TryGetFullTerrainRect(void* terrain, SC4RectLong& rect) {
+        if (terrain == nullptr || ReadField<uintptr_t>(terrain, kTerrainVertexDataOffset) == 0) {
+            return false;
+        }
+
+        const uint32_t maxCellX = ReadField<uint32_t>(terrain, kTerrainMaxCellXOffset);
+        const uint32_t maxCellZ = ReadField<uint32_t>(terrain, kTerrainMaxCellZOffset);
+        if (maxCellX == 0 || maxCellZ == 0) {
+            return false;
+        }
+
+        rect.left = 0;
+        rect.top = 0;
+        rect.right = static_cast<int32_t>(maxCellX);
+        rect.bottom = static_cast<int32_t>(maxCellZ);
+        return true;
+    }
+
+    void ApplyNearCliffDiagonalFix(void* terrain, const SC4RectLong* rect, DirtyTerrainRects* dirtyRects = nullptr) {
         if (!gSettings.enabled || terrain == nullptr || rect == nullptr) {
             return;
         }
@@ -351,6 +493,9 @@ namespace {
                 if (maxHeight - minHeight < gSettings.minHeightDelta) {
                     if (gSettings.clearNonCandidates && (flags & kInternalFlipFlag) != 0) {
                         flipInternal(terrain, ux, uz, false);
+                        if (dirtyRects) {
+                            dirtyRects->AddChangedCell(x, z);
+                        }
                         ++changedThisPass;
                     }
                     continue;
@@ -372,9 +517,16 @@ namespace {
 
                 if (flip != currentlyFlipped) {
                     flipInternal(terrain, ux, uz, flip);
+                    if (dirtyRects) {
+                        dirtyRects->AddChangedCell(x, z);
+                    }
                     ++changedThisPass;
                 }
             }
+        }
+
+        if (dirtyRects) {
+            dirtyRects->Finish();
         }
 
         if (changedThisPass != 0) {
@@ -418,6 +570,13 @@ namespace {
         }
 
         return GetFlippedCellAltitude(terrain, cellX, cellZ, localX, localZ);
+    }
+
+    void RefreshTerrainDisplay(cISTETerrain* terrain, const std::vector<SC4RectLong>& rects) {
+        for (const SC4RectLong& rect : rects) {
+            const SC4Rect<int32_t> displayRect(rect.left, rect.top, rect.right, rect.bottom);
+            terrain->RedisplayTerrain(true, true, displayRect, 0);
+        }
     }
 }
 
@@ -482,10 +641,28 @@ public:
                          static_cast<uint32_t>(kOriginalTerrainGetAltitude));
             }
         }
+
+        const cISC4AppPtr app;
+        if (app) {
+            if (auto* const cheats = app->GetCheatCodeManager()) {
+                if (cheats->RegisterCheatCode(kCheatRefreshTerrainDiagonals, cRZBaseString("fixjaggies"))) {
+                    cheats->AddNotification2(this, 0);
+                    cheatManager_ = cheats;
+                    LOG_INFO("TerrainDiagonalFix: cheat code registered (fixjaggies).");
+                } else {
+                    LOG_WARN("TerrainDiagonalFix: failed to register cheat code fixjaggies.");
+                }
+            }
+        }
         return true;
     }
 
     bool PostAppShutdown() override {
+        if (cheatManager_) {
+            cheatManager_->UnregisterCheatCode(kCheatRefreshTerrainDiagonals);
+            cheatManager_->RemoveNotification2(this, 0);
+            cheatManager_.Reset();
+        }
         heightQueryPatch_.Uninstall();
         patch_.Uninstall();
         if (mpFrameWork) {
@@ -494,13 +671,50 @@ public:
         return true;
     }
 
-    bool DoMessage(cIGZMessage2*) override {
+    bool DoMessage(cIGZMessage2* pMsg) override {
+        if (pMsg) {
+            auto* const stdMsg = static_cast<cIGZMessage2Standard*>(pMsg);
+            if (stdMsg->GetType() == kCheatCodeMessageType &&
+                static_cast<uint32_t>(stdMsg->GetData1()) == kCheatRefreshTerrainDiagonals) {
+                OnRefreshTerrainDiagonalsCheat();
+            }
+        }
         return true;
     }
 
 private:
+    void OnRefreshTerrainDiagonalsCheat() {
+        const cISC4AppPtr app;
+        cISC4City* const city = app ? app->GetCity() : nullptr;
+        cISTETerrain* const terrain = city ? city->GetTerrain() : nullptr;
+        if (terrain == nullptr) {
+            LOG_INFO("TerrainDiagonalFix: fixjaggies ignored; no city terrain is available.");
+            return;
+        }
+
+        SC4RectLong rect{};
+        if (!TryGetFullTerrainRect(terrain, rect)) {
+            LOG_WARN("TerrainDiagonalFix: fixjaggies failed; terrain data is not initialized.");
+            return;
+        }
+
+        DirtyTerrainRects dirtyRects(rect.right, rect.bottom);
+        ApplyNearCliffDiagonalFix(terrain, &rect, &dirtyRects);
+        RefreshTerrainDisplay(terrain, dirtyRects.GetRects());
+
+        LOG_INFO("TerrainDiagonalFix: fixjaggies scanned full terrain rect [{}, {}, {}, {}]; "
+                 "changed {} cells and refreshed {} dirty rects.",
+                 rect.left,
+                 rect.top,
+                 rect.right,
+                 rect.bottom,
+                 dirtyRects.GetChangedCellCount(),
+                 dirtyRects.GetRects().size());
+    }
+
     TerrainDecal::RelativeCallPatch patch_{};
     VTableEntryPatch heightQueryPatch_{};
+    cRZAutoRefCount<cIGZCheatCodeManager> cheatManager_;
 };
 
 static TerrainDiagonalFixDirector sDirector;
