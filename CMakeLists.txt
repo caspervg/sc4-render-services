@@ -611,9 +611,41 @@ set_target_properties(SC4TerrainDiagonalFixSample PROPERTIES
         PREFIX ""
 )
 
+# Power-pole cable customization. Lets a pole prop exemplar declare custom cable attach points
+# per connection direction via new exemplar properties, instead of being limited to the engine's
+# two baked 4-point tables. See docs/sc4-powerline-tool-re.md for the underlying RE.
+set(POWER_POLE_CUSTOMIZATION_SOURCES
+        ${SC4RS_ROOT}/src/sample/power-pole-customization/PowerPoleCustomizationDirector.cpp
+        ${SC4RS_ROOT}/src/service/decal/RelativeCallPatch.cpp
+        ${SC4RS_ROOT}/src/utils/VersionDetection.cpp
+        ${SC4RS_ROOT}/src/utils/Logger.cpp
+)
+
+add_library(SC4PowerPoleCustomizationSample SHARED ${POWER_POLE_CUSTOMIZATION_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
+
+target_include_directories(SC4PowerPoleCustomizationSample PRIVATE
+        ${SC4RS_ROOT}/src
+        ${MINI_INCLUDE_DIR}
+)
+
+target_link_libraries(SC4PowerPoleCustomizationSample PRIVATE
+        gzcom2
+        spdlog
+)
+
+if(WIN32)
+    target_link_libraries(SC4PowerPoleCustomizationSample PRIVATE Version)
+endif()
+
+set_target_properties(SC4PowerPoleCustomizationSample PROPERTIES
+        OUTPUT_NAME "SC4PowerPoleCustomizationSample"
+        SUFFIX ".dll"
+        PREFIX ""
+)
+
 
 add_custom_target(SC4RenderServicesAllTargets
-        DEPENDS imgui SC4RenderServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample SC4RoadDecalSample SC4TerrainDecalSample SC4CameraViewInputSample SC4DateJumperSample SC4FixedPoolGrowthFixSample SC4TerrainDiagonalFixSample
+        DEPENDS imgui SC4RenderServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample SC4RoadDecalSample SC4TerrainDecalSample SC4CameraViewInputSample SC4DateJumperSample SC4FixedPoolGrowthFixSample SC4TerrainDiagonalFixSample SC4PowerPoleCustomizationSample
 )
 
 # Automatic deployment to SC4 directories
@@ -763,6 +795,18 @@ if(WIN32 AND NOT DEFINED ENV{CI})
                 COMMENT "Deploying SC4TerrainDiagonalFixSample.dll to Plugins folder (INI only if missing)"
         )
 
+        add_custom_command(TARGET SC4PowerPoleCustomizationSample POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${SC4_PLUGINS_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:SC4PowerPoleCustomizationSample>
+                "${SC4_PLUGINS_DIR}/"
+                COMMAND ${CMAKE_COMMAND}
+                -DSRC=${SC4RS_ROOT}/SC4PowerPoleCustomization.ini
+                -DDST=${SC4_PLUGINS_DIR}/SC4PowerPoleCustomization.ini
+                -P ${SC4RS_ROOT}/cmake/CopyIfNotExists.cmake
+                COMMENT "Deploying SC4PowerPoleCustomizationSample.dll to Plugins folder (INI only if missing)"
+        )
+
         message(STATUS "Deployment targets configured:")
         message(STATUS "  - imgui.dll -> ${SC4_INSTALL_DIR}/Apps/")
         message(STATUS "  - SC4RenderServices.dll -> ${SC4_PLUGINS_DIR}/")
@@ -777,6 +821,7 @@ if(WIN32 AND NOT DEFINED ENV{CI})
         message(STATUS "  - SC4CameraViewInputSample.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4FixedPoolGrowthFixSample.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4TerrainDiagonalFixSample.dll -> ${SC4_PLUGINS_DIR}/")
+        message(STATUS "  - SC4PowerPoleCustomizationSample.dll -> ${SC4_PLUGINS_DIR}/")
     else()
         message(WARNING "SC4 installation not found. Manual deployment required.")
     endif()
