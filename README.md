@@ -116,6 +116,8 @@ Detailed reference: [docs/services.md](docs/services.md)
 
 Terrain decal guide: [docs/terrain-decals.md](docs/terrain-decals.md)
 
+Power-pole customization guide: [docs/power-pole-customization.md](docs/power-pole-customization.md)
+
 ### 1) ImGui service
 
 - Service ID / IID: `kImGuiServiceID`, `GZIID_cIGZImGuiService`
