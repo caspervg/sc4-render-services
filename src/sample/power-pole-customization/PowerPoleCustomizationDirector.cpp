@@ -69,6 +69,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -93,6 +94,13 @@ namespace {
     // gSyntheticTestModeEnabled branch in InitConnectionPointsHook) once in-game verification is done.
     // ------------------------------------------------------------------
     constexpr uint32_t kCheatPoleLineTest = 0xB07E1000;
+
+    // TEMPORARY interim UX for pole-style switching (see the "Multiple pole styles" block further
+    // down): cycles gActiveStyleIndex through vanilla + every [PowerPoles.<Name>] section loaded
+    // from the ini. Replace with the real Tab/Shift-Tab cSC4PowerLineTool ViewInputControl key hook
+    // in a follow-up session (deferred 2026-07-02 -- that hook needs its own Windows vtable-slot RE
+    // pass, not yet done).
+    constexpr uint32_t kCheatPoleStyle = 0xB07E1001;
     constexpr uint32_t kSyntheticTestPointCount = 6; // > vanilla's 4, so it's obvious if extras render
     bool gSyntheticTestModeEnabled = false;
 
@@ -277,6 +285,36 @@ namespace {
     constexpr uintptr_t kWallTextureHashSite2 = 0x0064ca84;
     constexpr uint32_t kVanillaFloorTextureId = 0x0912220E;
     constexpr uint32_t kVanillaWallTextureId = 0x08080004;
+
+    // ------------------------------------------------------------------
+    // Multiple pole "styles" (docs/sc4-powerline-tool-re.md SS "B. Multiple pole types/families").
+    // Data-model + style-switching resolver only, per user decision (2026-07-02) -- the real
+    // in-game Tab/Shift-Tab key hook is deferred to a follow-up session; style switching for now is
+    // driven by the interim "polestyle" cheat code below, same PoC pattern as kCheatPoleLineTest.
+    //
+    // cSC4PowerLineTool::CreatePowerPole (Windows 0x00650140) reads the pole instance for a
+    // direction mask from the vanilla global g_dwPowerPoleForDirectionsFlag[16] (0x00B467B0,
+    // confirmed docs SS7/SS8) at exactly 2 sites -- merge-branch and new-pole branch, both the
+    // identical 7-byte `MOV EAX,[EDI*4+0xB467B0]` (confirmed via raw memory read, not just
+    // disassembly text). Both patched to call a resolver that passes through to the vanilla array
+    // when no custom style is active (index 0), or looks up the active style's table otherwise,
+    // falling back to vanilla per-entry for any direction mask a sparse custom section doesn't
+    // define. EDI (the direction mask) is untouched by the hook -- it's read again immediately after
+    // both call sites (OR'd into the connection's stored direction flags), so must survive.
+    // ------------------------------------------------------------------
+    constexpr uintptr_t kPowerPoleForDirectionsFlag = 0x00B467B0; // vanilla 16xuint32 table
+    constexpr uintptr_t kPoleStyleLookupSite1 = 0x00650177; // merge-branch (existing pole at cell)
+    constexpr uintptr_t kPoleStyleLookupSite2 = 0x006501cd; // new-pole branch
+
+    struct PoleStyle {
+        std::string name;
+        std::array<uint32_t, 16> instanceByDirectionMask{};
+        std::array<bool, 16> hasMask{};
+    };
+
+    // Index 0 = vanilla (no override). gStyles[gActiveStyleIndex - 1] for gActiveStyleIndex >= 1.
+    std::vector<PoleStyle> gStyles;
+    uint32_t gActiveStyleIndex = 0;
 
     // ------------------------------------------------------------------
     // Data-driven settings (SC4PowerPoleCustomization.ini).
@@ -966,6 +1004,93 @@ namespace {
 #error Power-pole foundation-texture hook requires 32-bit MSVC.
 #endif
 
+    // ------------------------------------------------------------------
+    // Pole-style lookup. Returns the pole instance for a direction mask under the active style, or
+    // the vanilla instance when no style is active / the mask isn't defined in that style's ini
+    // section. EDI at the call site already holds the direction mask (0-15); pushed as the sole
+    // __cdecl argument.
+    // ------------------------------------------------------------------
+    uint32_t __cdecl ResolvePoleInstanceForDirectionMask(const uint32_t directionMask) noexcept {
+        const auto* const vanillaTable = reinterpret_cast<const uint32_t*>(kPowerPoleForDirectionsFlag);
+        const uint32_t mask = directionMask & 0xF;
+        if (gActiveStyleIndex == 0 || gActiveStyleIndex > gStyles.size()) {
+            return vanillaTable[mask];
+        }
+        const PoleStyle& style = gStyles[gActiveStyleIndex - 1];
+        return style.hasMask[mask] ? style.instanceByDirectionMask[mask] : vanillaTable[mask];
+    }
+
+#if defined(_MSC_VER) && defined(_M_IX86)
+    // EDI must survive untouched (read again by the caller right after both call sites); EAX is the
+    // only register the original 7-byte MOV wrote, matching what CALL leaves behind here too.
+    __declspec(naked) void PoleStyleLookupHook() {
+        __asm {
+            push edi
+            call ResolvePoleInstanceForDirectionMask
+            add esp, 4
+            ret
+        }
+    }
+#else
+#error Power-pole style-switching hook requires 32-bit MSVC.
+#endif
+
+    // Generic N-byte-prefix-match -> `CALL rel32` patch (5 bytes) + NOP padding for the remainder.
+    // Used for the 7-byte pole-style lookup sites; kept separate from Imm32CallPatch (fixed 5-byte
+    // `MOV EAX,imm32` sites) since the expected byte pattern and size differ here.
+    class ByteSpanCallPatch final {
+    public:
+        bool Install(const uintptr_t site, std::initializer_list<uint8_t> expectedBytes, void* hookFn,
+                     const char* name) {
+            site_ = site;
+            size_ = static_cast<uint32_t>(expectedBytes.size());
+            auto* const p = reinterpret_cast<uint8_t*>(site);
+            if (!std::equal(expectedBytes.begin(), expectedBytes.end(), p)) {
+                LOG_ERROR("PowerPoleCustomization: {} bytes at 0x{:08X} do not match 1.1.641; not patching.",
+                          name, static_cast<uint32_t>(site));
+                return false;
+            }
+
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(p, size_, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                LOG_ERROR("PowerPoleCustomization: VirtualProtect failed for {} (error {}).", name, GetLastError());
+                return false;
+            }
+            original_.assign(p, p + size_);
+            const auto relative = static_cast<int32_t>(
+                reinterpret_cast<intptr_t>(hookFn) - (static_cast<intptr_t>(site) + 5));
+            p[0] = 0xe8;
+            std::memcpy(p + 1, &relative, sizeof(relative));
+            std::fill(p + 5, p + size_, static_cast<uint8_t>(0x90));
+            FlushInstructionCache(GetCurrentProcess(), p, size_);
+            DWORD ignored = 0;
+            VirtualProtect(p, size_, oldProtect, &ignored);
+            installed_ = true;
+            return true;
+        }
+
+        void Uninstall() {
+            if (!installed_) {
+                return;
+            }
+            auto* const p = reinterpret_cast<uint8_t*>(site_);
+            DWORD oldProtect = 0;
+            if (VirtualProtect(p, size_, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                std::memcpy(p, original_.data(), original_.size());
+                FlushInstructionCache(GetCurrentProcess(), p, size_);
+                DWORD ignored = 0;
+                VirtualProtect(p, size_, oldProtect, &ignored);
+            }
+            installed_ = false;
+        }
+
+    private:
+        uintptr_t site_ = 0;
+        uint32_t size_ = 0;
+        std::vector<uint8_t> original_;
+        bool installed_ = false;
+    };
+
     // Generic 5-byte `MOV EAX, imm32` -> `CALL rel32` patch, one instance per hash-lookup site. Kept
     // separate from InlineCallPatch (used for the 23-byte wire-width site) since the byte count and
     // expected-opcode check differ.
@@ -1126,6 +1251,17 @@ namespace {
         return (ec == std::errc() && ptr == value.data() + value.size()) ? result : defaultValue;
     }
 
+    // Accepts "0x..."/"0X..." (matching the vanilla [PowerPoles] ini's own value format) or plain hex.
+    uint32_t ParseHexUInt32(const std::string& value, const uint32_t defaultValue) {
+        std::string_view text = value;
+        if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+            text.remove_prefix(2);
+        }
+        uint32_t result = defaultValue;
+        const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), result, 16);
+        return (ec == std::errc() && ptr == text.data() + text.size()) ? result : defaultValue;
+    }
+
     std::filesystem::path GetDllDirectoryPath() {
         HMODULE module = nullptr;
         if (!GetModuleHandleExW(
@@ -1140,8 +1276,46 @@ namespace {
         return std::filesystem::path(path).parent_path();
     }
 
+    // [PowerPoles.<Name>] sections, same key format as vanilla's own [PowerPoles] ini (see
+    // docs/sc4-powerline-tool-re.md SS1): keys "0x00".."0x0f" (direction-combination bitmask),
+    // values a pole prop exemplar Instance ID. A section may be sparse -- masks it doesn't define
+    // fall back to the vanilla instance for that mask at resolve time, not here.
+    void LoadPoleStyles(const mINI::INIStructure& ini) {
+        gStyles.clear();
+        constexpr std::string_view kPrefix = "powerpoles.";
+        for (const auto& [sectionName, section] : ini) {
+            std::string lowerName = sectionName;
+            std::ranges::transform(lowerName, lowerName.begin(), [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lowerName.size() <= kPrefix.size() || lowerName.compare(0, kPrefix.size(), kPrefix) != 0) {
+                continue;
+            }
+
+            PoleStyle style;
+            style.name = sectionName.substr(kPrefix.size());
+            uint32_t definedCount = 0;
+            for (uint32_t mask = 0; mask < 16; ++mask) {
+                char key[5] = {};
+                std::snprintf(key, sizeof(key), "0x%02x", mask);
+                if (section.has(key)) {
+                    style.instanceByDirectionMask[mask] = ParseHexUInt32(section.get(key), 0);
+                    style.hasMask[mask] = true;
+                    ++definedCount;
+                }
+            }
+            if (definedCount == 0) {
+                LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] defines no 0x00-0x0f keys; skipping.", style.name);
+                continue;
+            }
+            LOG_INFO("PowerPoleCustomization: loaded pole style \"{}\" ({} of 16 direction masks defined, "
+                     "rest fall back to vanilla).", style.name, definedCount);
+            gStyles.push_back(std::move(style));
+        }
+    }
+
     void LoadSettings() {
         gSettings = {};
+        gStyles.clear();
+        gActiveStyleIndex = 0;
         const auto settingsPath = GetDllDirectoryPath() / "SC4PowerPoleCustomization.ini";
         mINI::INIFile file(settingsPath.string());
         mINI::INIStructure ini;
@@ -1161,6 +1335,8 @@ namespace {
 
         LOG_INFO("PowerPoleCustomization: settings enabled={}, maxPointsPerDirection={}",
                  gSettings.enabled, gSettings.maxPointsPerDirection);
+
+        LoadPoleStyles(ini);
     }
 }
 
@@ -1229,9 +1405,14 @@ public:
         installed += wallTextureHashPatch2_.Install(kWallTextureHashSite2, kVanillaWallTextureId,
                                                       &WallTextureHashHook, "WallTextureHash@2") ? 1 : 0;
 
+        installed += poleStyleLookupPatch1_.Install(kPoleStyleLookupSite1,
+            {0x8b, 0x04, 0xbd, 0xb0, 0x67, 0xb4, 0x00}, &PoleStyleLookupHook, "PoleStyleLookup@1") ? 1 : 0;
+        installed += poleStyleLookupPatch2_.Install(kPoleStyleLookupSite2,
+            {0x8b, 0x04, 0xbd, 0xb0, 0x67, 0xb4, 0x00}, &PoleStyleLookupHook, "PoleStyleLookup@2") ? 1 : 0;
+
         LOG_INFO("PowerPoleCustomization: installed {} of {} patches.", installed,
                  initConnectionPointsPatches_.size() + kAddConnectionCallSites.size() +
-                 kUpdateConnectionCallSites.size() + 1 + createFloorPatches_.size() + 4);
+                 kUpdateConnectionCallSites.size() + 1 + createFloorPatches_.size() + 4 + 2);
 
         // TEMPORARY PoC-ONLY cheat. See the block comment above kCheatPoleLineTest.
         const cISC4AppPtr app;
@@ -1246,6 +1427,13 @@ public:
                 } else {
                     LOG_WARN("PowerPoleCustomization: failed to register cheat code polelinetest.");
                 }
+                if (cheats->RegisterCheatCode(kCheatPoleStyle, cRZBaseString("polestyle"))) {
+                    LOG_INFO("PowerPoleCustomization: [TEST MODE] cheat code registered (polestyle) -- "
+                             "cycles the active pole style ({} loaded from ini) for newly-placed poles. "
+                             "Interim UX; the real Tab/Shift-Tab key hook is a follow-up.", gStyles.size());
+                } else {
+                    LOG_WARN("PowerPoleCustomization: failed to register cheat code polestyle.");
+                }
             }
         }
 
@@ -1255,6 +1443,7 @@ public:
     bool PostAppShutdown() override {
         if (cheatManager_) {
             cheatManager_->UnregisterCheatCode(kCheatPoleLineTest);
+            cheatManager_->UnregisterCheatCode(kCheatPoleStyle);
             cheatManager_->RemoveNotification2(this, 0);
             cheatManager_.Reset();
         }
@@ -1267,6 +1456,8 @@ public:
         floorTextureHashPatch2_.Uninstall();
         wallTextureHashPatch1_.Uninstall();
         wallTextureHashPatch2_.Uninstall();
+        poleStyleLookupPatch1_.Uninstall();
+        poleStyleLookupPatch2_.Uninstall();
         gPolylineWidthOverrides.clear();
         gOverrides.clear();
         if (mpFrameWork) {
@@ -1284,6 +1475,13 @@ public:
                 LOG_INFO("PowerPoleCustomization: [TEST MODE] {} -- place or reload a power pole now "
                          "to see it take effect (only applies at InitConnectionPoints time).",
                          gSyntheticTestModeEnabled ? "ENABLED" : "disabled");
+            }
+            if (stdMsg->GetType() == kCheatCodeMessageType &&
+                static_cast<uint32_t>(stdMsg->GetData1()) == kCheatPoleStyle) {
+                gActiveStyleIndex = gStyles.empty() ? 0 : (gActiveStyleIndex + 1) % (static_cast<uint32_t>(gStyles.size()) + 1);
+                const std::string activeName = gActiveStyleIndex == 0 ? "vanilla" : gStyles[gActiveStyleIndex - 1].name;
+                LOG_INFO("PowerPoleCustomization: [TEST MODE] active pole style -> \"{}\" ({} of {}) -- "
+                         "applies to newly-placed poles only.", activeName, gActiveStyleIndex, gStyles.size());
             }
         }
         return true;
@@ -1315,6 +1513,8 @@ private:
     Imm32CallPatch floorTextureHashPatch2_{};
     Imm32CallPatch wallTextureHashPatch1_{};
     Imm32CallPatch wallTextureHashPatch2_{};
+    ByteSpanCallPatch poleStyleLookupPatch1_{};
+    ByteSpanCallPatch poleStyleLookupPatch2_{};
     InlineCallPatch wireWidthLookupPatch_{};
     cRZAutoRefCount<cIGZCheatCodeManager> cheatManager_; // TEMPORARY PoC-ONLY, see kCheatPoleLineTest
 };
