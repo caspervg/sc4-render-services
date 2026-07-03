@@ -306,10 +306,28 @@ namespace {
     constexpr uintptr_t kPoleStyleLookupSite1 = 0x00650177; // merge-branch (existing pole at cell)
     constexpr uintptr_t kPoleStyleLookupSite2 = 0x006501cd; // new-pole branch
 
+    // ------------------------------------------------------------------
+    // Per-style inter-pole distance. cSC4PowerLineTool::DeterminePolePositions (Windows 0x00650840,
+    // docs/sc4-powerline-tool-re.md SS16) forces a new pole once the current drag step exceeds the
+    // tool's "Max cells between power poles" field, read at `*(tool+0x3a4) <= (curStep - lastPoleStep)`.
+    // Vanilla loads that field once from the Utilities exemplar (property 0x098B25C8 = 10, docs SS2);
+    // it's a plain tool-instance member, and the placement loop is its only reader. The hook saves the
+    // field, writes the active style's value, runs vanilla, then restores -- fully scoped, so no
+    // persistent per-tool cache is needed. Called from 3 sites (preview, alt-preview, commit/PlacePoles).
+    // ------------------------------------------------------------------
+    constexpr uintptr_t kDeterminePolePositions = 0x00650840;
+    constexpr std::array<uintptr_t, 3> kDeterminePolePositionsCallSites = {
+        0x00652063, 0x006522bf, 0x006529c2,
+    };
+    constexpr uint32_t kTool_MaxCellsBetweenPoles = 0x3a4; // cSC4PowerLineTool instance field
+    constexpr uint32_t kMaxInterPoleDistance = 50; // sanity clamp; vanilla is 10
+
     struct PoleStyle {
         std::string name;
         std::array<uint32_t, 16> instanceByDirectionMask{};
         std::array<bool, 16> hasMask{};
+        uint32_t maxCellsBetweenPoles = 0; // 0 = inherit vanilla; else cells between poles
+        bool hasMaxCells = false;
     };
 
     // Index 0 = vanilla (no override). gStyles[gActiveStyleIndex - 1] for gActiveStyleIndex >= 1.
@@ -1234,6 +1252,30 @@ namespace {
         }
     }
 
+    // Inter-pole distance for the active style, or the tool's own vanilla value when no style is
+    // active / the active style doesn't override it. See kDeterminePolePositions block above.
+    uint32_t ResolveMaxCellsBetweenPoles(const uint32_t vanillaValue) noexcept {
+        if (gActiveStyleIndex == 0 || gActiveStyleIndex > gStyles.size()) {
+            return vanillaValue;
+        }
+        const PoleStyle& style = gStyles[gActiveStyleIndex - 1];
+        return style.hasMaxCells ? style.maxCellsBetweenPoles : vanillaValue;
+    }
+
+    using DeterminePolePositionsFn = void(__thiscall*)(void* tool);
+
+    void __fastcall DeterminePolePositionsHook(void* tool, void* /*edx*/) {
+        auto* const field = reinterpret_cast<uint32_t*>(
+            reinterpret_cast<uint8_t*>(tool) + kTool_MaxCellsBetweenPoles);
+        const uint32_t saved = *field;
+        if (gSettings.enabled) {
+            *field = ResolveMaxCellsBetweenPoles(saved);
+        }
+        const auto original = reinterpret_cast<DeterminePolePositionsFn>(kDeterminePolePositions);
+        original(tool);
+        *field = saved; // restore vanilla; the placement loop is this field's only reader
+    }
+
     // ------------------------------------------------------------------
     // Settings (SC4PowerPoleCustomization.ini, same layout convention as SC4TerrainDiagonalFix.ini).
     // ------------------------------------------------------------------
@@ -1302,12 +1344,20 @@ namespace {
                     ++definedCount;
                 }
             }
-            if (definedCount == 0) {
-                LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] defines no 0x00-0x0f keys; skipping.", style.name);
+            if (section.has("InterPoleDistance")) {
+                const uint32_t d = std::clamp(ParseUInt32(section.get("InterPoleDistance"), 0u), 1u, kMaxInterPoleDistance);
+                style.maxCellsBetweenPoles = d;
+                style.hasMaxCells = true;
+            }
+
+            if (definedCount == 0 && !style.hasMaxCells) {
+                LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] defines no 0x00-0x0f keys or "
+                         "InterPoleDistance; skipping.", style.name);
                 continue;
             }
             LOG_INFO("PowerPoleCustomization: loaded pole style \"{}\" ({} of 16 direction masks defined, "
-                     "rest fall back to vanilla).", style.name, definedCount);
+                     "rest fall back to vanilla; InterPoleDistance={}).", style.name, definedCount,
+                     style.hasMaxCells ? std::to_string(style.maxCellsBetweenPoles) : std::string("vanilla"));
             gStyles.push_back(std::move(style));
         }
     }
@@ -1388,6 +1438,11 @@ public:
             installed += InstallCallSitePatch(updateConnectionPatches_[i], "UpdateConnection@SetDefaultExemplar",
                                                kUpdateConnectionCallSites[i], kUpdateConnection, &UpdateConnectionHook);
         }
+        for (size_t i = 0; i < kDeterminePolePositionsCallSites.size(); ++i) {
+            installed += InstallCallSitePatch(determinePolePositionsPatches_[i], "DeterminePolePositions",
+                                               kDeterminePolePositionsCallSites[i], kDeterminePolePositions,
+                                               &DeterminePolePositionsHook);
+        }
         installed += wireWidthLookupPatch_.Install() ? 1 : 0;
 
         installed += InstallCallSitePatch(createFloorPatches_[0], "CreateFloor@SetPosition",
@@ -1412,7 +1467,8 @@ public:
 
         LOG_INFO("PowerPoleCustomization: installed {} of {} patches.", installed,
                  initConnectionPointsPatches_.size() + kAddConnectionCallSites.size() +
-                 kUpdateConnectionCallSites.size() + 1 + createFloorPatches_.size() + 4 + 2);
+                 kUpdateConnectionCallSites.size() + kDeterminePolePositionsCallSites.size() +
+                 1 + createFloorPatches_.size() + 4 + 2);
 
         // TEMPORARY PoC-ONLY cheat. See the block comment above kCheatPoleLineTest.
         const cISC4AppPtr app;
@@ -1450,6 +1506,7 @@ public:
         for (auto& patch : initConnectionPointsPatches_) patch.Uninstall();
         for (auto& patch : addConnectionPatches_) patch.Uninstall();
         for (auto& patch : updateConnectionPatches_) patch.Uninstall();
+        for (auto& patch : determinePolePositionsPatches_) patch.Uninstall();
         wireWidthLookupPatch_.Uninstall();
         for (auto& patch : createFloorPatches_) patch.Uninstall();
         floorTextureHashPatch1_.Uninstall();
@@ -1508,6 +1565,7 @@ private:
     std::array<TerrainDecal::RelativeCallPatch, 3> initConnectionPointsPatches_{};
     std::array<TerrainDecal::RelativeCallPatch, 4> addConnectionPatches_{};
     std::array<TerrainDecal::RelativeCallPatch, 2> updateConnectionPatches_{};
+    std::array<TerrainDecal::RelativeCallPatch, 3> determinePolePositionsPatches_{};
     std::array<TerrainDecal::RelativeCallPatch, 3> createFloorPatches_{};
     Imm32CallPatch floorTextureHashPatch1_{};
     Imm32CallPatch floorTextureHashPatch2_{};

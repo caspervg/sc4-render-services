@@ -619,3 +619,127 @@ sites, naturally handles the other side when it fires moments later. Not yet re-
 8. Find `GetLineConnectionPoints`'s Windows equivalent — likely inlined by MSVC at both call sites
    (`AddConnection`/`UpdateConnection`) rather than a standalone function; not yet located as a
    separate symbol. If a hook needs a single chokepoint, patch both inline sites instead.
+
+## 15. Investigation pass (2026-07-03): sag-per-style, inter-pole distance, fractional angles
+
+Requested scope: make sag configurable per style/wire, inter-pole distance per style, and assess
+fractional-angle support. Ghidra was offline this pass (no instance at 127.0.0.1:8089), so the two
+items needing new addresses are scoped but not yet resolved — Ghidra queries listed below.
+
+### A. Sag — per-wire already done; per-style is the gap
+
+Per-wire sag already ships in `PowerPoleCustomizationDirector.cpp`: family defaults
+`0xB22A0005` (sag scale) / `0xB22A0006` (max sag), per-wire arrays `0xB22A0008` /`0xB22A0009`,
+applied in `AdjustControlPointSag` + `ApplyConnectionCustomization`. Nothing to add for per-wire.
+
+Per-style has two disconnects: (1) `[PowerPoles.Name]` style sections carry only direction-mask →
+instance-ID, no sag keys; (2) `gActiveStyleIndex` is global-at-placement-time and is **never
+recorded per occupant** — it only steers `CreatePowerPole`'s instance pick, so at sag-apply time the
+pole's style is unknown. Options: author sag on each style's exemplars (zero code), or add
+`SagScale=`/`MaxSag=`/`WidthScale=` keys to the style section + a per-occupant style tag consulted in
+`FindAppearanceOverride`. Decision pending.
+
+### B. Inter-pole distance per style — IMPLEMENTED 2026-07-03
+
+Shipped in `PowerPoleCustomizationDirector.cpp`: `[PowerPoles.<Name>]` sections accept
+`InterPoleDistance=N` (cells, 1-50, vanilla 10). `DeterminePolePositions` (Win `0x00650840`) is hooked
+at all 3 call sites; the hook saves the tool's `this+0x3a4` field, writes the active style's value,
+runs vanilla, then restores. Verified in-game (builds + works). Original investigation notes below.
+
+### B (original). Inter-pole distance per style — feasible, needs one RE pass
+
+Distance = "Max cells between power poles" property `0x098B25C8` (=10) on the Utilities exemplar,
+read at `InitPowerLineControlVariables` (Win `0x0064a170`) into a global static, consumed by
+`DeterminePolePositions` (Win `0x00650840`). Unlike the sag case, style index is live during drag
+(before poles exist), so no per-occupant plumbing — patch the static read to a `gActiveStyleIndex`
+resolver, same shape as the existing `PoleStyleLookupHook`.
+**Ghidra to resolve:** (1) which `0x00B46xxx` static `0x098B25C8` writes in
+`InitPowerLineControlVariables` (§7 mapped the curve/sag statics but not max-cells/min-height/
+curve-distance); (2) the read site inside `DeterminePolePositions` to patch.
+
+### C. Fractional angles (FAR) — attach-rotation is cheap now, mesh/position are not
+
+FAR angle = `arctan(1/n)`: FAR-6≈9.46°, FAR-3≈18.43°, FAR-2≈26.57°, FAR-1.5≈33.69°. Vanilla power
+system knows only 4 orientations (`Get0To3Direction`). Three separable layers:
+
+- **Wire endpoints:** already arbitrary (bezier between the two poles' world positions) — free.
+- **Attach-point alignment:** table keyed by `direction&3` snaps cables to nearest of 4 orientations.
+  **New insight:** this DLL already reimplements attach reads (`GetAttachPoint`) and has *both* poles
+  in `ApplyConnectionCustomization`, so rotating each attach offset by the true bearing
+  `atan2(dz,dx)` aligns cables at any angle — pure code, no art. Vanilla couldn't (flat translation
+  add, no rotation matrix, §6C). This is the one cheap, high-value FAR win.
+- **Pole mesh:** `GetModelInstanceID` picks ~4 discrete rotated S3D variants → mesh faces nearest
+  45°, visual seam. Needs new art (or accept seam). Bit layout still unmapped.
+- **Pole position:** grid-quantized (`ComputePolePosition = cellX*16`). Confirmed 2026-07-03 this is
+  **NOT** a blocker for canonical FAR: those angles hit integer grid cells periodically
+  (FAR-3=arctan(1/3)→cell (3,1); FAR-2→(2,1); FAR-6→(6,1); FAR-1.5→(3,2) over 2 periods). Poles land
+  on real cells, just spaced 1-in-n. Earlier draft overstated this as a blocker.
+
+**The actual blocker (user, 2026-07-03): can't drag PPs at FAR angles.** The drag tool snaps the
+anchor→cursor line to 8 directions (H/V/diagonal, i.e. `Get0To3Direction`'s 4 undirected orientations)
+and staircases anything else, so a FAR run is never produced in the first place — wire alignment and
+pole position are both moot until placement can march poles along a 1-in-n slope.
+
+**Ghidra to resolve (in priority order):**
+1. ~~**Drag direction-snap site**~~ — RESOLVED 2026-07-03, see §16 below.
+2. `GetModelInstanceID` instance-ID bit layout — only for mesh yaw variants (cosmetic).
+3. Pole yaw storage (`cS3DTransform` occupant+0x64 Mac / Win TBD) — sidestepped by deriving bearing
+   from the two poles' positions; needed only if a stored yaw is preferred.
+
+## 16. Drag direction-snap located (2026-07-03) — the FAR-drag blocker
+
+The 8-direction snap that prevents dragging power poles at FAR angles lives in the **base
+`cSC4NetworkTool`**, not the power-line tool. Drag pipeline:
+
+```
+mouse drag → DrawNetworkLine → BreakIntoStraightAndDiagSegments   (snaps anchor→cursor to H/V/45°)
+                             → ComputeDraggedCells                (rasterizes the cell path)
+           → cSC4PowerLineTool::DeterminePolePositions            (consumes this+0x54 dragged steps,
+                                                                    this+0x60 cells)
+           → PlacePoles
+```
+
+`DrawNetworkLine` clears `this+0x54` (dragged-step vector) / `this+0x60` (cell vector) / `this+0x70`
+(=0), calls `BreakIntoStraightAndDiagSegments`, stores the diagonal flag at `this+0x6c`, then (unless
+straight-only) calls `ComputeDraggedCells`. `DeterminePolePositions` later reads exactly those
+`this+0x54`/`+0x60` fields — confirmed the same offsets on both binaries.
+
+**`BreakIntoStraightAndDiagSegments`** is the snap: computes `|dx|,|dy|` of anchor→cursor, forces the
+cursor to the nearest of horizontal / vertical / 45°-diagonal (2:1-ratio test, plus a ±2 near-diagonal
+correction), and emits 8-way direction codes (0–7) in its two out-params. A per-tool-instance flag
+(`this+0x2b5` Win / `this[0x2f5]` Mac) selects straight+diagonal (0) vs straight-only (≠0).
+
+### Confirmed addresses
+
+| Function | Mac | Windows | Evidence |
+|---|---|---|---|
+| `cSC4NetworkTool::BreakIntoStraightAndDiagSegments` | `0x004cb7d4` | **`0x00637eb0`** (body –`0x00638153`) | leaf; identical 11-param `__thiscall`; sole caller = DrawNetworkLine; byte-identical snap logic |
+| `cSC4NetworkTool::DrawNetworkLine` | `0x004cdd0a` | **`0x0063af40`** (body –`0x0063b120`) | already labeled `??DrawNetworkLine`; calls BreakInto + ComputeDraggedCells; `imul …,0x114` (sNetworkTypeInfo stride) |
+| `cSC4NetworkTool::ComputeDraggedCells` | `0x004cc96a` | `0x00639790` (probable) | DrawNetworkLine callee; `imul …,0x114` consumer; rasterizes cells (does NOT snap) |
+| `cSC4PowerLineTool::DeterminePolePositions` | `0x0022c98a` | `0x00650840` | §7 |
+
+### Windows field offsets (on the tool instance)
+
+- `this+0x54` dragged-step vector (stride 0xc), `this+0x60` cell vector (stride 8, `SC4Point<uint>`),
+  `this+0x70` total step count, `this+0x74` straight step count, `this+0x78` valid step count.
+- `this+0x118/0x11c` anchor-cell vector. `this+0x2b5` snap-mode flag.
+- **`this+0x3a4` = Max cells between power poles** (item B: read at
+  `*(this+0x3a4) <= (curStep - lastPoleStep)`; Mac `this+0x3f0`).
+- `this+0x3a8` = min pole height float added to pole Y (Mac `this+0x3f4`).
+
+### Implications for FAR-drag
+
+- The snap is **shared by every network tool** (road/rail/street/power) — any patch to
+  `BreakInto`/`DrawNetworkLine` must gate on the active tool being `cSC4PowerLineTool`, or it changes
+  road/rail dragging too. The `this+0x2b5` mode byte is per-instance, so a third "FAR-allowed" mode
+  could be encoded there for the power tool only.
+- To lay poles along a 1-in-n FAR slope, `BreakInto` must be allowed to emit a FAR segment (not
+  snapped to 8-way) AND `ComputeDraggedCells`/`DeterminePolePositions` must place poles only at the
+  periodic integer FAR nodes ((3,1),(6,2)… — see §15C) rather than at every staircase corner. That's
+  the implementation design for a follow-up; the snap itself is now fully mapped.
+
+### Suggested Ghidra renames (pending confirmation, Windows program)
+
+- `0x00637eb0` → `cSC4NetworkTool::BreakIntoStraightAndDiagSegments` (confidence: confirmed)
+- `0x00639790` → `cSC4NetworkTool::ComputeDraggedCells` (confidence: strong)
+- `0x0063af40` `??DrawNetworkLine` → `cSC4NetworkTool::DrawNetworkLine` (confidence: confirmed)
