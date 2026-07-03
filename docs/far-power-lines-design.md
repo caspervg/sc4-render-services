@@ -1,7 +1,8 @@
 # FAR power lines — style-table design note
 
-Status: design only (2026-07-03). The drag PoC (`farline` cheat, docs/sc4-powerline-tool-re.md §17)
-and the attach-point true-bearing rotation are implemented; nothing in this note is.
+Status: FAR model-routing design only (2026-07-03). Automatic FAR dragging, Shift-constrained
+regular dragging, attach-point true-bearing rotation, and named `REG.*` parsing are implemented.
+Named `FAR-*` model routing is not.
 
 ## What already works without new data
 
@@ -11,6 +12,20 @@ and the attach-point true-bearing rotation are implemented; nothing in this note
   4-point tables and custom attach-point properties alike.
 - **Pole placement**: FAR nodes are integer grid cells, so `ComputePolePosition`'s grid
   quantization is a non-issue. Pole cadence converts the max-cells value into whole FAR periods.
+
+## Player interaction: automatic snap with Shift constraint
+
+FAR ratio is not a separate pole style or a mode the player cycles. During an ordinary power-line
+drag, the hook selects the closest supported heading from the regular axes, 45° diagonals, and all
+configured FAR ratios. The active pole style then resolves the corresponding `REG.*` or `FAR-*`
+model automatically.
+
+Holding **Shift** restricts the current drag to regular orthogonal/diagonal headings and sends it
+through the original vanilla path. Pressing or releasing Shift during a drag updates subsequent
+previews and the committed result. Automatic selection uses angular distance in the first octant
+and reflects the result into the other seven; a 1° hysteresis band keeps the preview from flickering
+between adjacent headings near a snap boundary. Player-facing labels should use the integer slope
+and angle (`2:1 — 26.6°`) rather than requiring familiarity with the internal `FAR-2` name.
 
 ## The gap: pole *mesh* orientation
 
@@ -44,9 +59,9 @@ REG.X+Z=0x06000105
 ; ...remaining regular combinations may be supplied or inherited
 
 FAR-2.XP=0x06000505
-FAR-2.XN=0x06000506
-FAR-2.ZP=0x06000507
-FAR-2.ZN=0x06000508
+FAR-2.ZN=0x06000505        ; perpendicular: same model, engine quarter-turn
+FAR-2.XN=0x06000605
+FAR-2.ZP=0x06000605        ; perpendicular: same model, engine quarter-turn
 InterPoleDistance=14
 ```
 
@@ -87,9 +102,10 @@ InterPoleDistance=14
   `XP=(2,1)`, `XN=(2,−1)`, `ZP=(1,2)`, and `ZN=(−1,2)`. The full key set is those four orientations
   for each supported ratio: 16 FAR keys total.
 - **Heading capture**: the drag hook already knows `(ratio, orientation)` when it snaps the drag;
-  stash it in a global scoped to the drag (set in `FarDrawNetworkLineHook`, cleared with
-  `gFarDragActive`). `PlacePoles`/`CreatePowerPole` run inside that same drag, so the resolver can
-  read it — the direction mask alone (all the vanilla sites see) cannot express a FAR heading.
+  stash that selection in drag-scoped state for `PlacePoles`/`CreatePowerPole`. The direction mask
+  alone cannot express a FAR heading. Do not treat that transient state as occupant metadata,
+  however: authored mesh and attachment-basis headings must be recoverable from the selected
+  instance/exemplar when an occupant is initialized or reloaded from a saved city.
 - **Resolution order** (extended `ResolvePoleInstanceForDirectionMask`):
   1. exact `FAR-<ratio>.<orient>` key in the active style;
   2. same key in a new `[PowerPoles.FAR]` default/fallback section;
@@ -103,13 +119,13 @@ InterPoleDistance=14
 
 ## Two real wrinkles
 
-**Attach points must not be double-rotated.** The implemented yaw fix rotates baked attach
-offsets by (true bearing − nominal 45°). A mesh *authored at* the FAR angle already has correct
-attach geometry — rotating it again would skew the cables. Fix: when the resolver serves a FAR
-bucket, tag that occupant (side table keyed by occupant pointer, this DLL's existing convention)
-with its authored heading; `ComputeYawDelta` then uses that heading as the nominal angle → delta
-≈ 0 → no rotation. Untagged poles (nearest-45° fallback mesh) keep the rotation. Both cases stay
-correct, including mixed spans.
+**Mesh heading and attachment basis are separate.** Selecting a FAR-authored mesh does not by
+itself prove that its attachment-point table was authored in the same basis. Record both pieces of
+metadata for each FAR instance/exemplar. Connection rebuilding must calculate a separate delta at
+each endpoint: `deltaA = spanBearing − attachBasisA`, `deltaB = spanBearing − attachBasisB`. The
+current single `ComputeYawDelta` value cannot correctly handle a mixed FAR/fallback span. Metadata
+must be reconstructed during `InitConnectionPoints`, not retained only in a pointer side table from
+the original drag, so save/reload remains correct.
 
 **Endpoint/transition poles.** A FAR run's end pole often also carries a straight continuation —
 the mask calls it a junction, the art would want a purpose-built transition model. Cheap and
@@ -119,11 +135,21 @@ set proves out.
 
 ## Art bill
 
-Per family per supported ratio: **4 orientation meshes** — unless one mesh can serve all four via
-the engine's own baked-rotation variant selection. That hinges on `GetModelInstanceID`'s
-instance-ID bit layout (docs §15 open item 2, still unmapped). If its rotation bits work like
-other props, art cost drops to 1 mesh per ratio per family. **Resolve that in Ghidra before
-anyone models anything.**
+Confirmed in both binaries: Resource Key Type 1 (`0x27812821`) resolves an S3D instance as
+`baseInstance + LOD*0x100 + rotation*0x10`. On Windows the core selector is `FUN_00496830`; the
+power-pole path is `cSC4PowerPoleOccupant::LoadModel` at `0x0064ad90` through `FUN_00497180`.
+`LoadModel` supplies an extra quarter-turn for direction masks `0x1` and `0x8`, which is how one
+vanilla straight model serves X/Z and one diagonal model serves both diagonals.
+
+For a FAR ratio, a quarter-turn pairs perpendicular headings but cannot produce their mirror:
+
+- `XP` and `ZN` may reference one logical pole model;
+- `XN` and `ZP` may reference a second logical pole model.
+
+The art bill is therefore **2 logical pole models per family per supported ratio**, each with the
+normal camera-rotation and LOD S3D resources expected by its RKT1 model. Keep all four FAR keys in
+the style table, but allow the perpendicular pairs to alias the same prop instance ID as shown in
+the example. One logical model cannot cover both slope signs without reflection or free yaw.
 
 Do not attempt runtime mesh rotation via `SetTransform`: `GetModelInstanceID`'s variant selection
 and the baked lighting/LOD assets are not built for free yaw, and docs §6C documents the

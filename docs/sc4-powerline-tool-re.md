@@ -211,8 +211,7 @@ tools.
    §B above).
 3. Pin exact byte layout for the proposed new connection-point properties (property IDs from
    modder-reserved range, decide array-vs-fixed-struct encoding).
-4. Decide GetModelInstanceID's instance-ID bit layout (how many discrete rotation variants vanilla
-   ships) if/when fractional angle (§C) gets picked back up.
+4. ~~Decide GetModelInstanceID's instance-ID bit layout~~ — resolved 2026-07-03; see §15D.
 5. Find `GetLineConnectionPoints`'s Windows equivalent — likely inlined by MSVC at both call sites
    (`AddConnection`/`UpdateConnection`) rather than a standalone function; not yet located as a
    separate symbol. If a hook needs a single chokepoint, patch both inline sites instead.
@@ -614,8 +613,7 @@ sites, naturally handles the other side when it fires moments later. Not yet re-
    the multi-pole-type design in §6B).
 6. Pin exact byte layout for the proposed new connection-point properties (property IDs from
    modder-reserved range, decide array-vs-fixed-struct encoding).
-7. Decide `GetModelInstanceID`'s instance-ID bit layout (how many discrete rotation variants vanilla
-   ships) if/when fractional angle (§6C) gets picked back up.
+7. ~~Decide `GetModelInstanceID`'s instance-ID bit layout~~ — resolved 2026-07-03; see §15D.
 8. Find `GetLineConnectionPoints`'s Windows equivalent — likely inlined by MSVC at both call sites
    (`AddConnection`/`UpdateConnection`) rather than a standalone function; not yet located as a
    separate symbol. If a hook needs a single chokepoint, patch both inline sites instead.
@@ -682,9 +680,28 @@ pole position are both moot until placement can march poles along a 1-in-n slope
 
 **Ghidra to resolve (in priority order):**
 1. ~~**Drag direction-snap site**~~ — RESOLVED 2026-07-03, see §16 below.
-2. `GetModelInstanceID` instance-ID bit layout — only for mesh yaw variants (cosmetic).
+2. ~~`GetModelInstanceID` instance-ID bit layout~~ — RESOLVED 2026-07-03, see §15D below.
 3. Pole yaw storage (`cS3DTransform` occupant+0x64 Mac / Win TBD) — sidestepped by deriving bearing
    from the two poles' positions; needed only if a stored yaw is preferred.
+
+### D. `GetModelInstanceID` rotation layout — RESOLVED 2026-07-03
+
+Mac reference: `cSC4ModelMakerUtility::GetModelInstanceID` at `0x002059d4`; the power-pole caller is
+`cSC4PowerPoleOccupant::LoadModel` at `0x00255d0c`. For Resource Key Type 1 (`0x27812821`) it returns:
+
+```text
+baseInstance + LOD*0x100 + rotation*0x10
+```
+
+Windows confirms the same arithmetic in `FUN_00496830`, reached from the occupant overload
+`FUN_00497180` and `cSC4PowerPoleOccupant::LoadModel` at `0x0064ad90`. Windows `LoadModel` passes a
+one-quarter-turn correction when `dwDirectionFlags` is exactly `0x1` or `0x8`. This lets the same
+logical straight model serve X and Z, and the same logical diagonal model serve both diagonals.
+
+For FAR, quarter-turn rotation pairs `XP` with `ZN`, and `XN` with `ZP`. Those two pairs are mirrors
+and cannot be transformed into one another by 90° rotation. Result: **two logical pole models per
+ratio per family**, not four and not one. Each logical model still needs the ordinary camera-rotation
+and LOD resources required by its RKT1 model.
 
 ## 16. Drag direction-snap located (2026-07-03) — the FAR-drag blocker
 
@@ -822,7 +839,7 @@ their own vtable slots untouched. No runtime class check needed.
   out-params `&this+0x70` (total steps), `&this+0x74` (straight steps), `&this+0x7c`,
   `&this+0x80` (8-way direction codes) + two locals; writes diag flag byte `this+0x6c`;
   honors straight-only mode byte `this+0x2b5`; calls `ComputeDraggedCells` (`0x00639790`);
-  bounds-checks every cell against city dims `this+0x280/0x284` (clears everything and
+  bounds-checks every cell against city dims `this+0x240/0x244` (clears everything and
   returns 0 on violation). `sNetworkTypeInfo` base = `0x00b452c8`, stride `0x114` (widths at
   `+0x1c/+0x20`).
 - **`BreakIntoStraightAndDiagSegments` writes the snapped endpoint back into `end`** — callers
@@ -863,3 +880,65 @@ back to a plain vanilla call on any mismatch.
 - `FUN_0064f170` / `FUN_0064f1d0` are the pole-in-list scans over the `tPoleInfo` vector
   `this+0x36c..0x370` (stride 0x30) — by cell+flags and by occupant pointer respectively
   (confidence: strong; matches Mac `PoleIsInList` pair).
+
+## 18. Zoned-building construction interrupts power lines — cause and preservation option
+
+Zoning itself does not contain a power-line-specific removal path. The interruption occurs later,
+when a zoned lot starts construction. Mac `cSC4LotDeveloper::StartConstruction` (`0x000f48d0`)
+calls `ClearLotBlockingObjects` (`0x000f044a`). That function builds the lot's 3D bounding box,
+queries every intersecting occupant, and passes each result to the generic occupant-removal service.
+Both real `cSC4PowerPoleOccupant` objects and the hidden per-cell `cSC4PowerLineOccupant` objects
+registered along a span are returned by that sweep.
+
+Windows confirms the same path:
+
+- `cSC4LotDeveloper::StartConstruction` twin: `FUN_006cc490` (confirmed by call shape and the
+  construction-occupant GZCOM IDs `0xA97F909E/0x496E7636`);
+- `ClearLotBlockingObjects` twin: `FUN_006c9ad0`, called from the construction path;
+- spatial query: virtual call at `0x006c9be0`;
+- unconditional removal loop: `0x006c9bf2..0x006c9c15`, with the removal service call at
+  `0x006c9c07`.
+
+The two relevant occupant identities are reliable and already exposed through `QueryInterface`:
+
+- power pole CLSID/IID accepted by QI: `0x09C05C6A` (Windows compare at `0x0064a054`);
+- hidden power-line occupant CLSID/IID: `0xC9C05C5D` (Windows compare at `0x0064935b`).
+
+**Feasible preservation design:** patch only the `ClearLotBlockingObjects` removal loop and skip
+the generic removal call when the candidate supports either interface. Do not patch the generic
+occupant-removal service globally: manual bulldozing, network replacement, terrain operations, and
+city shutdown must retain vanilla behavior. The loop must still release the query's occupant
+reference and advance normally for skipped entries.
+
+This deliberately allows buildings and power-line occupants to coexist spatially. It can preserve
+continuity, but a building may visually intersect a pole or cable, and lot terrain levelling may
+leave a retained pole at an undesirable height. Make it an explicit experimental INI option rather
+than unconditional behavior. A more polished policy would preserve crossing spans but relocate a
+pole that lies inside the building footprint; that is a substantially larger graph-editing feature.
+
+## 19. FAR neighbor connections fail — three confirmed causes
+
+Windows `cSC4NetworkTool::AttemptNeighborConnections` is `0x00628bd0`. It replays the last two
+anchor points through virtual `DrawNetworkLine` at `0x00628c44`, then reads the resulting final
+8-way direction from `tool+0x7c` at `0x00628c5f`. It converts `direction >> 1` into an outward
+cardinal step using tables at `0x00AA8390` (X = `[-1,0,1,0]`) and `0x00AA83A0`
+(Z = `[0,-1,0,1]`). It also reads `tool+0x80` in the mixed straight/diagonal path. City dimensions
+are `tool+0x240/+0x244`, confirmed independently in both `AttemptNeighborConnections` and
+`DrawNetworkLine` (`0x0063b054`/`0x0063b067`).
+
+The current FAR hook violates three assumptions:
+
+1. It calls vanilla with a fake allocation drag, then rewrites cells but leaves `tool+0x7c/+0x80`
+   describing the fake +X drag. Neighbor detection therefore tests the wrong city edge.
+2. Its constants incorrectly read city dimensions at `tool+0x280/+0x284`; those offsets came from
+   an earlier cross-binary layout assumption and are wrong for Windows 1.1.641.
+3. It rounds the endpoint back to the nearest whole FAR period. Neighbor creation requires the
+   terminal pole to occupy the boundary cell so that one outward cardinal step leaves the city.
+   A FAR lattice node reaches that cell only when the anchor-to-edge distance happens to be divisible
+   by the ratio's major step.
+
+**Fix design:** use `+0x240/+0x244`; when a FAR drag targets a city edge, preserve a boundary-cell
+terminal even if the final span is shorter than one FAR period; and write `+0x7c/+0x80` to the even
+cardinal direction code for the crossed edge (`0=−X`, `2=−Z`, `4=+X`, `6=+Z`). Interior poles remain
+on exact FAR-period nodes. The shortened terminal span is a transition segment and should use the
+normal fallback model policy until dedicated transition art exists.

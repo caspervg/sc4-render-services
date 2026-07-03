@@ -69,7 +69,6 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -360,16 +359,27 @@ namespace {
     struct FarRatio {
         uint32_t run;  // cells along the major axis per period
         uint32_t rise; // cells along the minor axis per period
-        const char* name;
     };
     // arctan(rise/run): FAR-1.5 = 33.69, FAR-2 = 26.57, FAR-3 = 18.43, FAR-6 = 9.46 degrees.
     constexpr std::array<FarRatio, 4> kFarRatios = {{
-        {3, 2, "FAR-1.5"}, {2, 1, "FAR-2"}, {3, 1, "FAR-3"}, {6, 1, "FAR-6"},
+        {3, 2}, {2, 1}, {3, 1}, {6, 1},
     }};
-    constexpr uint32_t kCheatFarLine = 0xB07E1002; // TEMPORARY PoC-ONLY "farline" cheat
-    uint32_t gFarRatioIndex = 0;   // 0 = off; 1..N = kFarRatios[index-1]
     bool gFarDragActive = false;   // latest DrawNetworkLine call produced a FAR path
     uint32_t gFarDragRun = 0;      // major-axis cells per period of that FAR path
+
+    // Automatic heading selection considers the two regular headings bounding the first octant
+    // (axis and 45-degree diagonal) plus every supported FAR ratio. The remaining octants are
+    // reflections of this one. Candidate 0 is the nearest axis, 1..N are kFarRatios, and N+1 is
+    // the diagonal. A small angular hysteresis prevents integer cursor movement from flickering
+    // between adjacent headings at their exact midpoint during a drag.
+    constexpr uint32_t kAxisSnapCandidate = 0;
+    constexpr uint32_t kDiagonalSnapCandidate = static_cast<uint32_t>(kFarRatios.size()) + 1;
+    constexpr float kDiagonalAngleRadians = 0.78539816339744830962f;
+    constexpr float kSnapHysteresisRadians = 0.01745329251994329577f; // 1 degree
+    bool gFarSnapAnchorValid = false;
+    uint32_t gFarSnapAnchorX = 0;
+    uint32_t gFarSnapAnchorZ = 0;
+    uint32_t gFarSnapCandidate = kAxisSnapCandidate;
 
     struct PoleStyle {
         std::string name;
@@ -1497,22 +1507,74 @@ namespace {
         return cells;
     }
 
+    float SnapCandidateAngle(const uint32_t candidate) {
+        if (candidate == kAxisSnapCandidate) {
+            return 0.0f;
+        }
+        if (candidate == kDiagonalSnapCandidate) {
+            return kDiagonalAngleRadians;
+        }
+        const FarRatio& ratio = kFarRatios[candidate - 1];
+        return std::atan2(static_cast<float>(ratio.rise), static_cast<float>(ratio.run));
+    }
+
+    uint32_t SelectSnapCandidate(const uint32_t startX, const uint32_t startZ,
+                                 const uint32_t absoluteDx, const uint32_t absoluteDz) {
+        const uint32_t major = std::max(absoluteDx, absoluteDz);
+        const uint32_t minor = std::min(absoluteDx, absoluteDz);
+        const float angle = std::atan2(static_cast<float>(minor), static_cast<float>(major));
+
+        uint32_t bestCandidate = kAxisSnapCandidate;
+        float bestDifference = std::fabs(angle - SnapCandidateAngle(bestCandidate));
+        for (uint32_t candidate = 1; candidate <= kDiagonalSnapCandidate; ++candidate) {
+            const float difference = std::fabs(angle - SnapCandidateAngle(candidate));
+            const bool candidateIsRegular = candidate == kAxisSnapCandidate || candidate == kDiagonalSnapCandidate;
+            const bool bestIsRegular = bestCandidate == kAxisSnapCandidate || bestCandidate == kDiagonalSnapCandidate;
+            // Prefer a regular heading at an exact tie, otherwise take the genuinely nearer one.
+            if (difference < bestDifference || (difference == bestDifference && candidateIsRegular && !bestIsRegular)) {
+                bestCandidate = candidate;
+                bestDifference = difference;
+            }
+        }
+
+        if (gFarSnapAnchorValid && gFarSnapAnchorX == startX && gFarSnapAnchorZ == startZ) {
+            const float previousDifference = std::fabs(angle - SnapCandidateAngle(gFarSnapCandidate));
+            if (previousDifference <= bestDifference + kSnapHysteresisRadians) {
+                bestCandidate = gFarSnapCandidate;
+            }
+        }
+
+        gFarSnapAnchorValid = true;
+        gFarSnapAnchorX = startX;
+        gFarSnapAnchorZ = startZ;
+        gFarSnapCandidate = bestCandidate;
+        return bestCandidate;
+    }
+
     uint8_t __fastcall FarDrawNetworkLineHook(void* tool, void* /*edx*/, uint32_t* start, uint32_t* end,
                                               uint8_t straightOnly, int networkType) {
         const auto original = reinterpret_cast<DrawNetworkLineFn>(kDrawNetworkLine);
         gFarDragActive = false;
-        if (!gSettings.enabled || gFarRatioIndex == 0 || gFarRatioIndex > kFarRatios.size()) {
+        if (!gSettings.enabled || (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) {
+            gFarSnapAnchorValid = false;
             return original(tool, start, end, straightOnly, networkType);
         }
 
-        const FarRatio ratio = kFarRatios[gFarRatioIndex - 1];
         const int32_t dx = static_cast<int32_t>(end[0]) - static_cast<int32_t>(start[0]);
         const int32_t dz = static_cast<int32_t>(end[1]) - static_cast<int32_t>(start[1]);
         const uint32_t adx = static_cast<uint32_t>(std::abs(dx));
         const uint32_t adz = static_cast<uint32_t>(std::abs(dz));
-        if (dx == 0 || dz == 0 || adx == adz) {
-            return original(tool, start, end, straightOnly, networkType); // vanilla handles 8-dir drags
+        if (adx == 0 && adz == 0) {
+            gFarSnapAnchorValid = false;
+            return original(tool, start, end, straightOnly, networkType);
         }
+
+        const uint32_t snapCandidate = SelectSnapCandidate(start[0], start[1], adx, adz);
+        if (snapCandidate == kAxisSnapCandidate || snapCandidate == kDiagonalSnapCandidate) {
+            return original(tool, start, end, straightOnly, networkType); // vanilla handles regular headings
+        }
+
+        const FarRatio ratio = kFarRatios[snapCandidate - 1];
 
         const uint32_t cityCellsX = *reinterpret_cast<const uint32_t*>(reinterpret_cast<uint8_t*>(tool) + kTool_CityCellsX);
         const uint32_t cityCellsZ = *reinterpret_cast<const uint32_t*>(reinterpret_cast<uint8_t*>(tool) + kTool_CityCellsZ);
@@ -1638,15 +1700,15 @@ namespace {
         return (ec == std::errc() && ptr == value.data() + value.size()) ? result : defaultValue;
     }
 
-    // Accepts "0x..."/"0X..." (matching the vanilla [PowerPoles] ini's own value format) or plain hex.
-    uint32_t ParseHexUInt32(const std::string& value, const uint32_t defaultValue) {
+    // Instance IDs remain hexadecimal values even though direction masks now use named REG.* keys.
+    bool TryParseHexUInt32(const std::string& value, uint32_t& result) {
         std::string_view text = value;
         if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
             text.remove_prefix(2);
         }
-        uint32_t result = defaultValue;
+        result = 0;
         const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), result, 16);
-        return (ec == std::errc() && ptr == text.data() + text.size()) ? result : defaultValue;
+        return ec == std::errc() && ptr == text.data() + text.size();
     }
 
     std::filesystem::path GetDllDirectoryPath() {
@@ -1663,10 +1725,17 @@ namespace {
         return std::filesystem::path(path).parent_path();
     }
 
-    // [PowerPoles.<Name>] sections, same key format as vanilla's own [PowerPoles] ini (see
-    // docs/sc4-powerline-tool-re.md SS1): keys "0x00".."0x0f" (direction-combination bitmask),
-    // values a pole prop exemplar Instance ID. A section may be sparse -- masks it doesn't define
-    // fall back to the vanilla instance for that mask at resolve time, not here.
+    // [PowerPoles.<Name>] sections use named REG.* connection combinations. The names below are in
+    // engine mask order, so parsing compiles the author-facing key directly into the existing
+    // 16-entry lookup table. mINI makes keys case-insensitive. A section may be sparse -- masks it
+    // doesn't define fall back to the vanilla instance for that mask at resolve time, not here.
+    constexpr std::array<std::string_view, 16> kRegularDirectionKeys = {{
+        "reg.none", "reg.x", "reg.dp", "reg.x+dp",
+        "reg.z", "reg.x+z", "reg.dp+z", "reg.x+dp+z",
+        "reg.dn", "reg.x+dn", "reg.dp+dn", "reg.x+dp+dn",
+        "reg.z+dn", "reg.x+z+dn", "reg.dp+z+dn", "reg.x+dp+z+dn",
+    }};
+
     void LoadPoleStyles(const mINI::INIStructure& ini) {
         gStyles.clear();
         constexpr std::string_view kPrefix = "powerpoles.";
@@ -1681,12 +1750,29 @@ namespace {
             style.name = sectionName.substr(kPrefix.size());
             uint32_t definedCount = 0;
             for (uint32_t mask = 0; mask < 16; ++mask) {
-                char key[5] = {};
-                std::snprintf(key, sizeof(key), "0x%02x", mask);
+                const std::string key(kRegularDirectionKeys[mask]);
                 if (section.has(key)) {
-                    style.instanceByDirectionMask[mask] = ParseHexUInt32(section.get(key), 0);
+                    uint32_t instanceId = 0;
+                    if (!TryParseHexUInt32(section.get(key), instanceId)) {
+                        LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] {} has invalid hexadecimal "
+                                 "instance ID \"{}\"; ignoring it.", style.name, key, section.get(key));
+                        continue;
+                    }
+                    style.instanceByDirectionMask[mask] = instanceId;
                     style.hasMask[mask] = true;
                     ++definedCount;
+                }
+            }
+
+            for (const auto& entry : section) {
+                const std::string& key = entry.first;
+                if (key.starts_with("0x")) {
+                    LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] legacy mask key {} is unsupported; "
+                             "use a named REG.* key.", style.name, key);
+                } else if (key.starts_with("reg.") &&
+                           std::ranges::find(kRegularDirectionKeys, key) == kRegularDirectionKeys.end()) {
+                    LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] unknown or non-canonical regular "
+                             "direction key {}; ignoring it.", style.name, key);
                 }
             }
             if (section.has("InterPoleDistance")) {
@@ -1696,7 +1782,7 @@ namespace {
             }
 
             if (definedCount == 0 && !style.hasMaxCells) {
-                LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] defines no 0x00-0x0f keys or "
+                LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] defines no valid REG.* keys or "
                          "InterPoleDistance; skipping.", style.name);
                 continue;
             }
@@ -1839,12 +1925,6 @@ public:
                 } else {
                     LOG_WARN("PowerPoleCustomization: failed to register cheat code polestyle.");
                 }
-                if (cheats->RegisterCheatCode(kCheatFarLine, cRZBaseString("farline"))) {
-                    LOG_INFO("PowerPoleCustomization: [FAR PoC] cheat code registered (farline) -- cycles "
-                             "off -> FAR-1.5 -> FAR-2 -> FAR-3 -> FAR-6 for power-line drags.");
-                } else {
-                    LOG_WARN("PowerPoleCustomization: failed to register cheat code farline.");
-                }
             }
         }
 
@@ -1855,7 +1935,6 @@ public:
         if (cheatManager_) {
             cheatManager_->UnregisterCheatCode(kCheatPoleLineTest);
             cheatManager_->UnregisterCheatCode(kCheatPoleStyle);
-            cheatManager_->UnregisterCheatCode(kCheatFarLine);
             cheatManager_->RemoveNotification2(this, 0);
             cheatManager_.Reset();
         }
@@ -1897,14 +1976,6 @@ public:
                 LOG_INFO("PowerPoleCustomization: [TEST MODE] active pole style -> \"{}\" ({} of {}) -- "
                          "applies to newly-placed poles only.", activeName, gActiveStyleIndex, gStyles.size());
             }
-            if (stdMsg->GetType() == kCheatCodeMessageType &&
-                static_cast<uint32_t>(stdMsg->GetData1()) == kCheatFarLine) {
-                gFarRatioIndex = (gFarRatioIndex + 1) % (static_cast<uint32_t>(kFarRatios.size()) + 1);
-                gFarDragActive = false;
-                LOG_INFO("PowerPoleCustomization: [FAR PoC] fractional-angle drag -> {} -- drag the "
-                         "power-line tool off-axis to use it; axis/45-degree drags stay vanilla.",
-                         gFarRatioIndex == 0 ? "OFF" : kFarRatios[gFarRatioIndex - 1].name);
-            }
         }
         return true;
     }
@@ -1939,7 +2010,7 @@ private:
     ByteSpanCallPatch poleStyleLookupPatch1_{};
     ByteSpanCallPatch poleStyleLookupPatch2_{};
     InlineCallPatch wireWidthLookupPatch_{};
-    VTableSlotPatch farDrawNetworkLinePatch_{}; // TEMPORARY PoC-ONLY, see kCheatFarLine
+    VTableSlotPatch farDrawNetworkLinePatch_{}; // automatic FAR snapping; hold Shift for regular-only
     cRZAutoRefCount<cIGZCheatCodeManager> cheatManager_; // TEMPORARY PoC-ONLY, see kCheatPoleLineTest
 };
 
