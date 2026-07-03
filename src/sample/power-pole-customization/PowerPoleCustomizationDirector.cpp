@@ -322,6 +322,55 @@ namespace {
     constexpr uint32_t kTool_MaxCellsBetweenPoles = 0x3a4; // cSC4PowerLineTool instance field
     constexpr uint32_t kMaxInterPoleDistance = 50; // sanity clamp; vanilla is 10
 
+    // ------------------------------------------------------------------
+    // TEMPORARY PoC-ONLY: FAR (fractional-angle) power-line dragging. See
+    // docs/sc4-powerline-tool-re.md SS17 for the complete evidence trail.
+    //
+    // cSC4NetworkTool::DrawNetworkLine (0x0063af40) is virtual (slot +0x48) and has NO direct call
+    // sites -- every network tool dispatches it through its own vtable. cSC4PowerLineTool's ctor
+    // (0x006503c0) installs primary vtable 0x00aa9f30, whose DrawNetworkLine slot is the dword at
+    // 0x00aa9f78. Swapping that one dword hooks the power tool ONLY -- road/rail/street vtables
+    // keep their own untouched slots, so no runtime tool-identity check is needed.
+    //
+    // The hook, when a FAR ratio is active and the drag is not axis/45-aligned, snaps the cursor
+    // to the nearest whole number of FAR periods, then synthesizes the dragged-step/cell arrays:
+    // one step per FAR period whose FIRST cell is the period's integer grid node, plus a final
+    // single-cell step for the last node, with this+0x74 == this+0x70 (all steps "straight", so
+    // GetPrimaryCell returns each step's first cell). DeterminePolePositionsHook scopes
+    // this+0x3a4 = 1 for the same drag, so vanilla DeterminePolePositions forces a pole at every
+    // step's primary cell -- exactly the FAR nodes -- and nothing else (docs SS17.C).
+    //
+    // Allocation: the game's step/cell vectors use the game allocator, so the hook first runs the
+    // ORIGINAL DrawNetworkLine with a fake straight drag of exactly the needed cell count (vanilla
+    // performs all allocation), then rewrites the POD contents in place and shrinks the end
+    // pointers. Any capacity/expectation mismatch falls back to a plain vanilla call.
+    // ------------------------------------------------------------------
+    constexpr uintptr_t kDrawNetworkLine = 0x0063af40;
+    constexpr uintptr_t kPowerToolDrawNetworkLineSlot = 0x00aa9f78; // dword inside vtable 0x00aa9f30
+    constexpr uint32_t kTool_StepsBegin = 0x54;   // vector<tDraggedStep> begin ptr (stride 0xc)
+    constexpr uint32_t kTool_StepsEnd = 0x58;
+    constexpr uint32_t kTool_CellsBegin = 0x60;   // vector<SC4Point<uint>> begin ptr (stride 8)
+    constexpr uint32_t kTool_CellsEnd = 0x64;
+    constexpr uint32_t kTool_DiagonalFlag = 0x6c; // byte: drag has a diagonal segment
+    constexpr uint32_t kTool_TotalSteps = 0x70;
+    constexpr uint32_t kTool_StraightSteps = 0x74;
+    constexpr uint32_t kTool_CityCellsX = 0x280;  // city dimensions in cells
+    constexpr uint32_t kTool_CityCellsZ = 0x284;
+
+    struct FarRatio {
+        uint32_t run;  // cells along the major axis per period
+        uint32_t rise; // cells along the minor axis per period
+        const char* name;
+    };
+    // arctan(rise/run): FAR-1.5 = 33.69, FAR-2 = 26.57, FAR-3 = 18.43, FAR-6 = 9.46 degrees.
+    constexpr std::array<FarRatio, 4> kFarRatios = {{
+        {3, 2, "FAR-1.5"}, {2, 1, "FAR-2"}, {3, 1, "FAR-3"}, {6, 1, "FAR-6"},
+    }};
+    constexpr uint32_t kCheatFarLine = 0xB07E1002; // TEMPORARY PoC-ONLY "farline" cheat
+    uint32_t gFarRatioIndex = 0;   // 0 = off; 1..N = kFarRatios[index-1]
+    bool gFarDragActive = false;   // latest DrawNetworkLine call produced a FAR path
+    uint32_t gFarDragRun = 0;      // major-axis cells per period of that FAR path
+
     struct PoleStyle {
         std::string name;
         std::array<uint32_t, 16> instanceByDirectionMask{};
@@ -631,19 +680,66 @@ namespace {
     }
 
     // ------------------------------------------------------------------
+    // Attach-point yaw alignment. Vanilla stores attach offsets baked for exactly 4 nominal span
+    // orientations (Get0To3Direction) and applies them with a flat translation add -- no rotation
+    // matrix (docs SS6). For any span whose true bearing deviates from its direction's nominal
+    // angle (every FAR span, and any future free-angle span), the baked offset is rotated around
+    // the vertical axis by that deviation so cables meet the crossarm along the real span
+    // direction. Deviation is 0 for all vanilla-aligned spans, so behavior there is unchanged.
+    // ------------------------------------------------------------------
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr float kYawEpsilonRadians = 0.01f; // ~0.57 degrees; below this, skip the rebuild
+
+    // Undirected nominal xz-plane angle per Get0To3Direction result: 0 = x axis, 1 = the
+    // sign-agreeing diagonal (+x,+z), 2 = z axis, 3 = the opposing diagonal.
+    constexpr std::array<float, 4> kNominalDirectionAngle = {0.0f, kPi / 4.0f, kPi / 2.0f, 3.0f * kPi / 4.0f};
+
+    // Deviation of the true pole-to-pole bearing from the direction's nominal angle, normalized
+    // to (-pi/2, pi/2] so both endpoints of the (undirected) span agree on it.
+    float ComputeYawDelta(void* poleA, void* poleB, const uint32_t direction) {
+        const auto* const posA = reinterpret_cast<const float*>(reinterpret_cast<uint8_t*>(poleA) + kOccupant_PosX);
+        const auto* const posB = reinterpret_cast<const float*>(reinterpret_cast<uint8_t*>(poleB) + kOccupant_PosX);
+        const float dx = posB[0] - posA[0];
+        const float dz = posB[2] - posA[2];
+        if (dx == 0.0f && dz == 0.0f) {
+            return 0.0f;
+        }
+        float bearing = std::atan2(dz, dx);
+        if (bearing < 0.0f) {
+            bearing += kPi; // undirected line angle in [0, pi)
+        }
+        float delta = bearing - kNominalDirectionAngle[direction & 3];
+        while (delta > kPi / 2.0f) delta -= kPi;
+        while (delta <= -kPi / 2.0f) delta += kPi;
+        return delta;
+    }
+
+    AttachPoint RotateOffsetAroundY(const AttachPoint& offset, const float yaw) {
+        if (yaw == 0.0f) {
+            return offset;
+        }
+        const float c = std::cos(yaw);
+        const float s = std::sin(yaw);
+        return AttachPoint{offset.x * c - offset.z * s, offset.y, offset.x * s + offset.z * c};
+    }
+
+    // ------------------------------------------------------------------
     // Vanilla attach-point read, reimplemented for the case where a pole has no override -- exact
     // same arithmetic as the original GetLineConnectionPoints (inlined into AddConnection /
     // UpdateConnection on Windows, so it has no address of its own to call into): table base is
     // read from this+kOccupant_ConnectionPointTablePtr, point N of direction D is the cS3DVector3
-    // at (D & 3) * 0x30 + N * 0xc, translated by this pole's world position.
+    // at (D & 3) * 0x30 + N * 0xc, translated by this pole's world position -- with the one
+    // deliberate addition that the model-local offset is yaw-rotated first (see above).
     // ------------------------------------------------------------------
-    AttachPoint ReadVanillaAttachPoint(void* occupant, const uint32_t direction, const uint32_t index) {
+    AttachPoint ReadVanillaAttachPoint(void* occupant, const uint32_t direction, const uint32_t index,
+                                       const float yawDelta) {
         auto* const base = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(occupant) + kOccupant_ConnectionPointTablePtr);
         const auto* const point = reinterpret_cast<const float*>(
             base + (direction & 3) * kVanillaDirectionStrideBytes + index * 0xc);
 
+        const AttachPoint local = RotateOffsetAroundY(AttachPoint{point[0], point[1], point[2]}, yawDelta);
         const auto* const position = reinterpret_cast<const float*>(reinterpret_cast<uint8_t*>(occupant) + kOccupant_PosX);
-        return AttachPoint{point[0] + position[0], point[1] + position[1], point[2] + position[2]};
+        return AttachPoint{local.x + position[0], local.y + position[1], local.z + position[2]};
     }
 
     // Number of strands this pole exposes in a given direction: override count if one exists,
@@ -659,15 +755,17 @@ namespace {
         return count > 0 ? count : kVanillaPointsPerDirection;
     }
 
-    AttachPoint GetAttachPoint(void* occupant, const uint32_t direction, const uint32_t index) {
+    AttachPoint GetAttachPoint(void* occupant, const uint32_t direction, const uint32_t index,
+                               const float yawDelta) {
         const auto it = gOverrides.find(occupant);
         if (it != gOverrides.end()) {
             if (const AttachPoint* const p = it->second.Point(direction, index)) {
+                const AttachPoint local = RotateOffsetAroundY(*p, yawDelta);
                 const auto* const position = reinterpret_cast<const float*>(reinterpret_cast<uint8_t*>(occupant) + kOccupant_PosX);
-                return AttachPoint{p->x + position[0], p->y + position[1], p->z + position[2]};
+                return AttachPoint{local.x + position[0], local.y + position[1], local.z + position[2]};
             }
         }
-        return ReadVanillaAttachPoint(occupant, direction, index);
+        return ReadVanillaAttachPoint(occupant, direction, index, yawDelta);
     }
 
     // ------------------------------------------------------------------
@@ -923,14 +1021,18 @@ namespace {
         }
 
         const PoleAttachOverride* const appearance = FindAppearanceOverride(occupant, otherPole);
+        // Off-nominal bearing (e.g. a FAR span) forces a rebuild so the baked attach offsets can
+        // be yaw-rotated onto the true span direction. Zero for all vanilla-aligned spans.
+        const float yawDelta = ComputeYawDelta(occupant, otherPole, direction);
         const bool rebuildGeometry = HasAttachPointCustomization(occupant, direction) ||
                                      HasAttachPointCustomization(otherPole, direction) ||
-                                     (appearance != nullptr && appearance->hasSagCustomization);
+                                     (appearance != nullptr && appearance->hasSagCustomization) ||
+                                     std::fabs(yawDelta) > kYawEpsilonRadians;
         if (rebuildGeometry) {
             ClearConnectionPolylines(entry);
             for (uint32_t i = 0; i < count; ++i) {
-                const AttachPoint a = GetAttachPoint(occupant, direction, i);
-                const AttachPoint b = GetAttachPoint(otherPole, direction, i);
+                const AttachPoint a = GetAttachPoint(occupant, direction, i, yawDelta);
+                const AttachPoint b = GetAttachPoint(otherPole, direction, i, yawDelta);
                 const float sagScale = appearance ? appearance->SagScale(i) : 1.0f;
                 const float maximumSag = appearance ? appearance->MaximumSag(i) :
                                                       std::numeric_limits<float>::infinity();
@@ -1109,6 +1211,55 @@ namespace {
         bool installed_ = false;
     };
 
+    // Replaces one function pointer inside a vtable (a 4-byte data write, not a code patch).
+    // Used for the power tool's DrawNetworkLine slot: the method is only ever dispatched
+    // virtually, so swapping cSC4PowerLineTool's own slot hooks that tool exclusively -- other
+    // network tools dispatch through their own untouched vtables.
+    class VTableSlotPatch final {
+    public:
+        bool Install(const uintptr_t slotAddress, const uintptr_t expectedTarget, void* hookFn, const char* name) {
+            slot_ = slotAddress;
+            auto* const slot = reinterpret_cast<uintptr_t*>(slotAddress);
+            if (*slot != expectedTarget) {
+                LOG_ERROR("PowerPoleCustomization: {} vtable slot 0x{:08X} holds 0x{:08X}, expected 0x{:08X}; not patching.",
+                          name, static_cast<uint32_t>(slotAddress), static_cast<uint32_t>(*slot),
+                          static_cast<uint32_t>(expectedTarget));
+                return false;
+            }
+
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(slot, sizeof(uintptr_t), PAGE_READWRITE, &oldProtect)) {
+                LOG_ERROR("PowerPoleCustomization: VirtualProtect failed for {} (error {}).", name, GetLastError());
+                return false;
+            }
+            original_ = *slot;
+            *slot = reinterpret_cast<uintptr_t>(hookFn);
+            DWORD ignored = 0;
+            VirtualProtect(slot, sizeof(uintptr_t), oldProtect, &ignored);
+            installed_ = true;
+            return true;
+        }
+
+        void Uninstall() {
+            if (!installed_) {
+                return;
+            }
+            auto* const slot = reinterpret_cast<uintptr_t*>(slot_);
+            DWORD oldProtect = 0;
+            if (VirtualProtect(slot, sizeof(uintptr_t), PAGE_READWRITE, &oldProtect)) {
+                *slot = original_;
+                DWORD ignored = 0;
+                VirtualProtect(slot, sizeof(uintptr_t), oldProtect, &ignored);
+            }
+            installed_ = false;
+        }
+
+    private:
+        uintptr_t slot_ = 0;
+        uintptr_t original_ = 0;
+        bool installed_ = false;
+    };
+
     // Generic 5-byte `MOV EAX, imm32` -> `CALL rel32` patch, one instance per hash-lookup site. Kept
     // separate from InlineCallPatch (used for the 23-byte wire-width site) since the byte count and
     // expected-opcode check differ.
@@ -1269,11 +1420,205 @@ namespace {
             reinterpret_cast<uint8_t*>(tool) + kTool_MaxCellsBetweenPoles);
         const uint32_t saved = *field;
         if (gSettings.enabled) {
-            *field = ResolveMaxCellsBetweenPoles(saved);
+            uint32_t resolved = ResolveMaxCellsBetweenPoles(saved);
+            // TEMPORARY PoC-ONLY: during a FAR drag every synthetic step is one FAR period, and
+            // the cadence field counts step indices, not literal cells (docs SS17.C). Poles can
+            // only sit on FAR nodes, so convert the cell spacing into whole periods (nearest,
+            // minimum 1): FAR-2 with vanilla 10 -> every 5 nodes = 10 cells along the major axis.
+            if (gFarDragActive && gFarDragRun > 0) {
+                resolved = std::max(1u, (resolved + gFarDragRun / 2) / gFarDragRun);
+            }
+            *field = resolved;
         }
         const auto original = reinterpret_cast<DeterminePolePositionsFn>(kDeterminePolePositions);
         original(tool);
         *field = saved; // restore vanilla; the placement loop is this field's only reader
+    }
+
+    // ------------------------------------------------------------------
+    // TEMPORARY PoC-ONLY: FAR drag hook (see the kDrawNetworkLine constants block above and
+    // docs/sc4-powerline-tool-re.md SS17 for the design).
+    // ------------------------------------------------------------------
+    using DrawNetworkLineFn = uint8_t(__thiscall*)(void* tool, uint32_t* start, uint32_t* end,
+                                                    uint8_t straightOnly, int networkType);
+
+    struct CellXZ {
+        uint32_t x;
+        uint32_t z;
+    };
+
+    struct DraggedStep {
+        uint32_t firstCellIndex;
+        uint32_t lastCellIndex;
+        uint32_t unknownZeroed; // vanilla ComputeDraggedCells writes 0 here
+    };
+
+    // 4-connected supercover of one FAR period in (major, minor) cell space: every cell the
+    // center-to-center node segment passes through, from (0,0) inclusive to (run,rise) exclusive,
+    // in traversal order. At an exact corner crossing both adjacent cells are included, matching
+    // vanilla's own 2-cells-per-column diagonal registration.
+    std::vector<std::pair<uint32_t, uint32_t>> BuildFarPeriodPattern(const uint32_t run, const uint32_t rise) {
+        std::vector<std::pair<uint32_t, uint32_t>> cells;
+        uint32_t u = 0;
+        uint32_t v = 0;
+        cells.emplace_back(0u, 0u);
+        while (u != run || v != rise) {
+            // Next boundary crossings of the segment (0.5,0.5) -> (run+0.5, rise+0.5), compared
+            // cross-multiplied to stay in integers: next u-boundary at t_u = (u + 0.5) / run,
+            // next v-boundary at t_v = (v + 0.5) / rise (both scaled by 2*run*rise).
+            bool advanceU;
+            bool corner = false;
+            if (v >= rise) {
+                advanceU = true;
+            } else if (u >= run) {
+                advanceU = false;
+            } else {
+                const uint64_t tu = static_cast<uint64_t>(2 * u + 1) * rise;
+                const uint64_t tv = static_cast<uint64_t>(2 * v + 1) * run;
+                advanceU = tu < tv;
+                corner = tu == tv;
+            }
+            if (corner) {
+                // Corner crossing: register both adjacent cells, then continue diagonally.
+                cells.emplace_back(u + 1, v);
+                cells.emplace_back(u, v + 1);
+                ++u;
+                ++v;
+            } else if (advanceU) {
+                ++u;
+            } else {
+                ++v;
+            }
+            if (u == run && v == rise) {
+                break; // the closing node belongs to the next period (or the final step)
+            }
+            cells.emplace_back(u, v);
+        }
+        return cells;
+    }
+
+    uint8_t __fastcall FarDrawNetworkLineHook(void* tool, void* /*edx*/, uint32_t* start, uint32_t* end,
+                                              uint8_t straightOnly, int networkType) {
+        const auto original = reinterpret_cast<DrawNetworkLineFn>(kDrawNetworkLine);
+        gFarDragActive = false;
+        if (!gSettings.enabled || gFarRatioIndex == 0 || gFarRatioIndex > kFarRatios.size()) {
+            return original(tool, start, end, straightOnly, networkType);
+        }
+
+        const FarRatio ratio = kFarRatios[gFarRatioIndex - 1];
+        const int32_t dx = static_cast<int32_t>(end[0]) - static_cast<int32_t>(start[0]);
+        const int32_t dz = static_cast<int32_t>(end[1]) - static_cast<int32_t>(start[1]);
+        const uint32_t adx = static_cast<uint32_t>(std::abs(dx));
+        const uint32_t adz = static_cast<uint32_t>(std::abs(dz));
+        if (dx == 0 || dz == 0 || adx == adz) {
+            return original(tool, start, end, straightOnly, networkType); // vanilla handles 8-dir drags
+        }
+
+        const uint32_t cityCellsX = *reinterpret_cast<const uint32_t*>(reinterpret_cast<uint8_t*>(tool) + kTool_CityCellsX);
+        const uint32_t cityCellsZ = *reinterpret_cast<const uint32_t*>(reinterpret_cast<uint8_t*>(tool) + kTool_CityCellsZ);
+        const bool majorIsX = adx >= adz;
+        const uint32_t majorLen = majorIsX ? adx : adz;
+        const int32_t majorSign = (majorIsX ? dx : dz) > 0 ? 1 : -1;
+        const int32_t minorSign = (majorIsX ? dz : dx) > 0 ? 1 : -1;
+
+        // Snap to the nearest whole number of FAR periods along the major axis, then clamp until
+        // the snapped endpoint is inside the city.
+        uint32_t periods = (majorLen + ratio.run / 2) / ratio.run;
+        auto nodeCell = [&](const uint32_t period) -> CellXZ {
+            const int32_t du = majorSign * static_cast<int32_t>(period * ratio.run);
+            const int32_t dv = minorSign * static_cast<int32_t>(period * ratio.rise);
+            return CellXZ{
+                static_cast<uint32_t>(static_cast<int32_t>(start[0]) + (majorIsX ? du : dv)),
+                static_cast<uint32_t>(static_cast<int32_t>(start[1]) + (majorIsX ? dv : du)),
+            };
+        };
+        while (periods >= 1) {
+            const CellXZ last = nodeCell(periods);
+            if (last.x < cityCellsX && last.z < cityCellsZ) {
+                break;
+            }
+            --periods;
+        }
+        if (periods < 1) {
+            return original(tool, start, end, straightOnly, networkType);
+        }
+
+        // Build the full FAR cell/step layout: one step per period, first cell = the period's
+        // node; final single-cell step = the last node (so the last-cell endpoint force in
+        // DeterminePolePositions lands on a node, docs SS17.C).
+        const auto pattern = BuildFarPeriodPattern(ratio.run, ratio.rise);
+        std::vector<CellXZ> cells;
+        std::vector<DraggedStep> steps;
+        cells.reserve(pattern.size() * periods + 1);
+        steps.reserve(periods + 1);
+        for (uint32_t p = 0; p < periods; ++p) {
+            const DraggedStep step{static_cast<uint32_t>(cells.size()),
+                                   static_cast<uint32_t>(cells.size() + pattern.size() - 1), 0};
+            const CellXZ node = nodeCell(p);
+            for (const auto& [du, dv] : pattern) {
+                const int32_t su = majorSign * static_cast<int32_t>(du);
+                const int32_t sv = minorSign * static_cast<int32_t>(dv);
+                cells.push_back(CellXZ{
+                    static_cast<uint32_t>(static_cast<int32_t>(node.x) + (majorIsX ? su : sv)),
+                    static_cast<uint32_t>(static_cast<int32_t>(node.z) + (majorIsX ? sv : su)),
+                });
+            }
+            steps.push_back(step);
+        }
+        steps.push_back(DraggedStep{static_cast<uint32_t>(cells.size()), static_cast<uint32_t>(cells.size()), 0});
+        cells.push_back(nodeCell(periods));
+
+        // Fake straight drag along +/-x from the anchor, sized so vanilla allocates at least as
+        // many cells (and therefore steps: a straight drag makes one step per cell) as we need.
+        const auto totalCells = static_cast<uint32_t>(cells.size());
+        uint32_t fakeEnd[2] = {0, start[1]};
+        if (start[0] + totalCells - 1 < cityCellsX) {
+            fakeEnd[0] = start[0] + totalCells - 1;
+        } else if (start[0] >= totalCells - 1) {
+            fakeEnd[0] = start[0] - (totalCells - 1);
+        } else {
+            LOG_WARN("PowerPoleCustomization: [FAR PoC] no straight run of {} cells fits at x={} "
+                     "(city width {}); falling back to vanilla drag.", totalCells, start[0], cityCellsX);
+            return original(tool, start, end, straightOnly, networkType);
+        }
+        if (original(tool, start, fakeEnd, straightOnly, networkType) == 0) {
+            LOG_WARN("PowerPoleCustomization: [FAR PoC] vanilla allocation drag failed; falling back.");
+            return original(tool, start, end, straightOnly, networkType);
+        }
+
+        auto* const base = reinterpret_cast<uint8_t*>(tool);
+        auto* const stepsBegin = *reinterpret_cast<uint8_t**>(base + kTool_StepsBegin);
+        auto* const cellsBegin = *reinterpret_cast<uint8_t**>(base + kTool_CellsBegin);
+        const auto stepCapacity = static_cast<uint32_t>(
+            (*reinterpret_cast<uint8_t**>(base + kTool_StepsEnd) - stepsBegin) / sizeof(DraggedStep));
+        const auto cellCapacity = static_cast<uint32_t>(
+            (*reinterpret_cast<uint8_t**>(base + kTool_CellsEnd) - cellsBegin) / sizeof(CellXZ));
+        if (stepsBegin == nullptr || cellsBegin == nullptr ||
+            stepCapacity < steps.size() || cellCapacity < totalCells) {
+            LOG_WARN("PowerPoleCustomization: [FAR PoC] vanilla drag produced {} steps/{} cells, "
+                     "need {}/{}; falling back.", stepCapacity, cellCapacity, steps.size(), totalCells);
+            return original(tool, start, end, straightOnly, networkType);
+        }
+
+        // Rewrite the POD contents in place and shrink the end pointers -- no game-allocator
+        // interaction. All steps are declared "straight" so GetPrimaryCell returns first cells
+        // and the straight/diag-junction special case never engages.
+        std::memcpy(cellsBegin, cells.data(), totalCells * sizeof(CellXZ));
+        *reinterpret_cast<uint8_t**>(base + kTool_CellsEnd) = cellsBegin + totalCells * sizeof(CellXZ);
+        std::memcpy(stepsBegin, steps.data(), steps.size() * sizeof(DraggedStep));
+        *reinterpret_cast<uint8_t**>(base + kTool_StepsEnd) = stepsBegin + steps.size() * sizeof(DraggedStep);
+        *reinterpret_cast<uint32_t*>(base + kTool_TotalSteps) = static_cast<uint32_t>(steps.size());
+        *reinterpret_cast<uint32_t*>(base + kTool_StraightSteps) = static_cast<uint32_t>(steps.size());
+        *reinterpret_cast<uint8_t*>(base + kTool_DiagonalFlag) = 0;
+
+        // BreakIntoStraightAndDiagSegments writes the snapped endpoint back into `end`; callers
+        // consume it, so the FAR snap must do the same.
+        const CellXZ snapped = nodeCell(periods);
+        end[0] = snapped.x;
+        end[1] = snapped.z;
+        gFarDragActive = true;
+        gFarDragRun = ratio.run;
+        return 1;
     }
 
     // ------------------------------------------------------------------
@@ -1465,10 +1810,14 @@ public:
         installed += poleStyleLookupPatch2_.Install(kPoleStyleLookupSite2,
             {0x8b, 0x04, 0xbd, 0xb0, 0x67, 0xb4, 0x00}, &PoleStyleLookupHook, "PoleStyleLookup@2") ? 1 : 0;
 
+        // TEMPORARY PoC-ONLY: FAR drag (docs SS17). A vtable-slot swap, not a code patch.
+        installed += farDrawNetworkLinePatch_.Install(kPowerToolDrawNetworkLineSlot, kDrawNetworkLine,
+                                                       &FarDrawNetworkLineHook, "FarDrawNetworkLine") ? 1 : 0;
+
         LOG_INFO("PowerPoleCustomization: installed {} of {} patches.", installed,
                  initConnectionPointsPatches_.size() + kAddConnectionCallSites.size() +
                  kUpdateConnectionCallSites.size() + kDeterminePolePositionsCallSites.size() +
-                 1 + createFloorPatches_.size() + 4 + 2);
+                 1 + createFloorPatches_.size() + 4 + 2 + 1);
 
         // TEMPORARY PoC-ONLY cheat. See the block comment above kCheatPoleLineTest.
         const cISC4AppPtr app;
@@ -1490,6 +1839,12 @@ public:
                 } else {
                     LOG_WARN("PowerPoleCustomization: failed to register cheat code polestyle.");
                 }
+                if (cheats->RegisterCheatCode(kCheatFarLine, cRZBaseString("farline"))) {
+                    LOG_INFO("PowerPoleCustomization: [FAR PoC] cheat code registered (farline) -- cycles "
+                             "off -> FAR-1.5 -> FAR-2 -> FAR-3 -> FAR-6 for power-line drags.");
+                } else {
+                    LOG_WARN("PowerPoleCustomization: failed to register cheat code farline.");
+                }
             }
         }
 
@@ -1500,9 +1855,11 @@ public:
         if (cheatManager_) {
             cheatManager_->UnregisterCheatCode(kCheatPoleLineTest);
             cheatManager_->UnregisterCheatCode(kCheatPoleStyle);
+            cheatManager_->UnregisterCheatCode(kCheatFarLine);
             cheatManager_->RemoveNotification2(this, 0);
             cheatManager_.Reset();
         }
+        farDrawNetworkLinePatch_.Uninstall();
         for (auto& patch : initConnectionPointsPatches_) patch.Uninstall();
         for (auto& patch : addConnectionPatches_) patch.Uninstall();
         for (auto& patch : updateConnectionPatches_) patch.Uninstall();
@@ -1540,6 +1897,14 @@ public:
                 LOG_INFO("PowerPoleCustomization: [TEST MODE] active pole style -> \"{}\" ({} of {}) -- "
                          "applies to newly-placed poles only.", activeName, gActiveStyleIndex, gStyles.size());
             }
+            if (stdMsg->GetType() == kCheatCodeMessageType &&
+                static_cast<uint32_t>(stdMsg->GetData1()) == kCheatFarLine) {
+                gFarRatioIndex = (gFarRatioIndex + 1) % (static_cast<uint32_t>(kFarRatios.size()) + 1);
+                gFarDragActive = false;
+                LOG_INFO("PowerPoleCustomization: [FAR PoC] fractional-angle drag -> {} -- drag the "
+                         "power-line tool off-axis to use it; axis/45-degree drags stay vanilla.",
+                         gFarRatioIndex == 0 ? "OFF" : kFarRatios[gFarRatioIndex - 1].name);
+            }
         }
         return true;
     }
@@ -1574,6 +1939,7 @@ private:
     ByteSpanCallPatch poleStyleLookupPatch1_{};
     ByteSpanCallPatch poleStyleLookupPatch2_{};
     InlineCallPatch wireWidthLookupPatch_{};
+    VTableSlotPatch farDrawNetworkLinePatch_{}; // TEMPORARY PoC-ONLY, see kCheatFarLine
     cRZAutoRefCount<cIGZCheatCodeManager> cheatManager_; // TEMPORARY PoC-ONLY, see kCheatPoleLineTest
 };
 

@@ -743,3 +743,123 @@ correction), and emits 8-way direction codes (0–7) in its two out-params. A pe
 - `0x00637eb0` → `cSC4NetworkTool::BreakIntoStraightAndDiagSegments` (confidence: confirmed)
 - `0x00639790` → `cSC4NetworkTool::ComputeDraggedCells` (confidence: strong)
 - `0x0063af40` `??DrawNetworkLine` → `cSC4NetworkTool::DrawNetworkLine` (confidence: confirmed)
+
+## 17. FAR-drag investigation (2026-07-03) — Path A confirmed viable
+
+Goal: let the power tool drag along fractional angles (FAR-n = arctan(1/n)). Two candidate
+architectures were on the table: (A) hook `DrawNetworkLine`, synthesize the dragged-step/cell
+arrays, let vanilla `DeterminePolePositions` place poles; (B) skip vanilla and build the
+pole/connection graph directly. **Path A wins** — every placement rule in
+`DeterminePolePositions` was pinned and none of them breaks a synthetic FAR step sequence.
+
+### A. What actually forces a pole in `DeterminePolePositions` (Win `0x00650840`)
+
+Full decompile of the Mac twin (`0x0022c98a`, symbolized) cross-checked against Windows for the
+load-bearing offsets. The function iterates steps `0..this+0x78`, and within each step iterates
+that step's cell-index range. A pole is placed at a cell ONLY when one of these fires
+(confidence: confirmed unless noted):
+
+1. **Anchor match** — the cell equals the next unconsumed entry of the anchor-cell vector
+   `this+0x118` (callers push the drag endpoints into it), OR it is the last cell of the last
+   valid step. Forces a pole; consumes the anchor entry.
+2. **Max-cells cadence** — evaluated only at a step's *primary cell*: forces a pole when
+   `curStepIdx - stepIdxOfLastPole >= *(this+0x3a4)`. **The cadence counts STEP INDICES, not
+   cells** (Windows read at `0x3a4` confirmed in §16; Mac twin uses `this+0x3f0` identically).
+   Vanilla steps are ~1 cell wide along the drag's major axis, which is why the property reads
+   as "max cells".
+3. **Existing pole or crossing power line at the cell** (`FindPoleOccupant` /
+   `CellIsOccupiedByPowerLine`). The `GetLineSlope` call everyone suspected of being a
+   direction-break test is ONLY used here — axis-aligned-crossing dedup against
+   `IntersectionIsInList`/`PoleIsInList`, gated to the straight region (`stepIdx < this+0x74`).
+4. **Terrain line-of-sight break** — at a primary cell with no other force: casts a ray
+   (renderer vtable `+0xf0`) from the last pole's position (+min-height `this+0x3a8`) toward
+   the NEXT cell's position; if terrain intersects closer than the span length, forces a pole.
+   This is the real "slope break" — it is a terrain-clipping test, not a path-direction test.
+   Skipped entirely whenever the pole is already forced by 1–3 (the force flag short-circuits
+   before the LOS branch).
+
+Non-primary, non-forced cells are only appended to the current span's `tLineInfo` list
+(cell-path bookkeeping for the wire) — they structurally cannot take a pole.
+
+### B. `GetPrimaryCell` = Windows `FUN_0064f230` (confirmed)
+
+Identical branch structure and offsets to Mac `0x0022bb3a`: reads step `param_1` from
+`this+0x54` (stride 0xc). If `this+0x74 == 0 || stepIdx >= this+0x74` (diagonal region):
+returns the step's cell whose `|cellX-anchorX| == |cellZ-anchorZ|` vs anchor
+`this+0x118[param_2]`, else -1. Otherwise (straight region): **returns the step's first cell,
+unconditionally.**
+
+### C. Why Path A works
+
+Feed the tool synthetic arrays shaped as: one dragged step per FAR period whose FIRST cell is
+the period's integer node, a final single-cell step holding the last node, and
+`this+0x74 = this+0x70 = stepCount` (everything "straight", so primary = first cell and the
+§A pre-loop straight/diag-junction special case is skipped). Scope `this+0x3a4 = 1` for the
+drag (the existing per-style hook already owns this field): rule 2 then forces a pole at every
+step's primary cell = every FAR node, rule 1 covers both endpoints, rule 4 is short-circuited,
+and no other rule can fire mid-period. `this+0x78` doesn't need writing — every caller sets
+`this+0x78 = this+0x70` right after `DrawNetworkLine` returns (verified in `PlacePoles`
+`0x00651560` and the commit wrapper `FUN_00652980`).
+
+### D. Tool gating — `DrawNetworkLine` is virtual; patch one vtable slot
+
+`0x0063af40` has **no direct call xrefs** — only DATA refs from 5 network-tool vtables
+(`0x00aa8790`, `0x00aa99f0`, `0x00aa9f78`, `0x00aaa608`, `0x00aaa998`), i.e. every invocation
+is a virtual call through slot `+0x48`. `cSC4PowerLineTool`'s ctor (`0x006503c0`, confirmed —
+writes the class's statics and calls the `cSC4NetworkTool` base ctor with network type 5)
+stores primary vtable **`0x00aa9f30`** at `this+0` and secondary `0x00aa9f20` at `this+4`.
+`0x00aa9f30 + 0x48 = 0x00aa9f78` = the power tool's own `DrawNetworkLine` slot (content
+verified `0x0063af40` by raw memory read; `Init` `0x00650630` sits at `0x00aa9f3c` in the same
+vtable). **Patching that single dword hooks the power tool only** — road/rail/street keep
+their own vtable slots untouched. No runtime class check needed.
+
+### E. Windows `DrawNetworkLine` facts (disassembly-verified)
+
+- `__thiscall`, 4 stack args `(SC4Point<uint>& start, SC4Point<uint>& end, char straightOnly?,
+  int networkType)`, ends `RET 0x10`, returns success in AL.
+- Clears steps (`this+0x54/0x58` begin/end, cap `0x5c`) and cells (`this+0x60/0x64`, cap
+  `0x68`), zeroes `this+0x70`, calls `BreakIntoStraightAndDiagSegments` (`0x00637eb0`) with
+  out-params `&this+0x70` (total steps), `&this+0x74` (straight steps), `&this+0x7c`,
+  `&this+0x80` (8-way direction codes) + two locals; writes diag flag byte `this+0x6c`;
+  honors straight-only mode byte `this+0x2b5`; calls `ComputeDraggedCells` (`0x00639790`);
+  bounds-checks every cell against city dims `this+0x280/0x284` (clears everything and
+  returns 0 on violation). `sNetworkTypeInfo` base = `0x00b452c8`, stride `0x114` (widths at
+  `+0x1c/+0x20`).
+- **`BreakIntoStraightAndDiagSegments` writes the snapped endpoint back into `end`** — callers
+  consume the snapped point afterward, so a FAR hook must do the same.
+- `tDraggedStep` = `{uint32 firstCellIdx, uint32 lastCellIdx, uint32 zeroed}` (stride 0xc;
+  third dword set to 0 by `ComputeDraggedCells`, purpose untraced). Cell vector elements =
+  `SC4Point<uint> {x, z}` (stride 8).
+- `ComputeDraggedCells` (Mac decompile) opens a new step on every advance along the drag's
+  major axis and extends the current step's cell bounds on minor-axis advances — a vanilla
+  straight drag of L cells yields ~L one-cell steps, a 45° drag yields per-column two-cell
+  steps. Its walk is greedy (straight run + diagonal tail), NOT slope-proportional — so
+  reusing it for FAR rasterization would give L-shaped cell paths; a FAR hook must rasterize
+  its own supercover staircase.
+
+### F. Hook allocation strategy (design, not yet verified in-game)
+
+The step/cell vectors use the game's allocator; the DLL must not push_back into them with its
+own heap. Plan: the hook first calls the ORIGINAL `DrawNetworkLine` with a fake straight drag
+of exactly the needed cell count (chosen along ±x toward map interior, so vanilla's own path
+performs all allocation), then rewrites the step/cell contents in place (both element types
+are PODs) and shrinks the two end pointers. Runtime-validates resulting capacity and falls
+back to a plain vanilla call on any mismatch.
+
+### G. Related facts picked up on the way
+
+- `FUN_006520c0` (caller of `DeterminePolePositions` site `0x006522bf`) is the
+  auto-connect/neighbor-connect path: walks a candidate cell list, pushes both endpoints into
+  the anchor vector `this+0x118/0x11c/0x120`, virtual-calls `DrawNetworkLine` via slot
+  `+0x48`, sets `this+0x78 = this+0x70`, then `DeterminePolePositions` + `PlacePoles`
+  (confidence: strong).
+- Power tool network type lives at `this+0x35c` (passed as `DrawNetworkLine`'s 4th arg).
+- `Get0To3Direction` (`0x0061f4c0`): same z → 0; same x → 2; otherwise 1 or 3 by sign
+  agreement — **any non-axis-aligned delta, including every FAR span, classifies as a
+  diagonal (1 or 3)**. So FAR spans get the diagonal pole model + the diagonal attach-point
+  table; the mesh will visually sit at 45° until real FAR art exists (known caveat), and cable
+  attach offsets need a true-bearing rotation to align (implemented in the DLL as the
+  attach-rotation feature).
+- `FUN_0064f170` / `FUN_0064f1d0` are the pole-in-list scans over the `tPoleInfo` vector
+  `this+0x36c..0x370` (stride 0x30) — by cell+flags and by occupant pointer respectively
+  (confidence: strong; matches Mac `PoleIsInList` pair).
