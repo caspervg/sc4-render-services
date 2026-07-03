@@ -133,6 +133,11 @@ recommended initially: let it fall through to the vanilla catchall (works, mildl
 transition models (`FAR-2.XP+straight` etc.) are combinatorial; do not model them until the base
 set proves out.
 
+Neighbor connections add another transition case: the engine requires the terminal cell to lie on
+the city boundary, while an exact FAR lattice does not always land there. Edge drags therefore keep
+all complete FAR periods and use one shortened final span to the boundary cell. The tool reports
+that crossed edge as an outward cardinal direction for the vanilla neighbor-connection routine.
+
 ## Art bill
 
 Confirmed in both binaries: Resource Key Type 1 (`0x27812821`) resolves an S3D instance as

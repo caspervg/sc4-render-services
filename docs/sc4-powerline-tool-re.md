@@ -904,17 +904,29 @@ The two relevant occupant identities are reliable and already exposed through `Q
 - power pole CLSID/IID accepted by QI: `0x09C05C6A` (Windows compare at `0x0064a054`);
 - hidden power-line occupant CLSID/IID: `0xC9C05C5D` (Windows compare at `0x0064935b`).
 
-**Feasible preservation design:** patch only the `ClearLotBlockingObjects` removal loop and skip
-the generic removal call when the candidate supports either interface. Do not patch the generic
-occupant-removal service globally: manual bulldozing, network replacement, terrain operations, and
-city shutdown must retain vanilla behavior. The loop must still release the query's occupant
-reference and advance normally for skipped entries.
+**Runtime result (2026-07-03): this was the wrong path.** Repeated empty-zone tests produced no
+power occupant classifications in this loop. A WinDbg breakpoint at
+`cSC4PowerLineOccupant::Shutdown` (`0x00649270`) captured the real chain:
+
+`UpdateOnZoneChange 0x006522f0` -> reciprocal `RemoveConnection` calls at
+`0x0065279f/0x006527a9` -> pole-side removal at `0x0064da00` -> hidden occupant removal at
+`0x0064a560` -> generic occupant removal (`0x0049f240`) -> `Shutdown`.
+
+Mac symbols confirm the Windows match: `cSC4PowerLineTool::UpdateOnZoneChange` (`0x0022e388`)
+tests the changed zone rectangle, finds a connection whose cell path intersects it, calls
+`cSC4PowerPoleOccupant::RemoveConnection` on both endpoints, and then attempts to reposition and
+rebuild the line. That rebuild succeeding only for some geometry caused the misleading intermittent
+result. The DLL no longer patches `ClearLotBlockingObjects`. Instead, `keepwires` patches the first
+seven bytes of Windows `UpdateOnZoneChange`; disabled mode reproduces the original prologue, while
+enabled mode returns immediately with `RET 0x14`, bypassing the complete remove/reposition/rebuild
+transaction. Manual bulldozing and generic occupant removal remain untouched.
 
 This deliberately allows buildings and power-line occupants to coexist spatially. It can preserve
 continuity, but a building may visually intersect a pole or cable, and lot terrain levelling may
-leave a retained pole at an undesirable height. Make it an explicit experimental INI option rather
-than unconditional behavior. A more polished policy would preserve crossing spans but relocate a
-pole that lies inside the building footprint; that is a substantially larger graph-editing feature.
+leave a retained pole at an undesirable height. For now it is runtime test state only: enter
+`keepwires` to toggle it, then allow a zoned lot intersecting an existing line to grow. A more
+polished policy would preserve crossing spans but relocate a pole that lies inside the building
+footprint; that is a substantially larger graph-editing feature.
 
 ## 19. FAR neighbor connections fail — three confirmed causes
 
@@ -926,7 +938,7 @@ cardinal step using tables at `0x00AA8390` (X = `[-1,0,1,0]`) and `0x00AA83A0`
 are `tool+0x240/+0x244`, confirmed independently in both `AttemptNeighborConnections` and
 `DrawNetworkLine` (`0x0063b054`/`0x0063b067`).
 
-The current FAR hook violates three assumptions:
+The original FAR hook violated three assumptions:
 
 1. It calls vanilla with a fake allocation drag, then rewrites cells but leaves `tool+0x7c/+0x80`
    describing the fake +X drag. Neighbor detection therefore tests the wrong city edge.
@@ -937,8 +949,9 @@ The current FAR hook violates three assumptions:
    A FAR lattice node reaches that cell only when the anchor-to-edge distance happens to be divisible
    by the ratio's major step.
 
-**Fix design:** use `+0x240/+0x244`; when a FAR drag targets a city edge, preserve a boundary-cell
-terminal even if the final span is shorter than one FAR period; and write `+0x7c/+0x80` to the even
+**Implemented fix:** the hook now uses `+0x240/+0x244`; when a FAR drag targets a city edge, it
+preserves all complete FAR periods and synthesizes a final supercover transition to the actual
+boundary cell. It also writes `+0x7c/+0x80` to the even
 cardinal direction code for the crossed edge (`0=−X`, `2=−Z`, `4=+X`, `6=+Z`). Interior poles remain
-on exact FAR-period nodes. The shortened terminal span is a transition segment and should use the
-normal fallback model policy until dedicated transition art exists.
+on exact FAR-period nodes. The shortened terminal span is a transition segment and uses the normal
+fallback model policy until dedicated transition art exists.

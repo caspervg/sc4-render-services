@@ -100,8 +100,12 @@ namespace {
     // in a follow-up session (deferred 2026-07-02 -- that hook needs its own Windows vtable-slot RE
     // pass, not yet done).
     constexpr uint32_t kCheatPoleStyle = 0xB07E1001;
+    // Experimental, deliberately runtime-scoped switch: while enabled, the lot developer's
+    // ClearLotBlockingObjects loop leaves power-pole and hidden power-line occupants alone.
+    constexpr uint32_t kCheatKeepWires = 0xB07E1002;
     constexpr uint32_t kSyntheticTestPointCount = 6; // > vanilla's 4, so it's obvious if extras render
     bool gSyntheticTestModeEnabled = false;
+    bool gKeepWiresOnZoneChange = false;
 
     // ------------------------------------------------------------------
     // Hook sites -- SimCity 4.exe 1.1.641 absolute addresses.
@@ -353,8 +357,23 @@ namespace {
     constexpr uint32_t kTool_DiagonalFlag = 0x6c; // byte: drag has a diagonal segment
     constexpr uint32_t kTool_TotalSteps = 0x70;
     constexpr uint32_t kTool_StraightSteps = 0x74;
-    constexpr uint32_t kTool_CityCellsX = 0x280;  // city dimensions in cells
-    constexpr uint32_t kTool_CityCellsZ = 0x284;
+    constexpr uint32_t kTool_FirstDirection = 0x7c;  // cardinal direction used by neighbor connection logic
+    constexpr uint32_t kTool_SecondDirection = 0x80;
+    constexpr uint32_t kTool_CityCellsX = 0x240;     // city dimensions in cells
+    constexpr uint32_t kTool_CityCellsZ = 0x244;
+
+    // cSC4PowerLineTool::UpdateOnZoneChange (Windows twin confirmed by the runtime shutdown stack
+    // and Mac symbol/call-shape match). It deliberately removes both sides of every connection
+    // crossing the changed zone rectangle at 0x0065279f/0x006527a9, then attempts to reposition
+    // and rebuild it. Bypass the complete transaction while keepwires is enabled.
+    constexpr uintptr_t kUpdateOnZoneChange = 0x006522f0;
+    constexpr uintptr_t kUpdateOnZoneChangeResume = 0x006522f7;
+
+    // Diagnostic boundary for the disproven lot-clear-only hypothesis. Shutdown disconnects a
+    // hidden cSC4PowerLineOccupant from both endpoint poles before chaining to cSC4Occupant.
+    // This vtable slot observes the actual disconnect regardless of which subsystem requested it.
+    constexpr uintptr_t kPowerLineOccupantShutdownSlot = 0x00aa9c08;
+    constexpr uintptr_t kPowerLineOccupantShutdown = 0x00649270;
 
     struct FarRatio {
         uint32_t run;  // cells along the major axis per period
@@ -1165,6 +1184,29 @@ namespace {
 #error Power-pole style-switching hook requires 32-bit MSVC.
 #endif
 
+#if defined(_MSC_VER) && defined(_M_IX86)
+    // Entered by a CALL replacing the first 7 bytes of UpdateOnZoneChange. The CALL adds one
+    // temporary return address below the function's own return address/arguments. Disabled:
+    // discard it, reproduce the two overwritten instructions, and resume at 0x006522f7. Enabled:
+    // discard it and return directly to the caller, cleaning the original five stack arguments.
+    __declspec(naked) void KeepWiresOnZoneChangeHook() {
+        __asm {
+            cmp byte ptr [gKeepWiresOnZoneChange], 0
+            je run_original
+            add esp, 4
+            ret 14h
+        run_original:
+            add esp, 4
+            sub esp, 68h
+            mov eax, [esp + 7ch]
+            mov edx, kUpdateOnZoneChangeResume
+            jmp edx
+        }
+    }
+#else
+#error Keep-wires zone-change hook requires 32-bit MSVC.
+#endif
+
     // Generic N-byte-prefix-match -> `CALL rel32` patch (5 bytes) + NOP padding for the remainder.
     // Used for the 7-byte pole-style lookup sites; kept separate from Imm32CallPatch (fixed 5-byte
     // `MOV EAX,imm32` sites) since the expected byte pattern and size differ here.
@@ -1445,6 +1487,17 @@ namespace {
         *field = saved; // restore vanilla; the placement loop is this field's only reader
     }
 
+    using PowerLineOccupantShutdownFn = void(__thiscall*)(void* occupantInterface);
+
+    void __fastcall PowerLineOccupantShutdownHook(void* occupantInterface, void* /*edx*/) {
+        if (gKeepWiresOnZoneChange) {
+            // This is the occupant-shared subobject at complete-object +4.
+            LOG_INFO("PowerPoleCustomization: [keepwires] power-line occupant {} is being shut down "
+                     "and disconnected from its poles.", occupantInterface);
+        }
+        reinterpret_cast<PowerLineOccupantShutdownFn>(kPowerLineOccupantShutdown)(occupantInterface);
+    }
+
     // ------------------------------------------------------------------
     // TEMPORARY PoC-ONLY: FAR drag hook (see the kDrawNetworkLine constants block above and
     // docs/sc4-powerline-tool-re.md SS17 for the design).
@@ -1580,12 +1633,23 @@ namespace {
         const uint32_t cityCellsZ = *reinterpret_cast<const uint32_t*>(reinterpret_cast<uint8_t*>(tool) + kTool_CityCellsZ);
         const bool majorIsX = adx >= adz;
         const uint32_t majorLen = majorIsX ? adx : adz;
+        const uint32_t minorLen = majorIsX ? adz : adx;
         const int32_t majorSign = (majorIsX ? dx : dz) > 0 ? 1 : -1;
         const int32_t minorSign = (majorIsX ? dz : dx) > 0 ? 1 : -1;
 
-        // Snap to the nearest whole number of FAR periods along the major axis, then clamp until
-        // the snapped endpoint is inside the city.
-        uint32_t periods = (majorLen + ratio.run / 2) / ratio.run;
+        // Neighbor connections require the terminal cell itself to be on the city boundary. For
+        // ordinary drags, retain nearest-period snapping. For a boundary drag, keep as many exact
+        // FAR periods as fit and preserve the cursor's boundary cell as a short transition tail.
+        const CellXZ requestedEnd{end[0], end[1]};
+        const bool exitsAtNegativeX = dx < 0 && requestedEnd.x == 0;
+        const bool exitsAtPositiveX = dx > 0 && requestedEnd.x + 1 == cityCellsX;
+        const bool exitsAtNegativeZ = dz < 0 && requestedEnd.z == 0;
+        const bool exitsAtPositiveZ = dz > 0 && requestedEnd.z + 1 == cityCellsZ;
+        const bool boundaryTerminal = exitsAtNegativeX || exitsAtPositiveX ||
+                                      exitsAtNegativeZ || exitsAtPositiveZ;
+        uint32_t periods = boundaryTerminal
+            ? std::min(majorLen / ratio.run, minorLen / ratio.rise)
+            : (majorLen + ratio.run / 2) / ratio.run;
         auto nodeCell = [&](const uint32_t period) -> CellXZ {
             const int32_t du = majorSign * static_cast<int32_t>(period * ratio.run);
             const int32_t dv = minorSign * static_cast<int32_t>(period * ratio.rise);
@@ -1605,14 +1669,19 @@ namespace {
             return original(tool, start, end, straightOnly, networkType);
         }
 
+        const CellXZ terminal = boundaryTerminal ? requestedEnd : nodeCell(periods);
+        const CellXZ lastFarNode = nodeCell(periods);
+        const bool hasTransitionTail = terminal.x != lastFarNode.x || terminal.z != lastFarNode.z;
+
         // Build the full FAR cell/step layout: one step per period, first cell = the period's
-        // node; final single-cell step = the last node (so the last-cell endpoint force in
-        // DeterminePolePositions lands on a node, docs SS17.C).
+        // node. A boundary drag may add one short transition step, followed by the boundary cell
+        // itself, so AttemptNeighborConnections sees an endpoint from which its outward one-cell
+        // probe actually leaves the city.
         const auto pattern = BuildFarPeriodPattern(ratio.run, ratio.rise);
         std::vector<CellXZ> cells;
         std::vector<DraggedStep> steps;
-        cells.reserve(pattern.size() * periods + 1);
-        steps.reserve(periods + 1);
+        cells.reserve(pattern.size() * periods + ratio.run + ratio.rise + 2);
+        steps.reserve(periods + 2);
         for (uint32_t p = 0; p < periods; ++p) {
             const DraggedStep step{static_cast<uint32_t>(cells.size()),
                                    static_cast<uint32_t>(cells.size() + pattern.size() - 1), 0};
@@ -1627,8 +1696,35 @@ namespace {
             }
             steps.push_back(step);
         }
+        if (hasTransitionTail) {
+            const int32_t rawTailMajor = majorIsX
+                ? static_cast<int32_t>(terminal.x) - static_cast<int32_t>(lastFarNode.x)
+                : static_cast<int32_t>(terminal.z) - static_cast<int32_t>(lastFarNode.z);
+            const int32_t rawTailMinor = majorIsX
+                ? static_cast<int32_t>(terminal.z) - static_cast<int32_t>(lastFarNode.z)
+                : static_cast<int32_t>(terminal.x) - static_cast<int32_t>(lastFarNode.x);
+            const int32_t localTailMajor = rawTailMajor * majorSign;
+            const int32_t localTailMinor = rawTailMinor * minorSign;
+            if (localTailMajor < 0 || localTailMinor < 0) {
+                LOG_WARN("PowerPoleCustomization: [FAR PoC] boundary transition reverses direction; falling back.");
+                return original(tool, start, end, straightOnly, networkType);
+            }
+            const auto tailPattern = BuildFarPeriodPattern(
+                static_cast<uint32_t>(localTailMajor), static_cast<uint32_t>(localTailMinor));
+            const DraggedStep tailStep{static_cast<uint32_t>(cells.size()),
+                                       static_cast<uint32_t>(cells.size() + tailPattern.size() - 1), 0};
+            for (const auto& [du, dv] : tailPattern) {
+                const int32_t su = majorSign * static_cast<int32_t>(du);
+                const int32_t sv = minorSign * static_cast<int32_t>(dv);
+                cells.push_back(CellXZ{
+                    static_cast<uint32_t>(static_cast<int32_t>(lastFarNode.x) + (majorIsX ? su : sv)),
+                    static_cast<uint32_t>(static_cast<int32_t>(lastFarNode.z) + (majorIsX ? sv : su)),
+                });
+            }
+            steps.push_back(tailStep);
+        }
         steps.push_back(DraggedStep{static_cast<uint32_t>(cells.size()), static_cast<uint32_t>(cells.size()), 0});
-        cells.push_back(nodeCell(periods));
+        cells.push_back(terminal);
 
         // Fake straight drag along +/-x from the anchor, sized so vanilla allocates at least as
         // many cells (and therefore steps: a straight drag makes one step per cell) as we need.
@@ -1673,11 +1769,28 @@ namespace {
         *reinterpret_cast<uint32_t*>(base + kTool_StraightSteps) = static_cast<uint32_t>(steps.size());
         *reinterpret_cast<uint8_t*>(base + kTool_DiagonalFlag) = 0;
 
+        // AttemptNeighborConnections reduces these even direction codes with `direction >> 1`
+        // and indexes its cardinal X/Z delta tables. Prefer the actual crossed edge at corners;
+        // otherwise the FAR major-axis direction is the outward probe direction.
+        uint32_t neighborDirection = 0;
+        if ((majorIsX && (exitsAtNegativeX || exitsAtPositiveX)) ||
+            (!majorIsX && !(exitsAtNegativeZ || exitsAtPositiveZ) &&
+             (exitsAtNegativeX || exitsAtPositiveX))) {
+            neighborDirection = exitsAtPositiveX ? 4u : 0u;
+        } else if (exitsAtNegativeZ || exitsAtPositiveZ) {
+            neighborDirection = exitsAtPositiveZ ? 6u : 2u;
+        } else if (majorIsX) {
+            neighborDirection = majorSign > 0 ? 4u : 0u;
+        } else {
+            neighborDirection = majorSign > 0 ? 6u : 2u;
+        }
+        *reinterpret_cast<uint32_t*>(base + kTool_FirstDirection) = neighborDirection;
+        *reinterpret_cast<uint32_t*>(base + kTool_SecondDirection) = neighborDirection;
+
         // BreakIntoStraightAndDiagSegments writes the snapped endpoint back into `end`; callers
         // consume it, so the FAR snap must do the same.
-        const CellXZ snapped = nodeCell(periods);
-        end[0] = snapped.x;
-        end[1] = snapped.z;
+        end[0] = terminal.x;
+        end[1] = terminal.z;
         gFarDragActive = true;
         gFarDragRun = ratio.run;
         return 1;
@@ -1899,11 +2012,17 @@ public:
         // TEMPORARY PoC-ONLY: FAR drag (docs SS17). A vtable-slot swap, not a code patch.
         installed += farDrawNetworkLinePatch_.Install(kPowerToolDrawNetworkLineSlot, kDrawNetworkLine,
                                                        &FarDrawNetworkLineHook, "FarDrawNetworkLine") ? 1 : 0;
+        installed += keepWiresPatch_.Install(kUpdateOnZoneChange,
+            {0x83, 0xec, 0x68, 0x8b, 0x44, 0x24, 0x7c}, &KeepWiresOnZoneChangeHook,
+            "KeepWiresOnZoneChange") ? 1 : 0;
+        installed += powerLineShutdownPatch_.Install(kPowerLineOccupantShutdownSlot,
+            kPowerLineOccupantShutdown, &PowerLineOccupantShutdownHook,
+            "PowerLineOccupantShutdownDiagnostic") ? 1 : 0;
 
         LOG_INFO("PowerPoleCustomization: installed {} of {} patches.", installed,
                  initConnectionPointsPatches_.size() + kAddConnectionCallSites.size() +
                  kUpdateConnectionCallSites.size() + kDeterminePolePositionsCallSites.size() +
-                 1 + createFloorPatches_.size() + 4 + 2 + 1);
+                 1 + createFloorPatches_.size() + 4 + 2 + 1 + 1 + 1);
 
         // TEMPORARY PoC-ONLY cheat. See the block comment above kCheatPoleLineTest.
         const cISC4AppPtr app;
@@ -1925,6 +2044,12 @@ public:
                 } else {
                     LOG_WARN("PowerPoleCustomization: failed to register cheat code polestyle.");
                 }
+                if (cheats->RegisterCheatCode(kCheatKeepWires, cRZBaseString("keepwires"))) {
+                    LOG_INFO("PowerPoleCustomization: [TEST MODE] cheat code registered (keepwires) -- "
+                             "toggles suppression of power-line rerouting on zone changes.");
+                } else {
+                    LOG_WARN("PowerPoleCustomization: failed to register cheat code keepwires.");
+                }
             }
         }
 
@@ -1935,10 +2060,13 @@ public:
         if (cheatManager_) {
             cheatManager_->UnregisterCheatCode(kCheatPoleLineTest);
             cheatManager_->UnregisterCheatCode(kCheatPoleStyle);
+            cheatManager_->UnregisterCheatCode(kCheatKeepWires);
             cheatManager_->RemoveNotification2(this, 0);
             cheatManager_.Reset();
         }
         farDrawNetworkLinePatch_.Uninstall();
+        keepWiresPatch_.Uninstall();
+        powerLineShutdownPatch_.Uninstall();
         for (auto& patch : initConnectionPointsPatches_) patch.Uninstall();
         for (auto& patch : addConnectionPatches_) patch.Uninstall();
         for (auto& patch : updateConnectionPatches_) patch.Uninstall();
@@ -1976,6 +2104,14 @@ public:
                 LOG_INFO("PowerPoleCustomization: [TEST MODE] active pole style -> \"{}\" ({} of {}) -- "
                          "applies to newly-placed poles only.", activeName, gActiveStyleIndex, gStyles.size());
             }
+            if (stdMsg->GetType() == kCheatCodeMessageType &&
+                static_cast<uint32_t>(stdMsg->GetData1()) == kCheatKeepWires) {
+                gKeepWiresOnZoneChange = !gKeepWiresOnZoneChange;
+                LOG_INFO("PowerPoleCustomization: [TEST MODE] keepwires {} -- zone changes {} "
+                         "the power-line remove/reposition/rebuild handler.",
+                         gKeepWiresOnZoneChange ? "ENABLED" : "disabled",
+                         gKeepWiresOnZoneChange ? "will bypass" : "will run");
+            }
         }
         return true;
     }
@@ -2009,8 +2145,10 @@ private:
     Imm32CallPatch wallTextureHashPatch2_{};
     ByteSpanCallPatch poleStyleLookupPatch1_{};
     ByteSpanCallPatch poleStyleLookupPatch2_{};
+    ByteSpanCallPatch keepWiresPatch_{};
     InlineCallPatch wireWidthLookupPatch_{};
     VTableSlotPatch farDrawNetworkLinePatch_{}; // automatic FAR snapping; hold Shift for regular-only
+    VTableSlotPatch powerLineShutdownPatch_{}; // keepwires diagnostic: observes actual cable disconnects
     cRZAutoRefCount<cIGZCheatCodeManager> cheatManager_; // TEMPORARY PoC-ONLY, see kCheatPoleLineTest
 };
 
