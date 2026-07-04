@@ -86,12 +86,26 @@ to a null entry and gets dereferenced with no null check -- this crashes the gam
 render transparent. If you want no visible foundation, set the half-extent to `0` instead of trying
 to point the texture IDs at nothing.
 
+## Model quarter-turn correction
+
+Power-pole RKT1 models normally receive a mask-derived quarter-turn from the game. For some paired
+FAR headings the game rotates the wrong member of the pair. The following property toggles that
+0/1 decision before camera rotation and model-variant selection are calculated:
+
+| ID | Property | Type | Meaning |
+|---|---|---|---|
+| `0xB22A000E` | Power Pole Invert Model Quarter Turn | Bool | `true` exchanges the unrotated and quarter-turned model choices. Absent or `false` preserves vanilla behavior. |
+
+This correction is persistent because it is read from the pole's exemplar whenever the model is
+loaded, including zoom changes and save-game reloads. It changes only model-variant selection; wire
+attachment bearings remain controlled by the attachment properties.
+
 ## Property definitions
 
 The definitions are included in `.agents/new_properties.xml`. `Count="-3"` on attachment properties
 enforces repeated XYZ groups; `Count="-1"` permits variable-length per-wire arrays. The selected
-`0xB22A0000` through `0xB22A0009` IDs are unique in that vendored registry; the remainder of the
-`0xB22A0000` through `0xB22A000F` block was also checked and is currently unused there.
+`0xB22A0000` through `0xB22A000E` IDs are reserved by this feature. The final ID in the checked
+`0xB22A0000` through `0xB22A000F` block is currently unused.
 
 The production exemplar reader, arbitrary 1-N strand rebuild, sag scaling/capping, and per-wire
 width lookup are implemented. They still require an in-game validation pass before this sample

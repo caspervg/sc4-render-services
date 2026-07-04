@@ -177,6 +177,14 @@ normal camera-rotation and LOD S3D resources expected by its RKT1 model. Keep al
 the style table, but allow the perpendicular pairs to alias the same prop instance ID as shown in
 the example. One logical model cannot cover both slope signs without reflection or free yaw.
 
+There is an extra mask-order wrinkle: `XP/ZP` classify to mask `0x2` (no engine turn), while
+`XN/ZN` classify to mask `0x8` (engine +90 degrees). Which perpendicular pair needs correction is
+determined by the source model's authored basis. In-game validation of the P3 wood H-frame tangents
+shows that its `XP/ZN` (NR/negative-slope) pair needs the model exemplar's `Power Pole Invert Model
+Quarter Turn` property (`0xB22A000E`) set to true; its `XN/ZP` (NL/positive-slope) pair must leave it
+absent. The `LoadModel` call-site hook XORs the engine's 0/1 choice without changing model resources
+or relying on drag-scoped state.
+
 Do not attempt runtime mesh rotation via `SetTransform`: `GetModelInstanceID`'s variant selection
 and the baked lighting/LOD assets are not built for free yaw, and docs §6C documents the
 cable-detach problem that approach causes.

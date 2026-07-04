@@ -121,6 +121,14 @@ namespace {
     constexpr uintptr_t kInitConnectionPoints_CallSite_SetDefaultExemplar = 0x0064d94e;
     constexpr uintptr_t kInitConnectionPoints_CallSite_Read = 0x0064ef09; // save-game load path
 
+    // cSC4PowerPoleOccupant::LoadModel passes its mask-derived 0/1 quarter-turn to the RKT1 model
+    // selector here. The first argument is the model-resource-key vector at completeObject+0x8,
+    // which lets the hook recover the pole and apply an exemplar-controlled XOR correction before
+    // the selector folds camera rotation and pole rotation modulo four.
+    constexpr uintptr_t kGetModelInstanceID = 0x00497180;
+    constexpr uintptr_t kGetModelInstanceID_CallSite_LoadModel = 0x0064ae08;
+    constexpr uint32_t kOccupant_ModelResourceKeys = 0x08;
+
     // cSC4PowerPoleOccupant::AddConnection -- builds the strand polylines for a brand-new connection.
     // Called from cSC4PowerLineTool::PlacePoles at exactly 4 call sites (2 logical calls x 2 args-swapped).
     constexpr uintptr_t kAddConnection = 0x0064e3e0;
@@ -251,6 +259,10 @@ namespace {
     // custom attach-point properties; a pole using the vanilla baked table always uses the nominal
     // basis regardless of this value. See docs/far-power-lines-design.md "Two real wrinkles".
     constexpr uint32_t kPropAttachBasisDegrees = 0xB22A000D;
+    // Optional Bool. XORs the mask-derived 0/1 RKT1 quarter-turn. This is useful when two
+    // perpendicular FAR headings share one logical model but SC4 rotates the wrong member of the
+    // pair. Absent/false preserves vanilla model selection exactly.
+    constexpr uint32_t kPropInvertModelQuarterTurn = 0xB22A000E;
     constexpr std::array<uint32_t, 4> kAttachPointProperties = {
         kPropAttachPointsDir0, kPropAttachPointsDir1, kPropAttachPointsDir2, kPropAttachPointsDir3,
     };
@@ -647,6 +659,52 @@ namespace {
         }
         outValue = value;
         return true;
+    }
+
+    bool TryReadBoolProperty(const cISCPropertyHolder* holder, const uint32_t propertyId, bool& outValue) {
+        if (holder == nullptr || !holder->HasProperty(propertyId)) {
+            return false;
+        }
+        const cISCProperty* const prop = holder->GetProperty(propertyId);
+        const cIGZVariant* const variant = prop ? prop->GetPropertyValue() : nullptr;
+        bool value = false;
+        if (variant == nullptr || variant->GetType() != cIGZVariant::Bool || !variant->GetValBool(value)) {
+            LOG_WARN("PowerPoleCustomization: property 0x{:08X} must be a Bool; ignoring.", propertyId);
+            return false;
+        }
+        outValue = value;
+        return true;
+    }
+
+    bool ShouldInvertModelQuarterTurn(void* occupant) {
+        cRZAutoRefCount<cISCExemplarPropertyHolder> propertyHolder;
+        auto* const unknown = reinterpret_cast<cIGZUnknown*>(occupant);
+        if (!unknown->QueryInterface(GZIID_cISCExemplarPropertyHolder, propertyHolder.AsPPVoid())) {
+            return false;
+        }
+
+        cISCResExemplar* const exemplar = propertyHolder->GetDefaultExemplar();
+        const cISCPropertyHolder* const holder = exemplar ? exemplar->AsISCPropertyHolder() : nullptr;
+        bool invert = false;
+        return TryReadBoolProperty(holder, kPropInvertModelQuarterTurn, invert) && invert;
+    }
+
+    using GetModelInstanceIDFn = uint32_t(__cdecl*)(void* resourceKeys, uint32_t zoom,
+                                                    uint32_t cameraRotation, uint32_t quarterTurn,
+                                                    bool useExplicitRotation, uint32_t* outType,
+                                                    uint32_t* outGroup);
+
+    uint32_t __cdecl GetModelInstanceIDHook(void* resourceKeys, const uint32_t zoom,
+                                           const uint32_t cameraRotation, uint32_t quarterTurn,
+                                           const bool useExplicitRotation, uint32_t* const outType,
+                                           uint32_t* const outGroup) {
+        auto* const occupant = reinterpret_cast<uint8_t*>(resourceKeys) - kOccupant_ModelResourceKeys;
+        if (ShouldInvertModelQuarterTurn(occupant)) {
+            quarterTurn ^= 1u;
+        }
+
+        const auto original = reinterpret_cast<GetModelInstanceIDFn>(kGetModelInstanceID);
+        return original(resourceKeys, zoom, cameraRotation, quarterTurn, useExplicitRotation, outType, outGroup);
     }
 
     bool TryReadNonNegativeFloatArray(const cISCPropertyHolder* holder, const uint32_t propertyId,
@@ -1693,7 +1751,9 @@ namespace {
     // center-to-center node segment passes through, from (0,0) inclusive to (run,rise) exclusive,
     // in traversal order. At an exact corner crossing both adjacent cells are included, matching
     // vanilla's own 2-cells-per-column diagonal registration.
-    std::vector<std::pair<uint32_t, uint32_t>> BuildFarPeriodPattern(const uint32_t run, const uint32_t rise) {
+    // Supercover cell set for one FAR period. No longer used by the node-only drag synthesis (which
+    // stores only pole nodes), but retained for reference / a future per-tile wire-occupancy option.
+    [[maybe_unused]] std::vector<std::pair<uint32_t, uint32_t>> BuildFarPeriodPattern(const uint32_t run, const uint32_t rise) {
         std::vector<std::pair<uint32_t, uint32_t>> cells;
         uint32_t u = 0;
         uint32_t v = 0;
@@ -1846,58 +1906,43 @@ namespace {
         const CellXZ lastFarNode = nodeCell(periods);
         const bool hasTransitionTail = terminal.x != lastFarNode.x || terminal.z != lastFarNode.z;
 
-        // Build the full FAR cell/step layout: one step per period, first cell = the period's
-        // node. A boundary drag may add one short transition step, followed by the boundary cell
-        // itself, so AttemptNeighborConnections sees an endpoint from which its outward one-cell
-        // probe actually leaves the city.
-        const auto pattern = BuildFarPeriodPattern(ratio.run, ratio.rise);
+        // Node-only layout: one single-cell step per FAR period node (plus the boundary tail node
+        // and terminal). DeterminePolePositions is scoped to max-cells-between-poles = 1, so a pole
+        // is forced at every step's primary (= only) cell. Intermediate span cells are deliberately
+        // omitted: the wire renders bezier pole-to-pole and power conducts through the connection
+        // graph (proven by vanilla's 10-cell empty pole gaps), so they were never needed for pole
+        // placement or rendering. Omitting them also keeps the hidden per-cell line occupants off the
+        // tiles between poles -- zoning/lot construction then only interrupts the wire when a lot
+        // lands on a pole node itself -- and caps the buffer at ~periods+2 cells so arbitrarily long
+        // FAR runs fit on any city tile (256x256 included) instead of overflowing a straight drag.
         std::vector<CellXZ> cells;
         std::vector<DraggedStep> steps;
-        cells.reserve(pattern.size() * periods + ratio.run + ratio.rise + 2);
-        steps.reserve(periods + 2);
+        cells.reserve(periods + 3);
+        steps.reserve(periods + 3);
+        const auto pushNode = [&](const CellXZ node) {
+            steps.push_back(DraggedStep{static_cast<uint32_t>(cells.size()),
+                                        static_cast<uint32_t>(cells.size()), 0});
+            cells.push_back(node);
+        };
         for (uint32_t p = 0; p < periods; ++p) {
-            const DraggedStep step{static_cast<uint32_t>(cells.size()),
-                                   static_cast<uint32_t>(cells.size() + pattern.size() - 1), 0};
-            const CellXZ node = nodeCell(p);
-            for (const auto& [du, dv] : pattern) {
-                const int32_t su = majorSign * static_cast<int32_t>(du);
-                const int32_t sv = minorSign * static_cast<int32_t>(dv);
-                cells.push_back(CellXZ{
-                    static_cast<uint32_t>(static_cast<int32_t>(node.x) + (majorIsX ? su : sv)),
-                    static_cast<uint32_t>(static_cast<int32_t>(node.z) + (majorIsX ? sv : su)),
-                });
-            }
-            steps.push_back(step);
+            pushNode(nodeCell(p));
         }
         if (hasTransitionTail) {
+            // A boundary drag keeps the last whole-period node as a pole, then the boundary cell
+            // itself, so AttemptNeighborConnections' outward one-cell probe actually leaves the city.
             const int32_t rawTailMajor = majorIsX
                 ? static_cast<int32_t>(terminal.x) - static_cast<int32_t>(lastFarNode.x)
                 : static_cast<int32_t>(terminal.z) - static_cast<int32_t>(lastFarNode.z);
             const int32_t rawTailMinor = majorIsX
                 ? static_cast<int32_t>(terminal.z) - static_cast<int32_t>(lastFarNode.z)
                 : static_cast<int32_t>(terminal.x) - static_cast<int32_t>(lastFarNode.x);
-            const int32_t localTailMajor = rawTailMajor * majorSign;
-            const int32_t localTailMinor = rawTailMinor * minorSign;
-            if (localTailMajor < 0 || localTailMinor < 0) {
+            if (rawTailMajor * majorSign < 0 || rawTailMinor * minorSign < 0) {
                 LOG_WARN("PowerPoleCustomization: [FAR PoC] boundary transition reverses direction; falling back.");
                 return original(tool, start, end, straightOnly, networkType);
             }
-            const auto tailPattern = BuildFarPeriodPattern(
-                static_cast<uint32_t>(localTailMajor), static_cast<uint32_t>(localTailMinor));
-            const DraggedStep tailStep{static_cast<uint32_t>(cells.size()),
-                                       static_cast<uint32_t>(cells.size() + tailPattern.size() - 1), 0};
-            for (const auto& [du, dv] : tailPattern) {
-                const int32_t su = majorSign * static_cast<int32_t>(du);
-                const int32_t sv = minorSign * static_cast<int32_t>(dv);
-                cells.push_back(CellXZ{
-                    static_cast<uint32_t>(static_cast<int32_t>(lastFarNode.x) + (majorIsX ? su : sv)),
-                    static_cast<uint32_t>(static_cast<int32_t>(lastFarNode.z) + (majorIsX ? sv : su)),
-                });
-            }
-            steps.push_back(tailStep);
+            pushNode(lastFarNode);
         }
-        steps.push_back(DraggedStep{static_cast<uint32_t>(cells.size()), static_cast<uint32_t>(cells.size()), 0});
-        cells.push_back(terminal);
+        pushNode(terminal);
 
         // Fake straight drag sized so vanilla allocates at least as many cells (and therefore steps:
         // a straight drag makes one step per cell) as we need. Every allocated cell is overwritten
@@ -2238,6 +2283,9 @@ public:
         }
 
         size_t installed = 0;
+        installed += InstallCallSitePatch(modelInstanceIdPatch_, "GetModelInstanceID@LoadModel",
+                                           kGetModelInstanceID_CallSite_LoadModel, kGetModelInstanceID,
+                                           &GetModelInstanceIDHook);
         installed += InstallCallSitePatch(initConnectionPointsPatches_[0], "InitConnectionPoints@Init",
                                            kInitConnectionPoints_CallSite_Init, kInitConnectionPoints,
                                            &InitConnectionPointsHook);
@@ -2296,7 +2344,7 @@ public:
         LOG_INFO("PowerPoleCustomization: installed {} of {} patches.", installed,
                  initConnectionPointsPatches_.size() + kAddConnectionCallSites.size() +
                  kUpdateConnectionCallSites.size() + kDeterminePolePositionsCallSites.size() +
-                 1 + createFloorPatches_.size() + 4 + 2 + 1 + 1 + 1);
+                 2 + createFloorPatches_.size() + 4 + 2 + 1 + 1 + 1);
 
         // TEMPORARY PoC-ONLY cheat. See the block comment above kCheatPoleLineTest.
         const cISC4AppPtr app;
@@ -2341,6 +2389,7 @@ public:
         farDrawNetworkLinePatch_.Uninstall();
         keepWiresPatch_.Uninstall();
         powerLineShutdownPatch_.Uninstall();
+        modelInstanceIdPatch_.Uninstall();
         for (auto& patch : initConnectionPointsPatches_) patch.Uninstall();
         for (auto& patch : addConnectionPatches_) patch.Uninstall();
         for (auto& patch : updateConnectionPatches_) patch.Uninstall();
@@ -2409,6 +2458,7 @@ private:
     }
 
     std::array<TerrainDecal::RelativeCallPatch, 3> initConnectionPointsPatches_{};
+    TerrainDecal::RelativeCallPatch modelInstanceIdPatch_{};
     std::array<TerrainDecal::RelativeCallPatch, 4> addConnectionPatches_{};
     std::array<TerrainDecal::RelativeCallPatch, 2> updateConnectionPatches_{};
     std::array<TerrainDecal::RelativeCallPatch, 3> determinePolePositionsPatches_{};
