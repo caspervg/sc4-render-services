@@ -245,6 +245,12 @@ namespace {
     constexpr uint32_t kPropFoundationHalfExtent = 0xB22A000A;
     constexpr uint32_t kPropFoundationFloorTextureId = 0xB22A000B;
     constexpr uint32_t kPropFoundationWallTextureId = 0xB22A000C;
+    // Optional signed Float32, in degrees: the in-plane heading (0 = x axis, 90 = z axis) the
+    // custom attach points in this exemplar were authored for. Absent = attach points are in their
+    // direction's nominal 0/45/90/135-degree basis (vanilla behavior). Only meaningful together with
+    // custom attach-point properties; a pole using the vanilla baked table always uses the nominal
+    // basis regardless of this value. See docs/far-power-lines-design.md "Two real wrinkles".
+    constexpr uint32_t kPropAttachBasisDegrees = 0xB22A000D;
     constexpr std::array<uint32_t, 4> kAttachPointProperties = {
         kPropAttachPointsDir0, kPropAttachPointsDir1, kPropAttachPointsDir2, kPropAttachPointsDir3,
     };
@@ -383,8 +389,31 @@ namespace {
     constexpr std::array<FarRatio, 4> kFarRatios = {{
         {3, 2}, {2, 1}, {3, 1}, {6, 1},
     }};
-    bool gFarDragActive = false;   // latest DrawNetworkLine call produced a FAR path
-    uint32_t gFarDragRun = 0;      // major-axis cells per period of that FAR path
+
+    // A FAR span is undirected, so per ratio exactly 4 distinct pole headings exist: the 1:n slope
+    // tilted off the x axis with its minor step in +z (XP) or -z (XN), and the mirrored n:1 pair off
+    // the z axis with its minor step in +x (ZP) or -x (ZN). See docs/far-power-lines-design.md.
+    // Kept in this order so a style/table index is `ratioIndex * kFarOrientCount + orient`.
+    enum FarOrient : uint32_t { kFarOrientXP = 0, kFarOrientXN = 1, kFarOrientZP = 2, kFarOrientZN = 3 };
+    constexpr uint32_t kFarOrientCount = 4;
+    constexpr uint32_t kFarHeadingCount = static_cast<uint32_t>(kFarRatios.size()) * kFarOrientCount; // 16
+
+    // Human-readable tags for debug logging (order matches kFarRatios / the FarOrient enum).
+    constexpr std::array<std::string_view, 4> kFarRatioLabels = {{"1.5", "2", "3", "6"}};
+    constexpr std::string_view FarOrientName(const uint32_t orient) {
+        switch (orient) {
+            case kFarOrientXP: return "XP";
+            case kFarOrientXN: return "XN";
+            case kFarOrientZP: return "ZP";
+            case kFarOrientZN: return "ZN";
+            default: return "??";
+        }
+    }
+
+    bool gFarDragActive = false;      // latest DrawNetworkLine call produced a FAR path
+    uint32_t gFarDragRun = 0;         // major-axis cells per period of that FAR path
+    uint32_t gFarDragRatioIndex = 0;  // index into kFarRatios for that FAR path
+    uint32_t gFarDragOrient = kFarOrientXP; // FarOrient of that FAR path
 
     // Automatic heading selection considers the two regular headings bounding the first octant
     // (axis and 45-degree diagonal) plus every supported FAR ratio. The remaining octants are
@@ -404,6 +433,10 @@ namespace {
         std::string name;
         std::array<uint32_t, 16> instanceByDirectionMask{};
         std::array<bool, 16> hasMask{};
+        // FAR headings, indexed by `ratioIndex * kFarOrientCount + orient`. Selected during a FAR
+        // drag by the exact (ratio, orientation); direction masks cannot express a FAR heading.
+        std::array<uint32_t, kFarHeadingCount> farInstanceByHeading{};
+        std::array<bool, kFarHeadingCount> hasFarHeading{};
         uint32_t maxCellsBetweenPoles = 0; // 0 = inherit vanilla; else cells between poles
         bool hasMaxCells = false;
     };
@@ -411,6 +444,12 @@ namespace {
     // Index 0 = vanilla (no override). gStyles[gActiveStyleIndex - 1] for gActiveStyleIndex >= 1.
     std::vector<PoleStyle> gStyles;
     uint32_t gActiveStyleIndex = 0;
+
+    // The optional [PowerPoles.FAR] section: a style-independent fallback consulted for FAR headings
+    // when the active style doesn't define the exact key. Only its farInstanceByHeading is used; it
+    // is never a cyclable style and never enters gStyles.
+    PoleStyle gFarDefaultStyle;
+    bool gHasFarDefault = false;
 
     // ------------------------------------------------------------------
     // Data-driven settings (SC4PowerPoleCustomization.ini).
@@ -454,6 +493,10 @@ namespace {
         bool hasFloorTexture = false;
         uint32_t foundationWallTextureId = kVanillaWallTextureId;
         bool hasWallTexture = false;
+        // In-plane heading (radians, normalized to [0, pi)) the custom attach points were baked for.
+        // Only consulted for directions that actually carry custom attach points.
+        float attachBasisRadians = 0.0f;
+        bool hasAttachBasis = false;
 
         [[nodiscard]] uint32_t PointCount(const uint32_t direction) const {
             return direction < 4 ? static_cast<uint32_t>(perDirection[direction].size()) : 0;
@@ -569,6 +612,23 @@ namespace {
         return true;
     }
 
+    // Like the above but accepts any finite value (used for the signed attach-basis angle).
+    bool TryReadFiniteFloatProperty(const cISCPropertyHolder* holder, const uint32_t propertyId, float& outValue) {
+        if (holder == nullptr || !holder->HasProperty(propertyId)) {
+            return false;
+        }
+        const cISCProperty* const prop = holder->GetProperty(propertyId);
+        const cIGZVariant* const variant = prop ? prop->GetPropertyValue() : nullptr;
+        float value = 0.0f;
+        if (variant == nullptr || variant->GetType() != cIGZVariant::Float32 ||
+            !variant->GetValFloat32(value) || !std::isfinite(value)) {
+            LOG_WARN("PowerPoleCustomization: property 0x{:08X} must be a finite Float32; ignoring.", propertyId);
+            return false;
+        }
+        outValue = value;
+        return true;
+    }
+
     // Texture-ID properties are raw resource keys, not appearance scalars: no amount of range
     // clamping here can guarantee the ID resolves to a loaded texture at Draw() time. An unresolved
     // ID walks the engine's texture-cache hash chain to a null bucket and is dereferenced with no
@@ -676,6 +736,20 @@ namespace {
             LOG_WARN("PowerPoleCustomization: custom wall texture ID 0x{:08X} is unvalidated -- same crash "
                      "risk as the floor texture ID.", out.foundationWallTextureId);
         }
+
+        // Attach basis is only meaningful alongside custom attach points, so it deliberately does
+        // NOT set `any`: a pole that declares a basis but no attach points has nothing to rotate and
+        // stays fully vanilla. Stored normalized to [0, pi) to match ComputeSpanBearing's range.
+        float basisDegrees = 0.0f;
+        if (TryReadFiniteFloatProperty(holder, kPropAttachBasisDegrees, basisDegrees)) {
+            constexpr float pi = 3.14159265358979323846f;
+            float basisRadians = std::fmod(basisDegrees * (pi / 180.0f), pi);
+            if (basisRadians < 0.0f) {
+                basisRadians += pi;
+            }
+            out.attachBasisRadians = basisRadians;
+            out.hasAttachBasis = true;
+        }
         return any;
     }
 
@@ -723,24 +797,44 @@ namespace {
     // sign-agreeing diagonal (+x,+z), 2 = z axis, 3 = the opposing diagonal.
     constexpr std::array<float, 4> kNominalDirectionAngle = {0.0f, kPi / 4.0f, kPi / 2.0f, 3.0f * kPi / 4.0f};
 
-    // Deviation of the true pole-to-pole bearing from the direction's nominal angle, normalized
-    // to (-pi/2, pi/2] so both endpoints of the (undirected) span agree on it.
-    float ComputeYawDelta(void* poleA, void* poleB, const uint32_t direction) {
+    // Undirected in-plane bearing of the span: atan2(dz, dx) normalized to [0, pi). Both endpoints
+    // of the undirected span agree on it. Returns false (and leaves the bearing at 0) when the two
+    // poles coincide.
+    bool ComputeSpanBearing(void* poleA, void* poleB, float& outBearing) {
         const auto* const posA = reinterpret_cast<const float*>(reinterpret_cast<uint8_t*>(poleA) + kOccupant_PosX);
         const auto* const posB = reinterpret_cast<const float*>(reinterpret_cast<uint8_t*>(poleB) + kOccupant_PosX);
         const float dx = posB[0] - posA[0];
         const float dz = posB[2] - posA[2];
         if (dx == 0.0f && dz == 0.0f) {
-            return 0.0f;
+            outBearing = 0.0f;
+            return false;
         }
         float bearing = std::atan2(dz, dx);
         if (bearing < 0.0f) {
             bearing += kPi; // undirected line angle in [0, pi)
         }
-        float delta = bearing - kNominalDirectionAngle[direction & 3];
+        outBearing = bearing;
+        return true;
+    }
+
+    // Minimal undirected rotation: wrap a yaw deviation into (-pi/2, pi/2].
+    float WrapYaw(float delta) {
         while (delta > kPi / 2.0f) delta -= kPi;
         while (delta <= -kPi / 2.0f) delta += kPi;
         return delta;
+    }
+
+    // The heading (radians, [0, pi)) this pole's attach offsets were baked for, in this direction.
+    // A pole that both supplies custom attach points for the direction AND declares an attach basis
+    // uses that basis; every other case -- vanilla baked table, or no declared basis -- uses the
+    // direction's nominal 0/45/90/135-degree angle, so cables stay aligned to the table they
+    // actually came from. This is what lets a FAR-authored pole and a fallback pole share one span.
+    float AttachBasisAngle(void* pole, const uint32_t direction) {
+        const auto it = gOverrides.find(pole);
+        if (it != gOverrides.end() && it->second.hasAttachBasis && it->second.PointCount(direction) > 0) {
+            return it->second.attachBasisRadians;
+        }
+        return kNominalDirectionAngle[direction & 3];
     }
 
     AttachPoint RotateOffsetAroundY(const AttachPoint& offset, const float yaw) {
@@ -1050,18 +1144,25 @@ namespace {
         }
 
         const PoleAttachOverride* const appearance = FindAppearanceOverride(occupant, otherPole);
-        // Off-nominal bearing (e.g. a FAR span) forces a rebuild so the baked attach offsets can
-        // be yaw-rotated onto the true span direction. Zero for all vanilla-aligned spans.
-        const float yawDelta = ComputeYawDelta(occupant, otherPole, direction);
+        // Off-nominal bearing (e.g. a FAR span) forces a rebuild so each pole's baked attach offsets
+        // can be yaw-rotated onto the true span direction. A single shared delta is wrong when the
+        // two endpoints were authored in different bases (a FAR-authored pole meeting a fallback or
+        // vanilla one), so compute one deviation per endpoint. Both are 0 for vanilla-aligned spans,
+        // so this reduces exactly to the previous single-delta behavior there.
+        float spanBearing = 0.0f;
+        const bool haveBearing = ComputeSpanBearing(occupant, otherPole, spanBearing);
+        const float yawA = haveBearing ? WrapYaw(spanBearing - AttachBasisAngle(occupant, direction)) : 0.0f;
+        const float yawB = haveBearing ? WrapYaw(spanBearing - AttachBasisAngle(otherPole, direction)) : 0.0f;
         const bool rebuildGeometry = HasAttachPointCustomization(occupant, direction) ||
                                      HasAttachPointCustomization(otherPole, direction) ||
                                      (appearance != nullptr && appearance->hasSagCustomization) ||
-                                     std::fabs(yawDelta) > kYawEpsilonRadians;
+                                     std::fabs(yawA) > kYawEpsilonRadians ||
+                                     std::fabs(yawB) > kYawEpsilonRadians;
         if (rebuildGeometry) {
             ClearConnectionPolylines(entry);
             for (uint32_t i = 0; i < count; ++i) {
-                const AttachPoint a = GetAttachPoint(occupant, direction, i, yawDelta);
-                const AttachPoint b = GetAttachPoint(otherPole, direction, i, yawDelta);
+                const AttachPoint a = GetAttachPoint(occupant, direction, i, yawA);
+                const AttachPoint b = GetAttachPoint(otherPole, direction, i, yawB);
                 const float sagScale = appearance ? appearance->SagScale(i) : 1.0f;
                 const float maximumSag = appearance ? appearance->MaximumSag(i) :
                                                       std::numeric_limits<float>::infinity();
@@ -1159,14 +1260,86 @@ namespace {
     // section. EDI at the call site already holds the direction mask (0-15); pushed as the sole
     // __cdecl argument.
     // ------------------------------------------------------------------
-    uint32_t __cdecl ResolvePoleInstanceForDirectionMask(const uint32_t directionMask) noexcept {
-        const auto* const vanillaTable = reinterpret_cast<const uint32_t*>(kPowerPoleForDirectionsFlag);
-        const uint32_t mask = directionMask & 0xF;
+    // Regular (non-FAR) resolution: the active style's entry for this mask, else vanilla.
+    uint32_t ResolveRegularInstance(const uint32_t mask, const uint32_t* const vanillaTable) noexcept {
         if (gActiveStyleIndex == 0 || gActiveStyleIndex > gStyles.size()) {
             return vanillaTable[mask];
         }
         const PoleStyle& style = gStyles[gActiveStyleIndex - 1];
         return style.hasMask[mask] ? style.instanceByDirectionMask[mask] : vanillaTable[mask];
+    }
+
+    // Debug logging for FAR model selection. Logs only when the (heading, mask, resolved instance)
+    // tuple changes, so a whole drag of identical mid-line poles logs once, and endpoints/junctions
+    // that resolve differently log again. noexcept: the whole resolver path is noexcept, so the
+    // formatting call is wrapped -- a logging failure must never propagate into the engine's placement
+    // loop. Remove this and its call sites once the orient->model mapping is confirmed in-game.
+    void LogFarModelSelection(const uint32_t headingIndex, const uint32_t mask, const uint32_t resolved,
+                              const char* const source) noexcept {
+        static uint32_t lastHeading = 0xFFFFFFFFu;
+        static uint32_t lastMask = 0xFFFFFFFFu;
+        static uint32_t lastResolved = 0xFFFFFFFFu;
+        if (headingIndex == lastHeading && mask == lastMask && resolved == lastResolved) {
+            return;
+        }
+        lastHeading = headingIndex;
+        lastMask = mask;
+        lastResolved = resolved;
+        try {
+            const uint32_t ratioIndex = std::min(headingIndex / kFarOrientCount,
+                                                 static_cast<uint32_t>(kFarRatios.size() - 1));
+            const uint32_t orient = headingIndex % kFarOrientCount;
+            const FarRatio& r = kFarRatios[ratioIndex];
+            const double slopeDeg = std::atan2(static_cast<double>(r.rise), static_cast<double>(r.run)) *
+                                    180.0 / 3.14159265358979323846;
+            LOG_INFO("PowerPoleCustomization: [FAR] model select FAR-{}.{} (slope {:.1f} deg, mask 0x{:X}{}) "
+                     "-> pole instance 0x{:08X} [{}].",
+                     kFarRatioLabels[ratioIndex], FarOrientName(orient), slopeDeg, mask,
+                     mask == 0x8 ? " => engine +90 deg quarter-turn" : " => no engine turn",
+                     resolved, source);
+        } catch (...) {
+        }
+    }
+
+    // FAR resolution order (docs/far-power-lines-design.md): the exact FAR key in the active style,
+    // then in the [PowerPoles.FAR] default section, then the active style's regular entry for the
+    // mask the span already classifies to, then the vanilla instance. Sparse tables therefore
+    // degrade gracefully without unexpectedly changing pole family before the final fallback.
+    uint32_t ResolveFarInstance(const uint32_t headingIndex, const uint32_t mask,
+                                const uint32_t* const vanillaTable) noexcept {
+        if (headingIndex < kFarHeadingCount) {
+            if (gActiveStyleIndex >= 1 && gActiveStyleIndex <= gStyles.size()) {
+                const PoleStyle& style = gStyles[gActiveStyleIndex - 1];
+                if (style.hasFarHeading[headingIndex]) {
+                    const uint32_t resolved = style.farInstanceByHeading[headingIndex];
+                    LogFarModelSelection(headingIndex, mask, resolved, "active style");
+                    return resolved;
+                }
+            }
+            if (gHasFarDefault && gFarDefaultStyle.hasFarHeading[headingIndex]) {
+                const uint32_t resolved = gFarDefaultStyle.farInstanceByHeading[headingIndex];
+                LogFarModelSelection(headingIndex, mask, resolved, "[PowerPoles.FAR] default");
+                return resolved;
+            }
+        }
+        const uint32_t resolved = ResolveRegularInstance(mask, vanillaTable);
+        LogFarModelSelection(headingIndex, mask, resolved, "REG/vanilla fallback (no FAR key)");
+        return resolved;
+    }
+
+    uint32_t __cdecl ResolvePoleInstanceForDirectionMask(const uint32_t directionMask) noexcept {
+        const auto* const vanillaTable = reinterpret_cast<const uint32_t*>(kPowerPoleForDirectionsFlag);
+        const uint32_t mask = directionMask & 0xF;
+        // A clean lone-diagonal pole placed during an active FAR drag routes to the FAR model for
+        // the drag's exact (ratio, orientation). Junctions/merges (multi-bit masks) and every
+        // regular drag stay on the regular path -- FAR buckets apply only to clean two-connection
+        // mid-line poles (docs/far-power-lines-design.md). Any FAR span classifies as diagonal
+        // (Get0To3Direction returns 1 or 3), so its lone-direction mask is exactly 0x2 or 0x8.
+        if (gFarDragActive && (mask == 0x2 || mask == 0x8)) {
+            const uint32_t headingIndex = gFarDragRatioIndex * kFarOrientCount + gFarDragOrient;
+            return ResolveFarInstance(headingIndex, mask, vanillaTable);
+        }
+        return ResolveRegularInstance(mask, vanillaTable);
     }
 
 #if defined(_MSC_VER) && defined(_M_IX86)
@@ -1726,20 +1899,26 @@ namespace {
         steps.push_back(DraggedStep{static_cast<uint32_t>(cells.size()), static_cast<uint32_t>(cells.size()), 0});
         cells.push_back(terminal);
 
-        // Fake straight drag along +/-x from the anchor, sized so vanilla allocates at least as
-        // many cells (and therefore steps: a straight drag makes one step per cell) as we need.
+        // Fake straight drag sized so vanilla allocates at least as many cells (and therefore steps:
+        // a straight drag makes one step per cell) as we need. Every allocated cell is overwritten
+        // below, so the fake anchor is irrelevant to the result -- anchor it at the map edge instead
+        // of the real `start` so a run of `totalCells` fits whenever the route length is within a map
+        // dimension. A center anchor has too little clearance on either side and forced a fallback.
         const auto totalCells = static_cast<uint32_t>(cells.size());
-        uint32_t fakeEnd[2] = {0, start[1]};
-        if (start[0] + totalCells - 1 < cityCellsX) {
-            fakeEnd[0] = start[0] + totalCells - 1;
-        } else if (start[0] >= totalCells - 1) {
-            fakeEnd[0] = start[0] - (totalCells - 1);
+        uint32_t fakeStart[2];
+        uint32_t fakeEnd[2];
+        if (totalCells <= cityCellsX) {
+            fakeStart[0] = 0;         fakeStart[1] = start[1];
+            fakeEnd[0] = totalCells - 1; fakeEnd[1] = start[1];
+        } else if (totalCells <= cityCellsZ) {
+            fakeStart[0] = start[0];  fakeStart[1] = 0;
+            fakeEnd[0] = start[0];    fakeEnd[1] = totalCells - 1;
         } else {
-            LOG_WARN("PowerPoleCustomization: [FAR PoC] no straight run of {} cells fits at x={} "
-                     "(city width {}); falling back to vanilla drag.", totalCells, start[0], cityCellsX);
+            LOG_WARN("PowerPoleCustomization: [FAR PoC] route needs {} cells, exceeds city bounds "
+                     "({}x{}); falling back to vanilla drag.", totalCells, cityCellsX, cityCellsZ);
             return original(tool, start, end, straightOnly, networkType);
         }
-        if (original(tool, start, fakeEnd, straightOnly, networkType) == 0) {
+        if (original(tool, fakeStart, fakeEnd, straightOnly, networkType) == 0) {
             LOG_WARN("PowerPoleCustomization: [FAR PoC] vanilla allocation drag failed; falling back.");
             return original(tool, start, end, straightOnly, networkType);
         }
@@ -1791,6 +1970,30 @@ namespace {
         // consume it, so the FAR snap must do the same.
         end[0] = terminal.x;
         end[1] = terminal.z;
+        // Record the exact heading so CreatePowerPole's resolver can pick the FAR model. Orientation
+        // is fixed by which axis is major and whether the major/minor steps share sign (the +x,+z /
+        // -x,-z family vs the +x,-z / -x,+z family). majorSign/minorSign share sign exactly when the
+        // span runs into the sign-agreeing diagonal, matching Get0To3Direction's 1-vs-3 split.
+        const bool signsAgree = majorSign == minorSign;
+        gFarDragOrient = majorIsX ? (signsAgree ? kFarOrientXP : kFarOrientXN)
+                                  : (signsAgree ? kFarOrientZP : kFarOrientZN);
+        gFarDragRatioIndex = snapCandidate - 1; // snapCandidate 1..N maps to kFarRatios 0..N-1
+
+        // Debug: report when the drag snaps to a different FAR heading than last time. Pairs with the
+        // per-pole model-select log in ResolveFarInstance so a bad orientation can be traced from the
+        // heading the drag chose to the pole instance it resolved to. Remove once confirmed in-game.
+        static uint32_t lastLoggedDragHeading = 0xFFFFFFFFu;
+        const uint32_t dragHeading = gFarDragRatioIndex * kFarOrientCount + gFarDragOrient;
+        if (dragHeading != lastLoggedDragHeading) {
+            lastLoggedDragHeading = dragHeading;
+            const double slopeDeg = std::atan2(static_cast<double>(ratio.rise),
+                                               static_cast<double>(ratio.run)) * 180.0 / 3.14159265358979323846;
+            LOG_INFO("PowerPoleCustomization: [FAR] drag snapped to FAR-{}.{} (slope {:.1f} deg, {}-major, "
+                     "run/rise={}/{}, majorSign={}, minorSign={}).",
+                     kFarRatioLabels[gFarDragRatioIndex], FarOrientName(gFarDragOrient), slopeDeg,
+                     majorIsX ? "x" : "z", ratio.run, ratio.rise, majorSign, minorSign);
+        }
+
         gFarDragActive = true;
         gFarDragRun = ratio.run;
         return 1;
@@ -1849,8 +2052,55 @@ namespace {
         "reg.z+dn", "reg.x+z+dn", "reg.dp+z+dn", "reg.x+dp+z+dn",
     }};
 
+    // FAR heading keys, index = ratioIndex * kFarOrientCount + orient (same layout as
+    // PoleStyle::farInstanceByHeading and the gFarDragRatioIndex/gFarDragOrient pair). Ratio order
+    // matches kFarRatios (1.5, 2, 3, 6); orientation order matches the FarOrient enum (XP,XN,ZP,ZN).
+    constexpr std::array<std::string_view, kFarHeadingCount> kFarHeadingKeys = {{
+        "far-1.5.xp", "far-1.5.xn", "far-1.5.zp", "far-1.5.zn",
+        "far-2.xp",   "far-2.xn",   "far-2.zp",   "far-2.zn",
+        "far-3.xp",   "far-3.xn",   "far-3.zp",   "far-3.zn",
+        "far-6.xp",   "far-6.xn",   "far-6.zp",   "far-6.zn",
+    }};
+
+    // Parses every FAR-<ratio>.<orient> key present in a section into the style's FAR table. Returns
+    // the number of valid keys read. Shared by named styles and the [PowerPoles.FAR] default section.
+    uint32_t ParseFarHeadingKeys(const mINI::INIMap<std::string>& section, PoleStyle& style,
+                                 const std::string& sectionLabel) {
+        uint32_t count = 0;
+        for (uint32_t i = 0; i < kFarHeadingCount; ++i) {
+            const std::string key(kFarHeadingKeys[i]);
+            if (!section.has(key)) {
+                continue;
+            }
+            uint32_t instanceId = 0;
+            if (!TryParseHexUInt32(section.get(key), instanceId)) {
+                LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] {} has invalid hexadecimal instance "
+                         "ID \"{}\"; ignoring it.", sectionLabel, key, section.get(key));
+                continue;
+            }
+            style.farInstanceByHeading[i] = instanceId;
+            style.hasFarHeading[i] = true;
+            ++count;
+        }
+        return count;
+    }
+
+    // Warns about far-* keys that aren't one of the 16 canonical headings (typo/wrong ratio/orient).
+    void WarnUnknownFarKeys(const mINI::INIMap<std::string>& section, const std::string& sectionLabel) {
+        for (const auto& entry : section) {
+            const std::string& key = entry.first;
+            if (key.starts_with("far-") &&
+                std::ranges::find(kFarHeadingKeys, key) == kFarHeadingKeys.end()) {
+                LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] unknown FAR heading key {}; expected "
+                         "far-<1.5|2|3|6>.<xp|xn|zp|zn>. Ignoring it.", sectionLabel, key);
+            }
+        }
+    }
+
     void LoadPoleStyles(const mINI::INIStructure& ini) {
         gStyles.clear();
+        gFarDefaultStyle = PoleStyle{};
+        gHasFarDefault = false;
         constexpr std::string_view kPrefix = "powerpoles.";
         for (const auto& [sectionName, section] : ini) {
             std::string lowerName = sectionName;
@@ -1859,8 +2109,26 @@ namespace {
                 continue;
             }
 
+            const std::string styleName = sectionName.substr(kPrefix.size());
+
+            // [PowerPoles.FAR] is not a cyclable style: it's the style-independent FAR fallback.
+            // Parse only its FAR headings and never push it into gStyles.
+            if (lowerName == "powerpoles.far") {
+                const uint32_t farCount = ParseFarHeadingKeys(section, gFarDefaultStyle, styleName);
+                WarnUnknownFarKeys(section, styleName);
+                if (farCount > 0) {
+                    gHasFarDefault = true;
+                    LOG_INFO("PowerPoleCustomization: loaded [PowerPoles.FAR] default ({} of {} FAR "
+                             "headings defined).", farCount, kFarHeadingCount);
+                } else {
+                    LOG_WARN("PowerPoleCustomization: [PowerPoles.FAR] defines no valid FAR headings; "
+                             "ignoring the section.");
+                }
+                continue;
+            }
+
             PoleStyle style;
-            style.name = sectionName.substr(kPrefix.size());
+            style.name = styleName;
             uint32_t definedCount = 0;
             for (uint32_t mask = 0; mask < 16; ++mask) {
                 const std::string key(kRegularDirectionKeys[mask]);
@@ -1877,6 +2145,8 @@ namespace {
                 }
             }
 
+            const uint32_t farCount = ParseFarHeadingKeys(section, style, style.name);
+
             for (const auto& entry : section) {
                 const std::string& key = entry.first;
                 if (key.starts_with("0x")) {
@@ -1888,19 +2158,21 @@ namespace {
                              "direction key {}; ignoring it.", style.name, key);
                 }
             }
+            WarnUnknownFarKeys(section, style.name);
             if (section.has("InterPoleDistance")) {
                 const uint32_t d = std::clamp(ParseUInt32(section.get("InterPoleDistance"), 0u), 1u, kMaxInterPoleDistance);
                 style.maxCellsBetweenPoles = d;
                 style.hasMaxCells = true;
             }
 
-            if (definedCount == 0 && !style.hasMaxCells) {
-                LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] defines no valid REG.* keys or "
+            if (definedCount == 0 && farCount == 0 && !style.hasMaxCells) {
+                LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] defines no valid REG.*/FAR.* keys or "
                          "InterPoleDistance; skipping.", style.name);
                 continue;
             }
-            LOG_INFO("PowerPoleCustomization: loaded pole style \"{}\" ({} of 16 direction masks defined, "
-                     "rest fall back to vanilla; InterPoleDistance={}).", style.name, definedCount,
+            LOG_INFO("PowerPoleCustomization: loaded pole style \"{}\" ({} of 16 direction masks, {} of {} "
+                     "FAR headings defined; rest fall back; InterPoleDistance={}).", style.name, definedCount,
+                     farCount, kFarHeadingCount,
                      style.hasMaxCells ? std::to_string(style.maxCellsBetweenPoles) : std::string("vanilla"));
             gStyles.push_back(std::move(style));
         }
@@ -1909,6 +2181,8 @@ namespace {
     void LoadSettings() {
         gSettings = {};
         gStyles.clear();
+        gFarDefaultStyle = PoleStyle{};
+        gHasFarDefault = false;
         gActiveStyleIndex = 0;
         const auto settingsPath = GetDllDirectoryPath() / "SC4PowerPoleCustomization.ini";
         mINI::INIFile file(settingsPath.string());

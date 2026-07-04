@@ -1,8 +1,29 @@
 # FAR power lines — style-table design note
 
-Status: FAR model-routing design only (2026-07-03). Automatic FAR dragging, Shift-constrained
-regular dragging, attach-point true-bearing rotation, and named `REG.*` parsing are implemented.
-Named `FAR-*` model routing is not.
+Status: FAR model routing implemented (2026-07-04). Automatic FAR dragging, Shift-constrained
+regular dragging, attach-point true-bearing rotation, and named `REG.*` parsing were already in.
+Now added: named `FAR-<ratio>.<orient>` parsing + a `[PowerPoles.FAR]` default section
+(`ParseFarHeadingKeys`), the resolution-order lookup (`ResolveFarInstance`), drag-time heading
+capture (`gFarDragRatioIndex`/`gFarDragOrient`) feeding `ResolvePoleInstanceForDirectionMask`, and
+the per-endpoint attach-yaw refactor with an optional `kPropAttachBasisDegrees` exemplar property
+(`ComputeSpanBearing`/`AttachBasisAngle`, replacing the single `ComputeYawDelta`). Not yet done:
+in-game verification, and authoring pole prop exemplars that point the `FAR-*` keys at real angled
+S3D art.
+
+## Art source found (2026-07-04)
+
+`Documents/SimCity 4/Plugins/P3/MTO_P3_01` (the "P3" set) contains complete FAR-angle power-pole
+meshes: e.g. `MTO_P3_01_03_NL266` = *"P3 138 kV Wood H-Frame Pole Single-Circuit 26.6-degree
+Tangent"* (a straight FAR-2 run pole), plus turn/transition pieces (`TL266L634` etc.) and an FA3
+(18.4-degree) set. Meshes live in `MTO_P3_ModelsVol01` (S3D group `0x5AD0E817`); the P3 exemplars
+reference them via `ResourceKeyType1`. They are authored as **plop lots** (Exemplar Type 0x02, group
+`0x1E78397A`) -- the classic can't-drag-FAR workaround this feature removes -- not as pole props in
+the power-pole group. To wire `FAR-*` routing to this art, author prop exemplars in the pole group
+whose RKT1 points at the same P3 S3D model TGIs, then name those instance IDs in the `FAR-*` keys.
+These P3 models carry no custom attach-point properties, so a routed pole uses the vanilla diagonal
+attach table (nominal 45-degree basis) and the existing single-basis yaw rotation already aligns its
+cables; `kPropAttachBasisDegrees` is only needed if a future exemplar bakes attach points in the FAR
+basis itself.
 
 ## What already works without new data
 
