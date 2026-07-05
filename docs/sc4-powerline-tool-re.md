@@ -969,17 +969,20 @@ Escape (`0x1b`); Tab is unclaimed.
 
 Because that vtable is shared, a slot patch is **not** auto-scoped like the power-tool-specific
 `DrawNetworkLine` slot (`0x00aa9f78` in vtable `0x00aa9f30`). The hook runtime-gates on the active
-subtool:
+network type, which the input control caches at **`+0x50`**:
 
-- The input control stores the **active subtool pointer at `+0x4c`** (confirmed via `Init`
-  `0x00662160` and `OnMouseDownL` `0x00661ee0`, which forward events to `*(this+0x4c)`;
-  `*(this+0x50)` is the network-type id fed to `SL::NetworkManager`).
-- The active subtool's own primary vtable is the power tool's **`0x00aa9f30`**
-  (`cSC4PowerLineTool::cSC4PowerLineTool` `0x006503c0` installs it and calls the `cSC4NetworkTool`
-  base ctor with **network type 5**).
-- Gate = `*(control) == 0x00aab008 && *(*(control+0x4c)) == 0x00aa9f30`.
+- `*(this+0x50)` is the network-type id fed to `SL::NetworkManager` in `Init` (`0x00662160`). The
+  power line tool is **network type 5** (`cSC4PowerLineTool::cSC4PowerLineTool` `0x006503c0` calls
+  the `cSC4NetworkTool` base ctor with 5).
+- Gate = `*(control) == 0x00aab008 && *(uint32*)(control + 0x50) == 5`.
 
-Both vtable addresses are byte-validated at install time (the OnKeyDown slot patch confirms
-`0x00aab008` transitively; the FAR `DrawNetworkLine` patch confirms `0x00aa9f30`), so the DLL only
-trusts the runtime gate — and only registers the optional status overlay — when both are confirmed
-on the live binary. See `docs/power-line-style-ui-design.md` for the full UI design.
+**In-game correction (2026-07-05):** the input control's `+0x4c` pointer (used by `Init`/
+`OnMouseDownL` `0x00661ee0`) is a shared **`cSC4NetworkToolUI`** (vtable `0x00aa9140`), *not* the
+`cSC4PowerLineTool` object — so an initial gate comparing `*(*(control+0x4c))` to the power tool's
+`0x00aa9f30` read `powerActive=false` and was wrong. The `+0x50` network-type enum is the correct
+discriminator and is address-independent, so it survives a recompile that moves vtables.
+
+The one address in the gate (`0x00aab008`) is byte-validated at install (the OnKeyDown slot patch at
+`0x00aab040` confirms it transitively), so the DLL only trusts the runtime gate — and only registers
+the optional status overlay — when it is confirmed on the live binary. See
+`docs/power-line-style-ui-design.md` for the full UI design.

@@ -31,10 +31,6 @@
 // point, tessellation, and vector-insert helpers as vanilla. A separate validated inline lookup
 // supplies per-wire width while leaving the rest of DrawPowerlines intact. This revision still
 // requires its in-game verification pass -- see "Known gaps" at the bottom of this file.
-//
-// TEMPORARY PoC-ONLY ADDITION: a "polelinetest" cheat code (search kCheatPoleLineTest) that
-// bypasses exemplar properties so the strand-count/rebuild path can be tested in isolation with
-// zero new art/exemplars -- place or reload a power pole after toggling the cheat.
 
 #include "cIGZCOM.h"
 #include "cIGZCheatCodeManager.h"
@@ -92,24 +88,9 @@ namespace {
     constexpr uint16_t kSupportedGameVersion = 641;
     constexpr uint32_t kCheatCodeMessageType = 0x230E27AC; // fixed SC4 message type, same constant every sample uses
 
-    // ------------------------------------------------------------------
-    // TEMPORARY PoC-ONLY cheat code: "polelinetest". See docs/sc4-powerline-tool-re.md's PoC plan
-    // (step 4). The production exemplar path is implemented but still needs its first in-game
-    // validation pass. This cheat keeps geometry/count rebuilding testable independently: while
-    // active, every pole that goes through
-    // InitConnectionPointsHook (i.e. newly placed or reloaded poles) gets a synthetic multi-point
-    // override built from ITS OWN already-baked vanilla attach point (duplicated N times, no new
-    // art/exemplar needed). This isolates testing of the strand-count/append path (AppendPolylineToConnection)
-    // from the exemplar-reading path. Toggle off, then delete this whole block (and the
-    // gSyntheticTestModeEnabled branch in InitConnectionPointsHook) once in-game verification is done.
-    // ------------------------------------------------------------------
-    constexpr uint32_t kCheatPoleLineTest = 0xB07E1000;
-
     // Experimental, deliberately runtime-scoped switch: while enabled, the lot developer's
     // ClearLotBlockingObjects loop leaves power-pole and hidden power-line occupants alone.
     constexpr uint32_t kCheatKeepWires = 0xB07E1002;
-    constexpr uint32_t kSyntheticTestPointCount = 6; // > vanilla's 4, so it's obvious if extras render
-    bool gSyntheticTestModeEnabled = false;
     bool gKeepWiresOnZoneChange = false;
 
     // ------------------------------------------------------------------
@@ -395,12 +376,6 @@ namespace {
     constexpr uintptr_t kUpdateOnZoneChange = 0x006522f0;
     constexpr uintptr_t kUpdateOnZoneChangeResume = 0x006522f7;
 
-    // Diagnostic boundary for the disproven lot-clear-only hypothesis. Shutdown disconnects a
-    // hidden cSC4PowerLineOccupant from both endpoint poles before chaining to cSC4Occupant.
-    // This vtable slot observes the actual disconnect regardless of which subsystem requested it.
-    constexpr uintptr_t kPowerLineOccupantShutdownSlot = 0x00aa9c08;
-    constexpr uintptr_t kPowerLineOccupantShutdown = 0x00649270;
-
     // ------------------------------------------------------------------
     // Tab / Shift-Tab pole-style switch. Keyboard input for every network tool is dispatched by the
     // shared cSC4ViewInputControlNetworkTool (vtable 0x00aab008, confirmed by decompile). Its
@@ -408,23 +383,19 @@ namespace {
     // holds the OnKeyDown body 0x00661e90. Vanilla OnKeyDown only reacts to Escape (0x1b), so Tab is
     // unclaimed here. Because the vtable is shared across road/rail/street/power, the slot patch is
     // NOT auto-scoped the way the DrawNetworkLine patch was -- it must runtime-gate on the active
-    // subtool being the power tool. The input control keeps the active subtool pointer at +0x4c
-    // (confirmed via Init/OnMouseDownL forwarding), and that subtool's own primary vtable is the
-    // power tool's 0x00aa9f30 (= kPowerToolDrawNetworkLineSlot - 0x48). Comparing it is exact and
-    // independent of the network-type enum. See docs/power-line-style-ui-design.md.
+    // network type. The input control stores the current network type at +0x50 (fed to
+    // SL::NetworkManager in Init); the power line tool is network type 5 (cSC4PowerLineTool ctor
+    // calls the cSC4NetworkTool base with 5). That enum -- not a vtable address -- is the runtime
+    // discriminator: stable across rebuilds, and verified in-game. (The +0x4c subtool pointer is a
+    // shared cSC4NetworkToolUI, NOT the power tool object, so a vtable compare there was wrong.)
+    // See docs/power-line-style-ui-design.md.
     constexpr uintptr_t kNetworkToolInputControlVtable = 0x00aab008;
-    constexpr uintptr_t kOnKeyDownSlot = 0x00aab040;           // vtable + 0x38 (interface slot 14)
-    constexpr uintptr_t kOnKeyDown = 0x00661e90;               // cSC4ViewInputControlNetworkTool::OnKeyDown
-    constexpr uintptr_t kPowerToolPrimaryVtable = 0x00aa9f30;  // == kPowerToolDrawNetworkLineSlot - 0x48
-    constexpr uint32_t kIC_ActiveSubtool = 0x4c;               // cSC4ViewInputControlNetworkTool -> active cSC4NetworkTool*
-    // The input control stores the current network type at +0x50 (fed to SL::NetworkManager in Init).
-    // Power line tool == network type 5 (cSC4PowerLineTool ctor calls cSC4NetworkTool base with 5).
-    // This is the runtime power-vs-other-network-tool discriminator (a stable enum, not an address).
-    constexpr uint32_t kIC_NetworkType = 0x50;
+    constexpr uintptr_t kOnKeyDownSlot = 0x00aab040;   // vtable + 0x38 (interface slot 14)
+    constexpr uintptr_t kOnKeyDown = 0x00661e90;       // cSC4ViewInputControlNetworkTool::OnKeyDown
+    constexpr uint32_t kIC_NetworkType = 0x50;         // current network type on the input control
     constexpr uint32_t kNetworkTypePower = 5;
     constexpr uint32_t kVkTab = 0x09;
     static_assert(kOnKeyDownSlot == kNetworkToolInputControlVtable + 0x38);
-    static_assert(kPowerToolPrimaryVtable == kPowerToolDrawNetworkLineSlot - 0x48);
 
     // View3D acquisition (for overlay visibility only; same window IDs plop-and-paint uses).
     constexpr uint32_t kGZWin_WinSC4App = 0x6104489A;
@@ -851,35 +822,6 @@ namespace {
         return any;
     }
 
-    // TEMPORARY PoC-ONLY. See the block comment above kCheatPoleLineTest. Duplicates this pole's
-    // own already-baked vanilla attach point (read raw, before position translation -- matches
-    // what GetAttachPoint()/PoleAttachOverride expect to store) kSyntheticTestPointCount times per
-    // direction. Requires the real InitConnectionPoints call to have already run for this pole
-    // (true in InitConnectionPointsHook, which calls `original(occupant)` first).
-    //
-    // Y offset deliberately large (not a subtle +0.5/index): appended strands rendering with no
-    // errors and no crash but "not visible" (2026-07-01) is ambiguous between "nothing is actually
-    // drawing" and "it's drawing but subtly overlapping the vanilla wires" -- a huge, obvious offset
-    // turns that into a clean yes/no (a wire floating tens of units in the air is unmissable if it
-    // renders at all). Shrink back down once that's answered.
-    PoleAttachOverride BuildSyntheticTestOverride(void* occupant) {
-        PoleAttachOverride result;
-        auto* const base = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(occupant) + kOccupant_ConnectionPointTablePtr);
-        if (base == nullptr) {
-            return result;
-        }
-
-        for (uint32_t direction = 0; direction < 4; ++direction) {
-            const auto* const vanillaPoint = reinterpret_cast<const float*>(base + (direction & 3) * kVanillaDirectionStrideBytes);
-            result.perDirection[direction].reserve(kSyntheticTestPointCount);
-            for (uint32_t i = 0; i < kSyntheticTestPointCount; ++i) {
-                result.perDirection[direction].push_back(AttachPoint{
-                    vanillaPoint[0], vanillaPoint[1] + static_cast<float>(i) * 20.0f, vanillaPoint[2]});
-            }
-        }
-        return result;
-    }
-
     // ------------------------------------------------------------------
     // Attach-point yaw alignment. Vanilla stores attach offsets baked for exactly 4 nominal span
     // orientations (Get0To3Direction) and applies them with a flat translation add -- no rotation
@@ -1266,7 +1208,7 @@ namespace {
                                                       std::numeric_limits<float>::infinity();
                 AppendPolylineToConnection(entry, a, b, sagScale, maximumSag);
             }
-            LOG_INFO("PowerPoleCustomization: rebuilt {} strands in direction {} for connection {} -> {}.",
+            LOG_DEBUG("PowerPoleCustomization: rebuilt {} strands in direction {} for connection {} -> {}.",
                      count, direction, occupant, otherPole);
         }
         RegisterConnectionWidths(occupant, entry, appearance);
@@ -1390,7 +1332,7 @@ namespace {
             const FarRatio& r = kFarRatios[ratioIndex];
             const double slopeDeg = std::atan2(static_cast<double>(r.rise), static_cast<double>(r.run)) *
                                     180.0 / 3.14159265358979323846;
-            LOG_INFO("PowerPoleCustomization: [FAR] model select FAR-{}.{} (slope {:.1f} deg, mask 0x{:X}{}) "
+            LOG_DEBUG("PowerPoleCustomization: [FAR] model select FAR-{}.{} (slope {:.1f} deg, mask 0x{:X}{}) "
                      "-> pole instance 0x{:08X} [{}].",
                      kFarRatioLabels[ratioIndex], FarOrientName(orient), slopeDeg, mask,
                      mask == 0x8 ? " => engine +90 deg quarter-turn" : " => no engine turn",
@@ -1697,15 +1639,6 @@ namespace {
             return;
         }
 
-        // TEMPORARY PoC-ONLY: bypasses exemplar data so geometry/count rebuilding can still be
-        // tested with vanilla assets. Delete once the production path has completed its in-game run.
-        if (gSyntheticTestModeEnabled) {
-            gOverrides[occupant] = BuildSyntheticTestOverride(occupant);
-            LOG_INFO("PowerPoleCustomization: [TEST MODE] injected {}-point synthetic override for pole {}.",
-                     kSyntheticTestPointCount, occupant);
-            return;
-        }
-
         // cSC4PowerPoleOccupant::QueryInterface delegates through cSC4Occupant to
         // cSCExemplarPropertyHolder. Windows 1.1.641 confirms IID 0x0AC2B5F7 returns the adjusted
         // public cISCExemplarPropertyHolder interface whose +0x10 slot is GetDefaultExemplar().
@@ -1781,17 +1714,6 @@ namespace {
         const auto original = reinterpret_cast<DeterminePolePositionsFn>(kDeterminePolePositions);
         original(tool);
         *field = saved; // restore vanilla; the placement loop is this field's only reader
-    }
-
-    using PowerLineOccupantShutdownFn = void(__thiscall*)(void* occupantInterface);
-
-    void __fastcall PowerLineOccupantShutdownHook(void* occupantInterface, void* /*edx*/) {
-        if (gKeepWiresOnZoneChange) {
-            // This is the occupant-shared subobject at complete-object +4.
-            LOG_INFO("PowerPoleCustomization: [keepwires] power-line occupant {} is being shut down "
-                     "and disconnected from its poles.", occupantInterface);
-        }
-        reinterpret_cast<PowerLineOccupantShutdownFn>(kPowerLineOccupantShutdown)(occupantInterface);
     }
 
     // ------------------------------------------------------------------
@@ -2089,16 +2011,16 @@ namespace {
                                   : (signsAgree ? kFarOrientZP : kFarOrientZN);
         gFarDragRatioIndex = snapCandidate - 1; // snapCandidate 1..N maps to kFarRatios 0..N-1
 
-        // Debug: report when the drag snaps to a different FAR heading than last time. Pairs with the
-        // per-pole model-select log in ResolveFarInstance so a bad orientation can be traced from the
-        // heading the drag chose to the pole instance it resolved to. Remove once confirmed in-game.
+        // Debug trace (silent at the default info level): report when the drag snaps to a different
+        // FAR heading than last time. Pairs with the per-pole model-select trace in ResolveFarInstance
+        // so a bad orientation can be traced from the heading the drag chose to the resolved instance.
         static uint32_t lastLoggedDragHeading = 0xFFFFFFFFu;
         const uint32_t dragHeading = gFarDragRatioIndex * kFarOrientCount + gFarDragOrient;
         if (dragHeading != lastLoggedDragHeading) {
             lastLoggedDragHeading = dragHeading;
             const double slopeDeg = std::atan2(static_cast<double>(ratio.rise),
                                                static_cast<double>(ratio.run)) * 180.0 / 3.14159265358979323846;
-            LOG_INFO("PowerPoleCustomization: [FAR] drag snapped to FAR-{}.{} (slope {:.1f} deg, {}-major, "
+            LOG_DEBUG("PowerPoleCustomization: [FAR] drag snapped to FAR-{}.{} (slope {:.1f} deg, {}-major, "
                      "run/rise={}/{}, majorSign={}, minorSign={}).",
                      kFarRatioLabels[gFarDragRatioIndex], FarOrientName(gFarDragOrient), slopeDeg,
                      majorIsX ? "x" : "z", ratio.run, ratio.rise, majorSign, minorSign);
@@ -2153,18 +2075,6 @@ namespace {
     // with a throwaway edx). Consumes Tab only while the power tool is the active network subtool;
     // everything else -- including Tab under road/rail/street -- falls through to vanilla untouched.
     uint8_t __fastcall OnKeyDownHook(void* control, void* /*edx*/, int vkCode, uint32_t modifiers) {
-        // TEMP DIAGNOSTIC (remove once Tab confirmed): on Tab, dump the raw identity fields so the
-        // network-type gate can be verified against the live object.
-        if (vkCode == static_cast<int>(kVkTab) && control != nullptr) {
-            const uint32_t ctrlVtbl = *reinterpret_cast<uint32_t*>(control);
-            const uint32_t netType = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(control) + kIC_NetworkType);
-            const uint32_t sub = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(control) + kIC_ActiveSubtool);
-            const uint32_t subVtbl = sub != 0 ? *reinterpret_cast<uint32_t*>(sub) : 0;
-            LOG_INFO("PowerPoleCustomization: [keydbg] Tab ctrlVtbl=0x{:08X} netType={} sub=0x{:08X} "
-                     "subVtbl=0x{:08X} powerActive={}", ctrlVtbl, netType, sub, subVtbl,
-                     IsNetworkControlDrivingPowerTool(control));
-        }
-
         if (gSettings.enabled && vkCode == static_cast<int>(kVkTab) &&
             IsNetworkControlDrivingPowerTool(control)) {
             const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -2595,14 +2505,9 @@ public:
         installed += keepWiresPatch_.Install(kUpdateOnZoneChange,
             {0x83, 0xec, 0x68, 0x8b, 0x44, 0x24, 0x7c}, &KeepWiresOnZoneChangeHook,
             "KeepWiresOnZoneChange") ? 1 : 0;
-        installed += powerLineShutdownPatch_.Install(kPowerLineOccupantShutdownSlot,
-            kPowerLineOccupantShutdown, &PowerLineOccupantShutdownHook,
-            "PowerLineOccupantShutdownDiagnostic") ? 1 : 0;
 
-        // Tab / Shift-Tab pole-style switch. Byte-validates the OnKeyDown slot (which transitively
-        // confirms the network-tool input-control vtable). The overlay is only trusted when BOTH this
-        // and the FAR patch validated, because the overlay's power-tool identity check compares
-        // against both of those vtables.
+        // Tab / Shift-Tab pole-style switch. Byte-validates the OnKeyDown slot, which transitively
+        // confirms the network-tool input-control vtable the overlay's power-tool check also reads.
         const bool keyHookInstalled = onKeyDownPatch_.Install(kOnKeyDownSlot, kOnKeyDown,
                                                               &OnKeyDownHook, "OnKeyDown@NetworkToolInputControl");
         installed += keyHookInstalled ? 1 : 0;
@@ -2611,24 +2516,16 @@ public:
         LOG_INFO("PowerPoleCustomization: installed {} of {} patches.", installed,
                  initConnectionPointsPatches_.size() + kAddConnectionCallSites.size() +
                  kUpdateConnectionCallSites.size() + kDeterminePolePositionsCallSites.size() +
-                 2 + createFloorPatches_.size() + 4 + 2 + 1 + 1 + 1 + 1);
+                 2 + createFloorPatches_.size() + 4 + 2 + 1 + 1 + 1);
 
-        // TEMPORARY PoC-ONLY cheat. See the block comment above kCheatPoleLineTest.
         const cISC4AppPtr app;
         if (app) {
             if (auto* const cheats = app->GetCheatCodeManager()) {
-                if (cheats->RegisterCheatCode(kCheatPoleLineTest, cRZBaseString("polelinetest"))) {
+                if (cheats->RegisterCheatCode(kCheatKeepWires, cRZBaseString("keepwires"))) {
                     cheats->AddNotification2(this, 0);
                     cheatManager_ = cheats;
-                    LOG_INFO("PowerPoleCustomization: [TEST MODE] cheat code registered (polelinetest) "
-                             "-- toggles synthetic {}-point overrides for newly-placed/reloaded poles.",
-                             kSyntheticTestPointCount);
-                } else {
-                    LOG_WARN("PowerPoleCustomization: failed to register cheat code polelinetest.");
-                }
-                if (cheats->RegisterCheatCode(kCheatKeepWires, cRZBaseString("keepwires"))) {
-                    LOG_INFO("PowerPoleCustomization: [TEST MODE] cheat code registered (keepwires) -- "
-                             "toggles suppression of power-line rerouting on zone changes.");
+                    LOG_INFO("PowerPoleCustomization: cheat code registered (keepwires) -- toggles "
+                             "suppression of power-line rerouting on zone changes.");
                 } else {
                     LOG_WARN("PowerPoleCustomization: failed to register cheat code keepwires.");
                 }
@@ -2641,7 +2538,6 @@ public:
 
     bool PostAppShutdown() override {
         if (cheatManager_) {
-            cheatManager_->UnregisterCheatCode(kCheatPoleLineTest);
             cheatManager_->UnregisterCheatCode(kCheatKeepWires);
             cheatManager_->RemoveNotification2(this, 0);
             cheatManager_.Reset();
@@ -2650,7 +2546,6 @@ public:
         onKeyDownPatch_.Uninstall();
         farDrawNetworkLinePatch_.Uninstall();
         keepWiresPatch_.Uninstall();
-        powerLineShutdownPatch_.Uninstall();
         modelInstanceIdPatch_.Uninstall();
         for (auto& patch : initConnectionPointsPatches_) patch.Uninstall();
         for (auto& patch : addConnectionPatches_) patch.Uninstall();
@@ -2676,16 +2571,9 @@ public:
         if (pMsg) {
             auto* const stdMsg = static_cast<cIGZMessage2Standard*>(pMsg);
             if (stdMsg->GetType() == kCheatCodeMessageType &&
-                static_cast<uint32_t>(stdMsg->GetData1()) == kCheatPoleLineTest) {
-                gSyntheticTestModeEnabled = !gSyntheticTestModeEnabled;
-                LOG_INFO("PowerPoleCustomization: [TEST MODE] {} -- place or reload a power pole now "
-                         "to see it take effect (only applies at InitConnectionPoints time).",
-                         gSyntheticTestModeEnabled ? "ENABLED" : "disabled");
-            }
-            if (stdMsg->GetType() == kCheatCodeMessageType &&
                 static_cast<uint32_t>(stdMsg->GetData1()) == kCheatKeepWires) {
                 gKeepWiresOnZoneChange = !gKeepWiresOnZoneChange;
-                LOG_INFO("PowerPoleCustomization: [TEST MODE] keepwires {} -- zone changes {} "
+                LOG_INFO("PowerPoleCustomization: keepwires {} -- zone changes {} "
                          "the power-line remove/reposition/rebuild handler.",
                          gKeepWiresOnZoneChange ? "ENABLED" : "disabled",
                          gKeepWiresOnZoneChange ? "will bypass" : "will run");
@@ -2780,12 +2668,11 @@ private:
     ByteSpanCallPatch keepWiresPatch_{};
     InlineCallPatch wireWidthLookupPatch_{};
     VTableSlotPatch farDrawNetworkLinePatch_{}; // automatic FAR snapping; hold Shift for regular-only
-    VTableSlotPatch powerLineShutdownPatch_{}; // keepwires diagnostic: observes actual cable disconnects
     VTableSlotPatch onKeyDownPatch_{};         // Tab/Shift-Tab pole-style switch
-    bool styleUiValidated_ = false;            // both power-tool identity vtables byte-confirmed at install
+    bool styleUiValidated_ = false;            // OnKeyDown + FAR vtable slots byte-confirmed at install
     cIGZImGuiService* imguiService_ = nullptr; // optional; null when SC4RenderServices/imgui.dll absent
     bool overlayRegistered_ = false;
-    cRZAutoRefCount<cIGZCheatCodeManager> cheatManager_; // TEMPORARY PoC-ONLY, see kCheatPoleLineTest
+    cRZAutoRefCount<cIGZCheatCodeManager> cheatManager_; // holds the keepwires cheat registration
 };
 
 static PowerPoleCustomizationDirector sDirector;

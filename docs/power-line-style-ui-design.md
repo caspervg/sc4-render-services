@@ -14,15 +14,18 @@ working regardless.
   instance, vtable **`0x00aab008`**). `OnKeyDown` body = **`0x00661e90`**, at vtable slot
   **`0x00aab040`** (= `+0x38`, interface slot 14). Vanilla `OnKeyDown` handles only Escape
   (`0x1b`) — Tab is unclaimed, no conflict.
-- The input control keeps the active subtool pointer at **`+0x4c`** (confirmed via `Init`/
-  `OnMouseDownL`, which forward to it). The power tool's own primary vtable is **`0x00aa9f30`**
-  (`cSC4PowerLineTool` ctor `0x006503c0` → `PTR_QueryInterface_00aa9f30`); its ctor calls the
-  `cSC4NetworkTool` base with **network type 5**.
-- Gate = `*(control) == 0x00aab008 && *(*(control+0x4c)) == 0x00aa9f30`. Both vtable addresses are
-  byte-validated at install (the OnKeyDown slot patch confirms `0x00aab008`; the FAR DrawNetworkLine
-  patch confirms `0x00aa9f30`), so the overlay only registers when both are confirmed on the live
-  binary. On a recompiled/other build the install byte-checks fail → no Tab, no overlay, no crash —
-  a self-validating gate that does not rely on the version string alone.
+- The input control stores the **current network type at `+0x50`** (fed to `SL::NetworkManager` in
+  `Init`). The power line tool is **network type 5** (`cSC4PowerLineTool` ctor `0x006503c0` calls the
+  `cSC4NetworkTool` base with 5). This enum is the runtime discriminator.
+- **Verified in-game (2026-07-05):** the `+0x4c` pointer is a shared `cSC4NetworkToolUI` (vtable
+  `0x00aa9140`), **not** the power tool object — an initial vtable-compare gate against the power
+  tool's `0x00aa9f30` therefore read `powerActive=false` and was wrong. The network-type enum is
+  both correct and more rebuild-stable than any address.
+- Gate = `*(control) == 0x00aab008 && *(uint32*)(control + 0x50) == 5`. The one address
+  (`0x00aab008`) is byte-validated at install (the OnKeyDown slot patch at `0x00aab040` confirms it
+  transitively), so the overlay only registers when it is confirmed on the live binary. On a
+  recompiled/other build the byte-check fails → no Tab, no overlay, no crash — a self-validating gate
+  that does not rely on the version string alone.
 
 ## Decisions locked (from review Q&A, 2026-07-05)
 
@@ -76,32 +79,26 @@ subtool (road/rail/street/power) — the power line tool is a subtool of it. Its
   `0x00aa9f30`) was. A raw patch would also intercept Tab while dragging roads/rail/street. **Runtime
   gating is mandatory.**
 
-**Gating recipe.** In the hook, `this` is the `cSC4ViewInputControlNetworkTool` instance. Recover
-the active network subtool it is driving and confirm it is the power tool (network type 5) before
-acting on Tab; forward to the original untouched otherwise. The remaining RE micro-task is to
-confirm *how the input control names its active subtool*:
+**Gating recipe (resolved 2026-07-05).** In the hook, `this` is the `cSC4ViewInputControlNetworkTool`
+instance, which **caches the current network type at `+0x50`** (the value it feeds to
+`SL::NetworkManager` in `Init`). Gate on `*(uint32*)(this + 0x50) == 5`; forward to the original
+untouched otherwise.
 
-- The input control almost certainly holds a pointer to (or is paired with) the active
-  `cSC4NetworkTool`; read that tool and its network type at **`tool+0x35c`** (RE doc §7/§16;
-  power = 5). Alternatively the input control may cache the network type as its own member — check
-  for a `5` written near ctor/activate time.
-- Cross-check against `cISC4View3DWin::GetCurrentViewInputControl()` identity if a direct type read
-  is ambiguous.
-
-Deliverable: the exact field/offset that answers "is the active subtool the power tool?" from a
-`cSC4ViewInputControlNetworkTool*`. Everything else in Part A is settled.
+The initially-planned alternative — reading the active subtool at `+0x4c` and comparing its vtable to
+the power tool's `0x00aa9f30` — was tried and **rejected in-game**: `+0x4c` is a shared
+`cSC4NetworkToolUI` (vtable `0x00aa9140`), not the power tool object, so that compare always read
+false. The `+0x50` network-type enum is both correct and more rebuild-stable than any address.
 
 ### A.3 Hook behavior
 
 ```
-bool __thiscall OnKeyDownHook(void* self, int32_t vkCode, uint32_t modifiers):
-    // Case 2 only: recover tool, bail to original if network type != power(5).
-    if (vkCode == VK_TAB and no Ctrl/Alt):
-        if (modifiers & MOD_SHIFT): CycleStyle(-1)
-        else:                       CycleStyle(+1)
-        RefreshOverlaySnapshot()
-        return true                 // consume; do not let vanilla see Tab
-    return original(self, vkCode, modifiers)
+uint8_t __fastcall OnKeyDownHook(void* control, void* edx, int vkCode, uint32_t modifiers):
+    // Bail to original unless Tab AND the active network type is power (5).
+    if (enabled and vkCode == VK_TAB and *(control) == 0x00aab008 and *(control+0x50) == 5):
+        shift = GetAsyncKeyState(VK_SHIFT) & 0x8000
+        CycleStyle(shift ? -1 : +1)
+        return 1                      // consume; do not let vanilla see Tab
+    return original(control, vkCode, modifiers)
 ```
 
 `CycleStyle(dir)` advances `gActiveStyleIndex` over `[0 .. gStyles.size()]` (0 = vanilla), wrapping,
@@ -217,7 +214,7 @@ requirement — call out in code, don't over-engineer.
 - `src/sample/power-pole-customization/PowerPoleCustomizationDirector.cpp` — add `OnKeyDown` hook +
   `VTableSlotPatch`; add the ImGui panel (render/update/shutdown), service acquisition in
   `PostAppInit`, teardown in `PostAppShutdown`; factor the existing `polestyle` cycle into a shared
-  `CycleStyle(dir)`; add a tool-identity helper (network type at `+0x35c`).
+  `CycleStyle(dir)`; add a tool-identity helper (network type at input-control `+0x50` == 5).
 - New constants: `kNetworkToolInputControlVtable = 0x00aab008`, `kOnKeyDownSlot = 0x00aab040`
   (= vtable + `0x38`), a `VK_TAB` handler, `kToolNetworkType_Power = 5`,
   `kTool_NetworkType = 0x35c` (on the driven `cSC4NetworkTool`), `kStatusPanelId`.
