@@ -625,16 +625,25 @@ add_library(SC4PowerPoleCustomizationSample SHARED ${POWER_POLE_CUSTOMIZATION_SO
 
 target_include_directories(SC4PowerPoleCustomizationSample PRIVATE
         ${SC4RS_ROOT}/src
+        ${IMGUI_DIR}
         ${MINI_INCLUDE_DIR}
 )
 
 target_link_libraries(SC4PowerPoleCustomizationSample PRIVATE
         gzcom2
         spdlog
+        imgui
 )
 
+# The status overlay is optional: imgui.dll is DELAY-LOADED so this DLL still loads (and every pole
+# feature + the Tab key hook keep working) when SC4RenderServices / imgui.dll is not installed. No
+# ImGui:: symbol is touched unless the ImGui service was acquired, so the delay-load never resolves
+# in that case. IMGUI_DLL_IMPORT matches the shared imgui build the samples use.
+target_compile_definitions(SC4PowerPoleCustomizationSample PRIVATE IMGUI_DLL_IMPORT)
+
 if(WIN32)
-    target_link_libraries(SC4PowerPoleCustomizationSample PRIVATE Version)
+    target_link_libraries(SC4PowerPoleCustomizationSample PRIVATE Version delayimp)
+    target_link_options(SC4PowerPoleCustomizationSample PRIVATE /DELAYLOAD:imgui.dll)
 endif()
 
 set_target_properties(SC4PowerPoleCustomizationSample PROPERTIES

@@ -38,10 +38,13 @@
 
 #include "cIGZCOM.h"
 #include "cIGZCheatCodeManager.h"
+#include "cIGZFrameWork.h"
 #include "cIGZMessage2.h"
 #include "cIGZMessage2Standard.h"
 #include "cIGZPersistResourceManager.h"
+#include "cIGZWin.h"
 #include "cISC4App.h"
+#include "cISC4View3DWin.h"
 #include "cISCProperty.h"
 #include "cISCPropertyHolder.h"
 #include "cISCExemplarPropertyHolder.h"
@@ -51,6 +54,14 @@
 #include "cRZBaseString.h"
 #include "cRZMessage2COMDirector.h"
 #include "GZServPtrs.h"
+
+// Optional ImGui status overlay. imgui.dll is delay-loaded (see this target's CMake), so this DLL
+// still loads and every pole feature keeps working when SC4RenderServices / imgui.dll is absent --
+// the overlay simply never registers. Nothing here may call an ImGui:: symbol unless the ImGui
+// system service was successfully acquired.
+#include "public/cIGZImGuiService.h"
+#include "public/ImGuiServiceIds.h"
+#include "imgui.h"
 
 #include "mini/ini.h"
 
@@ -94,12 +105,6 @@ namespace {
     // ------------------------------------------------------------------
     constexpr uint32_t kCheatPoleLineTest = 0xB07E1000;
 
-    // TEMPORARY interim UX for pole-style switching (see the "Multiple pole styles" block further
-    // down): cycles gActiveStyleIndex through vanilla + every [PowerPoles.<Name>] section loaded
-    // from the ini. Replace with the real Tab/Shift-Tab cSC4PowerLineTool ViewInputControl key hook
-    // in a follow-up session (deferred 2026-07-02 -- that hook needs its own Windows vtable-slot RE
-    // pass, not yet done).
-    constexpr uint32_t kCheatPoleStyle = 0xB07E1001;
     // Experimental, deliberately runtime-scoped switch: while enabled, the lot developer's
     // ClearLotBlockingObjects loop leaves power-pole and hidden power-line occupants alone.
     constexpr uint32_t kCheatKeepWires = 0xB07E1002;
@@ -313,9 +318,8 @@ namespace {
 
     // ------------------------------------------------------------------
     // Multiple pole "styles" (docs/sc4-powerline-tool-re.md SS "B. Multiple pole types/families").
-    // Data-model + style-switching resolver only, per user decision (2026-07-02) -- the real
-    // in-game Tab/Shift-Tab key hook is deferred to a follow-up session; style switching for now is
-    // driven by the interim "polestyle" cheat code below, same PoC pattern as kCheatPoleLineTest.
+    // Data-model + style-switching resolver. Style switching is driven in-game by the Tab/Shift-Tab
+    // OnKeyDown hook (see OnKeyDownHook / CycleStyle), gated on the power tool being active.
     //
     // cSC4PowerLineTool::CreatePowerPole (Windows 0x00650140) reads the pole instance for a
     // direction mask from the vanilla global g_dwPowerPoleForDirectionsFlag[16] (0x00B467B0,
@@ -396,6 +400,38 @@ namespace {
     // This vtable slot observes the actual disconnect regardless of which subsystem requested it.
     constexpr uintptr_t kPowerLineOccupantShutdownSlot = 0x00aa9c08;
     constexpr uintptr_t kPowerLineOccupantShutdown = 0x00649270;
+
+    // ------------------------------------------------------------------
+    // Tab / Shift-Tab pole-style switch. Keyboard input for every network tool is dispatched by the
+    // shared cSC4ViewInputControlNetworkTool (vtable 0x00aab008, confirmed by decompile). Its
+    // cISC4ViewInputControl::OnKeyDown is interface slot 14 = byte 0x38 -> the dword at 0x00aab040
+    // holds the OnKeyDown body 0x00661e90. Vanilla OnKeyDown only reacts to Escape (0x1b), so Tab is
+    // unclaimed here. Because the vtable is shared across road/rail/street/power, the slot patch is
+    // NOT auto-scoped the way the DrawNetworkLine patch was -- it must runtime-gate on the active
+    // subtool being the power tool. The input control keeps the active subtool pointer at +0x4c
+    // (confirmed via Init/OnMouseDownL forwarding), and that subtool's own primary vtable is the
+    // power tool's 0x00aa9f30 (= kPowerToolDrawNetworkLineSlot - 0x48). Comparing it is exact and
+    // independent of the network-type enum. See docs/power-line-style-ui-design.md.
+    constexpr uintptr_t kNetworkToolInputControlVtable = 0x00aab008;
+    constexpr uintptr_t kOnKeyDownSlot = 0x00aab040;           // vtable + 0x38 (interface slot 14)
+    constexpr uintptr_t kOnKeyDown = 0x00661e90;               // cSC4ViewInputControlNetworkTool::OnKeyDown
+    constexpr uintptr_t kPowerToolPrimaryVtable = 0x00aa9f30;  // == kPowerToolDrawNetworkLineSlot - 0x48
+    constexpr uint32_t kIC_ActiveSubtool = 0x4c;               // cSC4ViewInputControlNetworkTool -> active cSC4NetworkTool*
+    // The input control stores the current network type at +0x50 (fed to SL::NetworkManager in Init).
+    // Power line tool == network type 5 (cSC4PowerLineTool ctor calls cSC4NetworkTool base with 5).
+    // This is the runtime power-vs-other-network-tool discriminator (a stable enum, not an address).
+    constexpr uint32_t kIC_NetworkType = 0x50;
+    constexpr uint32_t kNetworkTypePower = 5;
+    constexpr uint32_t kVkTab = 0x09;
+    static_assert(kOnKeyDownSlot == kNetworkToolInputControlVtable + 0x38);
+    static_assert(kPowerToolPrimaryVtable == kPowerToolDrawNetworkLineSlot - 0x48);
+
+    // View3D acquisition (for overlay visibility only; same window IDs plop-and-paint uses).
+    constexpr uint32_t kGZWin_WinSC4App = 0x6104489A;
+    constexpr uint32_t kGZWin_SC4View3DWin = 0x9a47b417;
+
+    // ImGui status overlay panel id (this DLL's 0xB07E**** block).
+    constexpr uint32_t kStatusPanelId = 0xB07E2000;
 
     struct FarRatio {
         uint32_t run;  // cells along the major axis per period
@@ -2074,6 +2110,198 @@ namespace {
     }
 
     // ------------------------------------------------------------------
+    // Tab / Shift-Tab pole-style switch + optional ImGui status overlay.
+    // See docs/power-line-style-ui-design.md. The key hook has no ImGui dependency; the overlay only
+    // ever runs when the ImGui service was acquired. Both the IC vtable (0x00aab008, proven by the
+    // OnKeyDown slot's install-time byte check) and the power-tool vtable (0x00aa9f30, proven by the
+    // FAR DrawNetworkLine patch's byte check) are validated against the live binary before either is
+    // trusted at runtime, so a recompiled SC4 with moved vtables degrades to "no overlay / no Tab"
+    // rather than misbehaving. The runtime checks below are pure reads + compares (no writes).
+    // ------------------------------------------------------------------
+
+    // Cached only to gate overlay visibility. Read on the render thread; set once at init.
+    cISC4View3DWin* gView3D = nullptr;
+
+    // True when `control` is the shared network-tool input control AND the subtool it is currently
+    // driving is the power line tool. Used by the key hook (control = its own `this`) and by the
+    // overlay visibility check (control = GetCurrentViewInputControl()).
+    bool IsNetworkControlDrivingPowerTool(void* control) {
+        if (control == nullptr || *reinterpret_cast<uintptr_t*>(control) != kNetworkToolInputControlVtable) {
+            return false;
+        }
+        return *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(control) + kIC_NetworkType) == kNetworkTypePower;
+    }
+
+    // Advances the active pole style. dir > 0 forward, dir < 0 backward. Index 0 is vanilla; custom
+    // styles occupy 1..gStyles.size(). Wraps. Driven by the Tab/Shift-Tab key hook.
+    void CycleStyle(const int dir) {
+        if (gStyles.empty()) {
+            gActiveStyleIndex = 0;
+            return;
+        }
+        const uint32_t count = static_cast<uint32_t>(gStyles.size()) + 1; // + vanilla(0)
+        const uint32_t step = dir >= 0 ? 1u : count - 1u;
+        gActiveStyleIndex = (gActiveStyleIndex + step) % count;
+        const std::string activeName = gActiveStyleIndex == 0 ? "vanilla" : gStyles[gActiveStyleIndex - 1].name;
+        LOG_INFO("PowerPoleCustomization: active pole style -> \"{}\" ({} of {}) -- applies to newly-placed poles.",
+                 activeName, gActiveStyleIndex, gStyles.size());
+    }
+
+    using OnKeyDownFn = uint8_t(__thiscall*)(void* control, int vkCode, uint32_t modifiers);
+
+    // Vtable-slot hook (installed like the FAR DrawNetworkLine hook: __fastcall matches __thiscall
+    // with a throwaway edx). Consumes Tab only while the power tool is the active network subtool;
+    // everything else -- including Tab under road/rail/street -- falls through to vanilla untouched.
+    uint8_t __fastcall OnKeyDownHook(void* control, void* /*edx*/, int vkCode, uint32_t modifiers) {
+        // TEMP DIAGNOSTIC (remove once Tab confirmed): on Tab, dump the raw identity fields so the
+        // network-type gate can be verified against the live object.
+        if (vkCode == static_cast<int>(kVkTab) && control != nullptr) {
+            const uint32_t ctrlVtbl = *reinterpret_cast<uint32_t*>(control);
+            const uint32_t netType = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(control) + kIC_NetworkType);
+            const uint32_t sub = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(control) + kIC_ActiveSubtool);
+            const uint32_t subVtbl = sub != 0 ? *reinterpret_cast<uint32_t*>(sub) : 0;
+            LOG_INFO("PowerPoleCustomization: [keydbg] Tab ctrlVtbl=0x{:08X} netType={} sub=0x{:08X} "
+                     "subVtbl=0x{:08X} powerActive={}", ctrlVtbl, netType, sub, subVtbl,
+                     IsNetworkControlDrivingPowerTool(control));
+        }
+
+        if (gSettings.enabled && vkCode == static_cast<int>(kVkTab) &&
+            IsNetworkControlDrivingPowerTool(control)) {
+            const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            CycleStyle(shift ? -1 : 1);
+            return 1; // consume: don't let vanilla focus handling also act on Tab
+        }
+        const auto original = reinterpret_cast<OnKeyDownFn>(kOnKeyDown);
+        return original(control, vkCode, modifiers);
+    }
+
+    // View3D (and the 3D-view window it lives under) does not exist at PostAppInit -- it appears
+    // once a city view is up. Acquire it lazily on the render thread, retrying until it resolves,
+    // instead of failing overlay setup permanently at app init.
+    cISC4View3DWin* EnsureView3D() {
+        if (gView3D != nullptr) {
+            return gView3D;
+        }
+        if (const cISC4AppPtr app; app) {
+            if (cIGZWin* const mainWindow = app->GetMainWindow()) {
+                if (cIGZWin* const sc4AppWin = mainWindow->GetChildWindowFromID(kGZWin_WinSC4App)) {
+                    sc4AppWin->GetChildAs(kGZWin_SC4View3DWin, kGZIID_cISC4View3DWin,
+                                          reinterpret_cast<void**>(&gView3D));
+                }
+            }
+        }
+        return gView3D;
+    }
+
+    bool OverlayShouldShow() {
+        cISC4View3DWin* const view = EnsureView3D();
+        return view != nullptr && IsNetworkControlDrivingPowerTool(view->GetCurrentViewInputControl());
+    }
+
+    // Does a style define any orientation of the given FAR ratio?
+    bool StyleDefinesRatio(const PoleStyle& style, const uint32_t ratioIndex) {
+        for (uint32_t orient = 0; orient < kFarOrientCount; ++orient) {
+            if (style.hasFarHeading[ratioIndex * kFarOrientCount + orient]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The active style's supported FAR ratios: the style's own headings plus the [PowerPoles.FAR]
+    // default fallback (which applies under any style, vanilla included).
+    bool ActiveStyleSupportsRatio(const uint32_t ratioIndex) {
+        if (gActiveStyleIndex >= 1 && StyleDefinesRatio(gStyles[gActiveStyleIndex - 1], ratioIndex)) {
+            return true;
+        }
+        return gHasFarDefault && StyleDefinesRatio(gFarDefaultStyle, ratioIndex);
+    }
+
+    // ImGui render callback. Only invoked by the ImGui service (so imgui.dll is guaranteed present
+    // by the time any ImGui:: symbol below is touched). Styled after sc4-plop-and-paint's
+    // PaintStatusPanel: borderless, auto-sized, click-through, top-left.
+    void RenderPoleStyleOverlay(void* /*userData*/) {
+        if (!OverlayShouldShow()) {
+            return;
+        }
+
+        constexpr float kMargin = 10.0f;
+        ImGui::SetNextWindowPos(ImVec2(kMargin, kMargin), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.7f);
+        constexpr ImGuiWindowFlags kFlags =
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoMove;
+        if (!ImGui::Begin("##PoleStyle", nullptr, kFlags)) {
+            ImGui::End();
+            return;
+        }
+
+        if (gActiveStyleIndex == 0) {
+            ImGui::TextUnformatted("Style: Vanilla");
+        } else {
+            ImGui::Text("Style: %s (%u / %u)", gStyles[gActiveStyleIndex - 1].name.c_str(),
+                        gActiveStyleIndex, static_cast<uint32_t>(gStyles.size()));
+        }
+
+        const uint32_t interPole = (gActiveStyleIndex >= 1 && gStyles[gActiveStyleIndex - 1].hasMaxCells)
+            ? gStyles[gActiveStyleIndex - 1].maxCellsBetweenPoles
+            : 10u; // vanilla default (docs SS2)
+        ImGui::Text("Poles every %u cells", interPole);
+
+        // Best-effort live heading: reflects the most recent snap while a drag is/was in progress.
+        if (gFarSnapAnchorValid) {
+            if (gFarSnapCandidate == kAxisSnapCandidate) {
+                ImGui::TextUnformatted("Heading: orthogonal");
+            } else if (gFarSnapCandidate == kDiagonalSnapCandidate) {
+                ImGui::TextUnformatted("Heading: 45 deg diagonal");
+            } else if (gFarDragActive) {
+                const FarRatio& r = kFarRatios[gFarDragRatioIndex];
+                const double deg = std::atan2(static_cast<double>(r.rise), static_cast<double>(r.run)) *
+                                   180.0 / 3.14159265358979323846;
+                const std::string_view orient = FarOrientName(gFarDragOrient);
+                ImGui::Text("Heading: FA-%s  %.1f deg (%.*s)",
+                            std::string(kFarRatioLabels[gFarDragRatioIndex]).c_str(), deg,
+                            static_cast<int>(orient.size()), orient.data());
+            }
+        }
+
+        if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+            ImGui::TextUnformatted("Shift: regular headings only");
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Separator();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+        ImGui::TextUnformatted("FA:");
+        bool anyRatio = false;
+        for (uint32_t ri = 0; ri < kFarRatios.size(); ++ri) {
+            if (!ActiveStyleSupportsRatio(ri)) {
+                continue;
+            }
+            anyRatio = true;
+            ImGui::SameLine();
+            const bool activeRatio = gFarDragActive && gFarSnapAnchorValid && gFarDragRatioIndex == ri;
+            if (activeRatio) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.3f, 1.0f));
+            }
+            ImGui::Text("FA-%s", std::string(kFarRatioLabels[ri]).c_str());
+            if (activeRatio) {
+                ImGui::PopStyleColor();
+            }
+        }
+        if (!anyRatio) {
+            ImGui::SameLine();
+            ImGui::TextUnformatted("none");
+        }
+        ImGui::TextUnformatted("Tab / Shift+Tab  style");
+        ImGui::PopStyleColor();
+
+        ImGui::End();
+    }
+
+    // ------------------------------------------------------------------
     // Settings (SC4PowerPoleCustomization.ini, same layout convention as SC4TerrainDiagonalFix.ini).
     // ------------------------------------------------------------------
     bool ParseBool(const std::string& value, const bool defaultValue) {
@@ -2361,8 +2589,9 @@ public:
             {0x8b, 0x04, 0xbd, 0xb0, 0x67, 0xb4, 0x00}, &PoleStyleLookupHook, "PoleStyleLookup@2") ? 1 : 0;
 
         // TEMPORARY PoC-ONLY: FAR drag (docs SS17). A vtable-slot swap, not a code patch.
-        installed += farDrawNetworkLinePatch_.Install(kPowerToolDrawNetworkLineSlot, kDrawNetworkLine,
-                                                       &FarDrawNetworkLineHook, "FarDrawNetworkLine") ? 1 : 0;
+        const bool farInstalled = farDrawNetworkLinePatch_.Install(kPowerToolDrawNetworkLineSlot, kDrawNetworkLine,
+                                                                    &FarDrawNetworkLineHook, "FarDrawNetworkLine");
+        installed += farInstalled ? 1 : 0;
         installed += keepWiresPatch_.Install(kUpdateOnZoneChange,
             {0x83, 0xec, 0x68, 0x8b, 0x44, 0x24, 0x7c}, &KeepWiresOnZoneChangeHook,
             "KeepWiresOnZoneChange") ? 1 : 0;
@@ -2370,10 +2599,19 @@ public:
             kPowerLineOccupantShutdown, &PowerLineOccupantShutdownHook,
             "PowerLineOccupantShutdownDiagnostic") ? 1 : 0;
 
+        // Tab / Shift-Tab pole-style switch. Byte-validates the OnKeyDown slot (which transitively
+        // confirms the network-tool input-control vtable). The overlay is only trusted when BOTH this
+        // and the FAR patch validated, because the overlay's power-tool identity check compares
+        // against both of those vtables.
+        const bool keyHookInstalled = onKeyDownPatch_.Install(kOnKeyDownSlot, kOnKeyDown,
+                                                              &OnKeyDownHook, "OnKeyDown@NetworkToolInputControl");
+        installed += keyHookInstalled ? 1 : 0;
+        styleUiValidated_ = keyHookInstalled && farInstalled;
+
         LOG_INFO("PowerPoleCustomization: installed {} of {} patches.", installed,
                  initConnectionPointsPatches_.size() + kAddConnectionCallSites.size() +
                  kUpdateConnectionCallSites.size() + kDeterminePolePositionsCallSites.size() +
-                 2 + createFloorPatches_.size() + 4 + 2 + 1 + 1 + 1);
+                 2 + createFloorPatches_.size() + 4 + 2 + 1 + 1 + 1 + 1);
 
         // TEMPORARY PoC-ONLY cheat. See the block comment above kCheatPoleLineTest.
         const cISC4AppPtr app;
@@ -2388,13 +2626,6 @@ public:
                 } else {
                     LOG_WARN("PowerPoleCustomization: failed to register cheat code polelinetest.");
                 }
-                if (cheats->RegisterCheatCode(kCheatPoleStyle, cRZBaseString("polestyle"))) {
-                    LOG_INFO("PowerPoleCustomization: [TEST MODE] cheat code registered (polestyle) -- "
-                             "cycles the active pole style ({} loaded from ini) for newly-placed poles. "
-                             "Interim UX; the real Tab/Shift-Tab key hook is a follow-up.", gStyles.size());
-                } else {
-                    LOG_WARN("PowerPoleCustomization: failed to register cheat code polestyle.");
-                }
                 if (cheats->RegisterCheatCode(kCheatKeepWires, cRZBaseString("keepwires"))) {
                     LOG_INFO("PowerPoleCustomization: [TEST MODE] cheat code registered (keepwires) -- "
                              "toggles suppression of power-line rerouting on zone changes.");
@@ -2404,17 +2635,19 @@ public:
             }
         }
 
+        SetupStatusOverlay();
         return true;
     }
 
     bool PostAppShutdown() override {
         if (cheatManager_) {
             cheatManager_->UnregisterCheatCode(kCheatPoleLineTest);
-            cheatManager_->UnregisterCheatCode(kCheatPoleStyle);
             cheatManager_->UnregisterCheatCode(kCheatKeepWires);
             cheatManager_->RemoveNotification2(this, 0);
             cheatManager_.Reset();
         }
+        TeardownStatusOverlay();
+        onKeyDownPatch_.Uninstall();
         farDrawNetworkLinePatch_.Uninstall();
         keepWiresPatch_.Uninstall();
         powerLineShutdownPatch_.Uninstall();
@@ -2450,13 +2683,6 @@ public:
                          gSyntheticTestModeEnabled ? "ENABLED" : "disabled");
             }
             if (stdMsg->GetType() == kCheatCodeMessageType &&
-                static_cast<uint32_t>(stdMsg->GetData1()) == kCheatPoleStyle) {
-                gActiveStyleIndex = gStyles.empty() ? 0 : (gActiveStyleIndex + 1) % (static_cast<uint32_t>(gStyles.size()) + 1);
-                const std::string activeName = gActiveStyleIndex == 0 ? "vanilla" : gStyles[gActiveStyleIndex - 1].name;
-                LOG_INFO("PowerPoleCustomization: [TEST MODE] active pole style -> \"{}\" ({} of {}) -- "
-                         "applies to newly-placed poles only.", activeName, gActiveStyleIndex, gStyles.size());
-            }
-            if (stdMsg->GetType() == kCheatCodeMessageType &&
                 static_cast<uint32_t>(stdMsg->GetData1()) == kCheatKeepWires) {
                 gKeepWiresOnZoneChange = !gKeepWiresOnZoneChange;
                 LOG_INFO("PowerPoleCustomization: [TEST MODE] keepwires {} -- zone changes {} "
@@ -2486,6 +2712,59 @@ private:
         return 1;
     }
 
+    // Acquires the optional ImGui status overlay. Safe no-op when the power-tool identity vtables
+    // weren't byte-confirmed at install (recompiled/other binary), or when the ImGui service
+    // (SC4RenderServices / imgui.dll) is absent. The pole features and the Tab key hook keep working
+    // regardless -- nothing here is on the critical path.
+    void SetupStatusOverlay() {
+        if (!styleUiValidated_) {
+            LOG_INFO("PowerPoleCustomization: power-tool vtables not confirmed on this binary; status "
+                     "overlay disabled (Tab switching inactive too).");
+            return;
+        }
+
+        // View3D is acquired lazily at render time (EnsureView3D) -- it does not exist yet here.
+        // Registration only needs the ImGui service, which is available at PostAppInit.
+        if (mpFrameWork == nullptr ||
+            !mpFrameWork->GetSystemService(kImGuiServiceID, GZIID_cIGZImGuiService,
+                                           reinterpret_cast<void**>(&imguiService_))) {
+            imguiService_ = nullptr;
+            LOG_INFO("PowerPoleCustomization: ImGui service absent; status overlay disabled "
+                     "(Tab style switching still works).");
+            return;
+        }
+
+        ImGuiPanelDesc desc{};
+        desc.id = kStatusPanelId;
+        desc.order = 120;
+        desc.visible = true;
+        desc.on_render = &RenderPoleStyleOverlay;
+        if (!imguiService_->RegisterPanel(desc)) {
+            LOG_WARN("PowerPoleCustomization: failed to register status overlay panel.");
+            imguiService_->Release();
+            imguiService_ = nullptr;
+            return;
+        }
+        overlayRegistered_ = true;
+        LOG_INFO("PowerPoleCustomization: status overlay registered (ImGui api {}).",
+                 imguiService_->GetApiVersion());
+    }
+
+    void TeardownStatusOverlay() {
+        if (imguiService_ != nullptr) {
+            if (overlayRegistered_) {
+                imguiService_->UnregisterPanel(kStatusPanelId);
+                overlayRegistered_ = false;
+            }
+            imguiService_->Release();
+            imguiService_ = nullptr;
+        }
+        if (gView3D != nullptr) {
+            gView3D->Release();
+            gView3D = nullptr;
+        }
+    }
+
     std::array<TerrainDecal::RelativeCallPatch, 3> initConnectionPointsPatches_{};
     TerrainDecal::RelativeCallPatch modelInstanceIdPatch_{};
     std::array<TerrainDecal::RelativeCallPatch, 4> addConnectionPatches_{};
@@ -2502,6 +2781,10 @@ private:
     InlineCallPatch wireWidthLookupPatch_{};
     VTableSlotPatch farDrawNetworkLinePatch_{}; // automatic FAR snapping; hold Shift for regular-only
     VTableSlotPatch powerLineShutdownPatch_{}; // keepwires diagnostic: observes actual cable disconnects
+    VTableSlotPatch onKeyDownPatch_{};         // Tab/Shift-Tab pole-style switch
+    bool styleUiValidated_ = false;            // both power-tool identity vtables byte-confirmed at install
+    cIGZImGuiService* imguiService_ = nullptr; // optional; null when SC4RenderServices/imgui.dll absent
+    bool overlayRegistered_ = false;
     cRZAutoRefCount<cIGZCheatCodeManager> cheatManager_; // TEMPORARY PoC-ONLY, see kCheatPoleLineTest
 };
 

@@ -100,6 +100,19 @@ This correction is persistent because it is read from the pole's exemplar whenev
 loaded, including zoom changes and save-game reloads. It changes only model-variant selection; wire
 attachment bearings remain controlled by the attachment properties.
 
+## Switching pole styles in-game (Tab / Shift-Tab)
+
+When more than one `[PowerPoles.<Name>]` style is loaded, **Tab** cycles the active style forward and
+**Shift-Tab** backward while the power-line tool is selected; the change applies to newly-placed
+poles. This works with no other mods. See `docs/power-line-style-ui-design.md` for the hook details.
+
+An optional on-screen overlay (top-left) shows the active style, the inter-pole distance, the live
+drag heading (e.g. `FA-2  26.6 deg`), whether Shift is constraining to regular headings, and which
+FAR ratios the active style supports. The overlay requires the ImGui service
+(`SC4RenderServices` / `imgui.dll`); when it is not installed the overlay simply does not appear and
+everything else — including Tab switching — keeps working. `imgui.dll` is delay-loaded, so this DLL
+never hard-depends on it.
+
 ## Property definitions
 
 The definitions are included in `.agents/new_properties.xml`. `Count="-3"` on attachment properties
