@@ -151,6 +151,10 @@ namespace {
     constexpr uint32_t kOccupant_ConnectionsBegin = 0xac;        // confirmed via DrawPowerlines (clean decompile)
     constexpr uint32_t kOccupant_ConnectionsEnd = 0xb0;
     constexpr uint32_t kOccupant_DirectionFlags = 0xb8;          // confirmed via CreatePowerPole
+    constexpr uintptr_t kCardinalConnectionPoints = 0x00B0C0D8;
+    constexpr uintptr_t kDiagonalConnectionPoints = 0x00B0C198;
+    constexpr uint32_t kCardinalDirectionFlags = 0x5; // X | Z
+    constexpr uint32_t kDiagonalDirectionFlags = 0xa; // DP | DN
     // SetPosition (0x0064c540) is invoked through the occupant subobject at completeObject+0x8.
     // Its raw [this+0x98/+0x9c/+0xa0] stores therefore resolve to these complete-object offsets.
     // GetLineConnectionPoints (0x00649ba0) independently reads the same +0xa0/+0xa4/+0xa8 triple.
@@ -1610,6 +1614,30 @@ namespace {
     using UpdateConnectionFn = void(__thiscall*)(void* occupant, void* otherPole);
     using CreateFloorFn = void(__fastcall*)(void* occupant, void* /*unused edx*/);
 
+    // Vanilla selects one of its two fixed attachment tables from bits 8-11 of the model's RKT1
+    // group. Arbitrary custom-model groups can encode a value outside vanilla's accepted 1-4
+    // range, in which case InitConnectionPoints silently leaves the constructor-initialized field
+    // null. AddConnection/UpdateConnection dereference that field before our custom polyline rebuild,
+    // so seed a safe staging table for those models. Custom attachment geometry still replaces the
+    // resulting vanilla strands in ApplyConnectionCustomization.
+    void RepairMissingConnectionPointTable(void* occupant) {
+        auto*& table = *reinterpret_cast<uint8_t**>(
+            reinterpret_cast<uint8_t*>(occupant) + kOccupant_ConnectionPointTablePtr);
+        if (table != nullptr) {
+            return;
+        }
+
+        const uint32_t directionFlags = *reinterpret_cast<const uint32_t*>(
+            reinterpret_cast<const uint8_t*>(occupant) + kOccupant_DirectionFlags);
+        const bool diagonalOnly = (directionFlags & kDiagonalDirectionFlags) != 0 &&
+                                  (directionFlags & kCardinalDirectionFlags) == 0;
+        table = reinterpret_cast<uint8_t*>(
+            diagonalOnly ? kDiagonalConnectionPoints : kCardinalConnectionPoints);
+        LOG_WARN("PowerPoleCustomization: vanilla left pole {} without a connection-point table "
+                 "(direction flags 0x{:X}); using the {} table as a safe fallback.",
+                 occupant, directionFlags, diagonalOnly ? "diagonal" : "cardinal");
+    }
+
     void __fastcall CreateFloorHook(void* occupant, void* edxUnused) {
         const auto original = reinterpret_cast<CreateFloorFn>(kCreateFloor);
         original(occupant, edxUnused);
@@ -1625,6 +1653,7 @@ namespace {
     void __fastcall InitConnectionPointsHook(void* occupant, void* /*edx*/) {
         const auto original = reinterpret_cast<InitConnectionPointsFn>(kInitConnectionPoints);
         original(occupant); // always run vanilla first: it still owns model load + default-table selection
+        RepairMissingConnectionPointTable(occupant);
         ForgetOccupantWidths(occupant);
 
         if (!gSettings.enabled) {
