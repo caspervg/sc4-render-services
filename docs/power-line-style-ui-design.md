@@ -1,6 +1,6 @@
 # Power-line pole-style Tab switching + hovering status overlay — design note
 
-Status: implemented (2026-07-05), awaiting in-game validation. Replaces the interim `polestyle`
+Status: implemented (2026-07-05), validated in-game (2026-07-19). Replaces the interim `polestyle`
 cheat (now removed) as the real style-switching UX. Two parts: (A) a
 Tab/Shift-Tab key hook that cycles the active pole style, and (B) an optional ImGui status overlay
 that shows the active style and the live drag heading. Part B degrades to nothing when the ImGui

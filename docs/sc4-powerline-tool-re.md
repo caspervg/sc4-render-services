@@ -986,3 +986,45 @@ The one address in the gate (`0x00aab008`) is byte-validated at install (the OnK
 `0x00aab040` confirms it transitively), so the DLL only trusts the runtime gate — and only registers
 the optional status overlay — when it is confirmed on the live binary. See
 `docs/power-line-style-ui-design.md` for the full UI design.
+
+## 18. Pole lifetime + texture registry (2026-07-19) — beta hardening pass
+
+### A. cSC4PowerPoleOccupant destructor chain (Windows, confirmed)
+
+| Function | Windows | Evidence |
+|---|---|---|
+| Constructor | `0x0064db30` | called from CreatePowerPole `0x006501b6` after pool alloc of 0x124 bytes; primary vtable `0x00aa9cb8`; cSC4Occupant base ctor `0x005e9220` on `this+0x8` |
+| Complete destructor | `0x0064dfc0` | same 7-vtable reset pattern as Mac `~cSC4PowerPoleOccupant` `0x002594ec`; destroys tConnection vector at `+0xac/+0xb0` (matches SS9 offsets); base dtors on `+0x3c` and `+0x8` |
+| Scalar deleting dtor | `0x0064e380` | calls complete dtor at **`0x0064e383`** (`E8 38 FC FF FF`), then returns the object to the fixed pool at `0x00b0c0c8` |
+| Pool alloc / slab grow / factory | `0x006499d0` / `0x006497e0` / `0x0064e340` | 292-byte fixed pool, 112 objects per slab; factory stub is reached via the GZCOM class-factory table |
+
+The DLL hooks the single call site `0x0064e383` (`Destructor@DeletingDtor` patch) to erase
+`gOverrides`/`gPolylineWidthOverrides` entries the moment a pole dies — closing the stale-pointer
+window that pool-slot reuse opened. All six functions renamed in the Windows Ghidra database with
+provenance plate comments.
+
+### B. Power-pole texture registry (Windows, confirmed) — why custom texture IDs used to be a guaranteed crash
+
+`StaticInit` (`0x0064cc20`) seeds a hash_map rooted at `0x00b46784` with exactly four texture IDs
+(wires `0xAA9DA78E`/`0xC9AF0FCD`, floor `0x0912220E`, wall `0x08080004`), each with a null
+`cS3DTextureBinding*`. Node layout `{+0 next, +4 id, +8 binding}`, bucket array at
+`[0x00b46788]..[0x00b4678c]`, bucket = `id % bucketCount` — read directly from Windows `Draw`
+(`0x0064c800`) disassembly, which walks the chain with **no null check** on either the node or the
+binding. `ChangeZoomLevel` (`0x0064c6c0`) reloads every registered entry's binding — FSH type
+`0x7AB50E44`, **group `0x1ABE787D`**, instance = the id — whenever the zoom global `0x00b0c0a8`
+differs from the draw context's zoom. Map insert function (the exact call StaticInit makes):
+`0x004f8d30`, `__thiscall(this=0xb46784, const uint32_t* key) -> uint32_t* valueSlot`.
+
+DLL consequence (implemented): a custom foundation texture ID is accepted only after
+`TestForKey(0x7AB50E44, 0x1ABE787D, id)` succeeds; it is then inserted via `0x004f8d30`, the insert
+is verified by re-running Draw's own read-only bucket walk, the fresh slot is zeroed, and
+`0x00b0c0a8` is zeroed so the engine reloads all bindings on the next frame. Any failure falls back
+to the vanilla texture.
+
+### C. Beta example content
+
+`assets/power-pole-customization/SC4PowerPoleFA2Example.dat`: pole prop exemplars
+`6534284A-088E1962-B07EFA20/21` (vanilla pole prop group confirmed as `0x088E1962` via
+SimCity_1.dat, template = `PowerPole_205`), RKT1 → P3 FA-2 tangent S3Ds
+`5AD0E817-E4586C0B-00030000` (NL266) and `5AD0E817-44586CF1-00030000` (NR266); base instances end
+in `00` per the RKT1 rotation-nibble rule.

@@ -80,11 +80,14 @@ regardless of the pole's model or exemplar. These three properties override that
 | `0xB22A000B` | Power Pole Foundation Floor Texture ID | Uint32 | Overrides the floor's texture-cache lookup key (vanilla `0x0912220E`). |
 | `0xB22A000C` | Power Pole Foundation Wall Texture ID | Uint32 | Overrides the walls' texture-cache lookup key (vanilla `0x08080004`). |
 
-**Texture ID safety warning**: unlike the half-extent, these are not validated against loaded
-textures. An ID that doesn't resolve to a real texture in the game's cache walks a hash-bucket chain
-to a null entry and gets dereferenced with no null check -- this crashes the game, it does not
-render transparent. If you want no visible foundation, set the half-extent to `0` instead of trying
-to point the texture IDs at nothing.
+**Texture ID validation (2026-07-19)**: custom texture IDs are validated and registered at load.
+The engine keeps its own power-pole texture registry seeded with only the four vanilla IDs, and
+`Draw()` null-derefs on any ID missing from it -- so the DLL now accepts a custom ID only when an
+FSH resource with **type `0x7AB50E44`, group `0x1ABE787D`, instance = the texture ID** exists in the
+resource manager, then registers the ID with the engine's registry and triggers a binding reload.
+An ID that fails validation logs a warning and keeps the vanilla texture (never a crash). Practical
+consequence for authors: ship pad textures as FSH in group `0x1ABE787D`. If you want no visible
+foundation, set the half-extent to `0`; that path needs no texture at all.
 
 ## Model quarter-turn correction
 
@@ -120,7 +123,22 @@ enforces repeated XYZ groups; `Count="-1"` permits variable-length per-wire arra
 `0xB22A0000` through `0xB22A000E` IDs are reserved by this feature. The final ID in the checked
 `0xB22A0000` through `0xB22A000F` block is currently unused.
 
-The production exemplar reader, arbitrary 1-N strand rebuild, sag scaling/capping, and per-wire
-width lookup are implemented. They still require an in-game validation pass before this sample
-should be treated as release-ready. The temporary `polelinetest` cheat remains available for
-isolated geometry testing on newly placed or reloaded poles.
+The production exemplar reader, arbitrary 1-N strand rebuild, sag scaling/capping, per-wire width
+lookup, FAR dragging/routing, and the Tab/Shift-Tab style switch were all validated in-game
+(2026-07-19). Pole lifetime is handled: a destructor hook drops a pole's customization the moment
+the engine destroys it, and all remaining city-scoped state is flushed on city shutdown.
+
+## Example content
+
+`assets/power-pole-customization/SC4PowerPoleFA2Example.dat` ships two ready-made FA-2 pole prop
+exemplars in the vanilla power-pole group `0x088E1962`:
+
+| Instance | Exemplar | Model (S3D) |
+|---|---|---|
+| `0xB07EFA20` | `PowerPole_FA2_P3_NL266` | `5AD0E817-E4586C0B-00030000` (P3 26.6-degree tangent, NL) |
+| `0xB07EFA21` | `PowerPole_FA2_P3_NR266` | `5AD0E817-44586CF1-00030000` (mirrored NR twin) |
+
+They require the P3 model pack (`MTO_P3_ModelsVol01`) for the meshes. The matching (commented)
+`[PowerPoles.FAR]` preset in `SC4PowerPoleCustomization.ini` routes `FAR-2.XP/ZN` to the NL prop
+and `FAR-2.XN/ZP` to the NR prop; if a heading renders 90 degrees off in-game, swap the pairs or
+set `0xB22A000E` on one prop.

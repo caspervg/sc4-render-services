@@ -21,7 +21,8 @@
 //
 // Status: hook sites and data structures below are real, address-confirmed (see "Hook sites"
 // section and docs/sc4-powerline-tool-re.md SS7-14). The cable-count/strand-build algorithm is
-// written out in full and ACTIVE.
+// written out in full, ACTIVE, and validated in-game (2026-07-19) together with per-wire width,
+// FAR drag/routing, and the Tab/Shift-Tab style switch.
 //
 // First attempt (2026-07-01) registered extra strands as cSC4PowerLineOccupant city objects --
 // confirmed in-game (docs SS13) to run with no crash but NOT make DrawPowerlines render anything,
@@ -29,14 +30,15 @@
 // independent of any cSC4PowerLineOccupant's existence. The current approach clears and rebuilds
 // the complete regular-polyline list in each active tConnection, using the same erase, control-
 // point, tessellation, and vector-insert helpers as vanilla. A separate validated inline lookup
-// supplies per-wire width while leaving the rest of DrawPowerlines intact. This revision still
-// requires its in-game verification pass -- see "Known gaps" at the bottom of this file.
+// supplies per-wire width while leaving the rest of DrawPowerlines intact.
 
+#include "cGZPersistResourceKey.h"
 #include "cIGZCOM.h"
 #include "cIGZCheatCodeManager.h"
 #include "cIGZFrameWork.h"
 #include "cIGZMessage2.h"
 #include "cIGZMessage2Standard.h"
+#include "cIGZMessageServer2.h"
 #include "cIGZPersistResourceManager.h"
 #include "cIGZWin.h"
 #include "cISC4App.h"
@@ -81,12 +83,14 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
     constexpr uint32_t kDirectorID = 0xB07E11E5; // arbitrary, must not collide with another director in this Plugins folder
     constexpr uint16_t kSupportedGameVersion = 641;
     constexpr uint32_t kCheatCodeMessageType = 0x230E27AC; // fixed SC4 message type, same constant every sample uses
+    constexpr uint32_t kSC4MessagePreCityShutdown = 0x26D31EC2; // same constant DateJumper/RenderServices use
 
     // Experimental, deliberately runtime-scoped switch: while enabled, the lot developer's
     // ClearLotBlockingObjects loop leaves power-pole and hidden power-line occupants alone.
@@ -106,6 +110,17 @@ namespace {
     constexpr uintptr_t kInitConnectionPoints_CallSite_Init = 0x0064ceaa; // new-pole initialization path
     constexpr uintptr_t kInitConnectionPoints_CallSite_SetDefaultExemplar = 0x0064d94e;
     constexpr uintptr_t kInitConnectionPoints_CallSite_Read = 0x0064ef09; // save-game load path
+
+    // cSC4PowerPoleOccupant::~cSC4PowerPoleOccupant (complete-object destructor, confirmed
+    // 2026-07-19: same 7-vtable reset pattern as the Mac dtor at 0x002594ec, destroys the
+    // tConnection vector at +0xac/+0xb0, calls the cSC4Occupant base dtor on +0x8). Its sole
+    // caller is the scalar deleting destructor at 0x0064e380, which then returns the 292-byte
+    // object to the fixed pool at 0x00b0c0c8. Hooking that one call site lets this DLL drop its
+    // side-table entries for a pole the moment the engine destroys it -- without this, demolished
+    // poles leave stale gOverrides/gPolylineWidthOverrides entries behind and the pool's address
+    // reuse can briefly pair a new pole with a dead pole's customization.
+    constexpr uintptr_t kDestructor = 0x0064dfc0;
+    constexpr uintptr_t kDestructor_CallSite_DeletingDtor = 0x0064e383;
 
     // cSC4PowerPoleOccupant::LoadModel passes its mask-derived 0/1 quarter-turn to the RKT1 model
     // selector here. The first argument is the model-resource-key vector at completeObject+0x8,
@@ -297,6 +312,30 @@ namespace {
     constexpr uint32_t kVanillaFloorTextureId = 0x0912220E;
     constexpr uint32_t kVanillaWallTextureId = 0x08080004;
 
+    // Engine power-pole texture registry (confirmed 2026-07-19 on the WINDOWS binary via StaticInit
+    // 0x0064cc20 / ChangeZoomLevel 0x0064c6c0 / Draw 0x0064c800 -- the container layout below is
+    // read from Windows disassembly, NOT assumed from the Mac binary's gnu hashtable): a
+    // hash_map<textureId, cS3DTextureBinding*> rooted at 0x00b46784 with the bucket-pointer array
+    // at [0x00b46788]..[0x00b4678c], node layout {+0 next, +4 id, +8 binding}, bucket index =
+    // id % bucketCount. StaticInit seeds it with exactly the four vanilla wire/floor/wall IDs.
+    // Draw's bucket walk has NO null check, so any ID absent from this map crashes -- a custom ID
+    // must therefore (a) resolve to a real FSH resource and (b) be inserted into this map before
+    // the first Draw that uses it. Insertion goes through the engine's own map insert function
+    // (0x004f8d30, __thiscall, arg = pointer to the 32-bit key, returns the value slot -- the exact
+    // call StaticInit itself makes four times), then is verified by re-finding the node with the
+    // same read-only bucket walk Draw performs; verification failure falls back to the vanilla
+    // texture instead of trusting the insert. ChangeZoomLevel reloads the binding of every
+    // registered entry whenever the zoom global at 0x00b0c0a8 differs from the draw context's
+    // zoom, so zeroing that global right after inserting forces the engine itself to load the new
+    // texture on the next frame -- no manual texture-manager call needed.
+    constexpr uintptr_t kPoleTextureRegistry = 0x00b46784;
+    constexpr uintptr_t kPoleTextureRegistryInsert = 0x004f8d30;
+    constexpr uintptr_t kPoleTextureBucketsBegin = 0x00b46788;
+    constexpr uintptr_t kPoleTextureBucketsEnd = 0x00b4678c;
+    constexpr uintptr_t kPoleTextureZoomGlobal = 0x00b0c0a8;
+    constexpr uint32_t kFshTypeId = 0x7ab50e44;
+    constexpr uint32_t kPoleTextureGroupId = 0x1abe787d; // group ChangeZoomLevel loads bindings from
+
     // ------------------------------------------------------------------
     // Multiple pole "styles" (docs/sc4-powerline-tool-re.md SS "B. Multiple pole types/families").
     // Data-model + style-switching resolver. Style switching is driven in-game by the Tab/Shift-Tab
@@ -333,7 +372,7 @@ namespace {
     constexpr uint32_t kMaxInterPoleDistance = 50; // sanity clamp; vanilla is 10
 
     // ------------------------------------------------------------------
-    // TEMPORARY PoC-ONLY: FAR (fractional-angle) power-line dragging. See
+    // FAR (fractional-angle) power-line dragging -- validated in-game 2026-07-19. See
     // docs/sc4-powerline-tool-re.md SS17 for the complete evidence trail.
     //
     // cSC4NetworkTool::DrawNetworkLine (0x0063af40) is virtual (slot +0x48) and has NO direct call
@@ -652,11 +691,6 @@ namespace {
         return true;
     }
 
-    // Texture-ID properties are raw resource keys, not appearance scalars: no amount of range
-    // clamping here can guarantee the ID resolves to a loaded texture at Draw() time. An unresolved
-    // ID walks the engine's texture-cache hash chain to a null bucket and is dereferenced with no
-    // null check (confirmed via disassembly of cSC4PowerPoleOccupant::Draw) -- a crash, not a
-    // silently-transparent pad. Warn loudly so authors don't assume "unknown ID = invisible".
     bool TryReadUint32Property(const cISCPropertyHolder* holder, const uint32_t propertyId, uint32_t& outValue) {
         if (holder == nullptr || !holder->HasProperty(propertyId)) {
             return false;
@@ -684,6 +718,73 @@ namespace {
             return false;
         }
         outValue = value;
+        return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Custom foundation-texture registration. Draw() resolves texture IDs through the engine's
+    // power-pole texture registry (see the kPoleTextureRegistry constants block); an ID missing
+    // from that registry is a guaranteed null dereference, and StaticInit only ever registers the
+    // four vanilla IDs. A custom ID is therefore accepted only after (1) its FSH resource is
+    // proven to exist and (2) it has been inserted into the registry and re-found by the same
+    // bucket walk Draw performs. Any failure keeps the pole on the vanilla texture.
+    // ------------------------------------------------------------------
+    std::unordered_set<uint32_t> gRegisteredPoleTextures; // IDs this DLL inserted this session
+
+    // Read-only re-find using the exact node layout Draw's own walk uses.
+    bool PoleTextureRegistryContains(const uint32_t textureId) {
+        const auto* const bucketsBegin = *reinterpret_cast<uint8_t* const*>(kPoleTextureBucketsBegin);
+        const auto* const bucketsEnd = *reinterpret_cast<uint8_t* const*>(kPoleTextureBucketsEnd);
+        if (bucketsBegin == nullptr || bucketsEnd <= bucketsBegin) {
+            return false;
+        }
+        const auto bucketCount = static_cast<uint32_t>((bucketsEnd - bucketsBegin) / 4);
+        const uint8_t* node =
+            reinterpret_cast<const uint8_t* const*>(bucketsBegin)[textureId % bucketCount];
+        while (node != nullptr && *reinterpret_cast<const uint32_t*>(node + 4) != textureId) {
+            node = *reinterpret_cast<const uint8_t* const*>(node);
+        }
+        return node != nullptr;
+    }
+
+    bool EnsurePoleTextureRegistered(const uint32_t textureId, const char* const use) {
+        if (textureId == kVanillaFloorTextureId || textureId == kVanillaWallTextureId ||
+            gRegisteredPoleTextures.contains(textureId)) {
+            return true;
+        }
+
+        // Registered by someone else (another pole DLL, or a future engine change): usable as-is,
+        // and its live binding must not be disturbed.
+        if (PoleTextureRegistryContains(textureId)) {
+            gRegisteredPoleTextures.insert(textureId);
+            return true;
+        }
+
+        const cIGZPersistResourceManagerPtr resourceManager;
+        const cGZPersistResourceKey key(kFshTypeId, kPoleTextureGroupId, textureId);
+        if (!resourceManager || !resourceManager->TestForKey(key)) {
+            LOG_WARN("PowerPoleCustomization: {} texture ID 0x{:08X} has no FSH resource "
+                     "(type 0x{:08X}, group 0x{:08X}); keeping the vanilla texture. Custom pad "
+                     "textures must ship as FSH in that exact group.",
+                     use, textureId, kFshTypeId, kPoleTextureGroupId);
+            return false;
+        }
+
+        using RegistryInsertFn = uint32_t*(__thiscall*)(void* map, const uint32_t* key);
+        uint32_t* const slot = reinterpret_cast<RegistryInsertFn>(kPoleTextureRegistryInsert)(
+            reinterpret_cast<void*>(kPoleTextureRegistry), &textureId);
+        if (slot == nullptr || !PoleTextureRegistryContains(textureId)) {
+            LOG_ERROR("PowerPoleCustomization: engine texture-registry insert for {} texture ID "
+                      "0x{:08X} could not be verified; keeping the vanilla texture.", use, textureId);
+            return false;
+        }
+        *slot = 0; // fresh node: no binding yet (StaticInit zeroes its own fresh slots the same way)
+        // Force the engine to reload every registered binding (including this one) on the next
+        // Draw: zoom values are 1-5, so 0 always mismatches.
+        *reinterpret_cast<uint32_t*>(kPoleTextureZoomGlobal) = 0;
+        gRegisteredPoleTextures.insert(textureId);
+        LOG_INFO("PowerPoleCustomization: registered {} texture ID 0x{:08X} with the engine's "
+                 "power-pole texture registry.", use, textureId);
         return true;
     }
 
@@ -791,19 +892,24 @@ namespace {
             out.hasFoundationHalfExtent = true;
             any = true;
         }
+        // Texture IDs are accepted only once the FSH resource is proven to exist and the ID is
+        // registered with the engine's texture registry -- otherwise Draw() would null-deref on
+        // the unknown ID (see EnsurePoleTextureRegistered). Failure falls back to vanilla.
         if (TryReadUint32Property(holder, kPropFoundationFloorTextureId, out.foundationFloorTextureId)) {
-            out.hasFloorTexture = true;
-            any = true;
-            LOG_WARN("PowerPoleCustomization: custom floor texture ID 0x{:08X} is unvalidated -- an ID with "
-                     "no loaded texture resource can crash the game (null dereference in the engine's texture "
-                     "cache lookup, not a transparent pad). Verify it resolves to a real loaded texture.",
-                     out.foundationFloorTextureId);
+            if (EnsurePoleTextureRegistered(out.foundationFloorTextureId, "floor")) {
+                out.hasFloorTexture = true;
+                any = true;
+            } else {
+                out.foundationFloorTextureId = kVanillaFloorTextureId;
+            }
         }
         if (TryReadUint32Property(holder, kPropFoundationWallTextureId, out.foundationWallTextureId)) {
-            out.hasWallTexture = true;
-            any = true;
-            LOG_WARN("PowerPoleCustomization: custom wall texture ID 0x{:08X} is unvalidated -- same crash "
-                     "risk as the floor texture ID.", out.foundationWallTextureId);
+            if (EnsurePoleTextureRegistered(out.foundationWallTextureId, "wall")) {
+                out.hasWallTexture = true;
+                any = true;
+            } else {
+                out.foundationWallTextureId = kVanillaWallTextureId;
+            }
         }
 
         // Attach basis is only meaningful alongside custom attach points, so it deliberately does
@@ -1628,6 +1734,19 @@ namespace {
         }
     }
 
+    using DestructorFn = void(__thiscall*)(void* occupant);
+
+    // Runs when the engine destroys a pole (demolition, zone rebuild, city teardown). Dropping the
+    // side-table entries here -- unconditionally, even while disabled -- guarantees no stale
+    // customization can attach to a future pole that recycles the same 292-byte pool slot, and
+    // keeps both maps from growing across a long session.
+    void __fastcall DestructorHook(void* occupant, void* /*edx*/) {
+        gOverrides.erase(occupant);
+        ForgetOccupantWidths(occupant);
+        const auto original = reinterpret_cast<DestructorFn>(kDestructor);
+        original(occupant);
+    }
+
     void __fastcall InitConnectionPointsHook(void* occupant, void* /*edx*/) {
         const auto original = reinterpret_cast<InitConnectionPointsFn>(kInitConnectionPoints);
         original(occupant); // always run vanilla first: it still owns model load + default-table selection
@@ -1702,7 +1821,7 @@ namespace {
         const uint32_t saved = *field;
         if (gSettings.enabled) {
             uint32_t resolved = ResolveMaxCellsBetweenPoles(saved);
-            // TEMPORARY PoC-ONLY: during a FAR drag every synthetic step is one FAR period, and
+            // During a FAR drag every synthetic step is one FAR period, and
             // the cadence field counts step indices, not literal cells (docs SS17.C). Poles can
             // only sit on FAR nodes, so convert the cell spacing into whole periods (nearest,
             // minimum 1): FAR-2 with vanilla 10 -> every 5 nodes = 10 cells along the major axis.
@@ -1717,8 +1836,8 @@ namespace {
     }
 
     // ------------------------------------------------------------------
-    // TEMPORARY PoC-ONLY: FAR drag hook (see the kDrawNetworkLine constants block above and
-    // docs/sc4-powerline-tool-re.md SS17 for the design).
+    // FAR drag hook (see the kDrawNetworkLine constants block above and
+    // docs/sc4-powerline-tool-re.md SS17 for the design). Validated in-game 2026-07-19.
     // ------------------------------------------------------------------
     using DrawNetworkLineFn = uint8_t(__thiscall*)(void* tool, uint32_t* start, uint32_t* end,
                                                     uint8_t straightOnly, int networkType);
@@ -2418,6 +2537,24 @@ namespace {
 
         LoadPoleStyles(ini);
     }
+
+    // City teardown: every pole is destroyed (the destructor hook empties the side tables
+    // per-pole), the engine's texture registry is torn down by its own static shutdown, and the
+    // View3D window this DLL cached for overlay visibility is destroyed with the city. Belt and
+    // suspenders: drop everything city-scoped here so nothing stale survives into the next city,
+    // whatever destruction order the engine picked.
+    void FlushCityScopedState() {
+        gOverrides.clear();
+        gPolylineWidthOverrides.clear();
+        gRegisteredPoleTextures.clear();
+        gFarDragActive = false;
+        gFarSnapAnchorValid = false;
+        if (gView3D != nullptr) {
+            gView3D->Release();
+            gView3D = nullptr;
+        }
+        LOG_DEBUG("PowerPoleCustomization: city-scoped state flushed on city shutdown.");
+    }
 }
 
 class PowerPoleCustomizationDirector final : public cRZMessage2COMDirector {
@@ -2462,6 +2599,9 @@ public:
         installed += InstallCallSitePatch(initConnectionPointsPatches_[2], "InitConnectionPoints@Read",
                                            kInitConnectionPoints_CallSite_Read, kInitConnectionPoints,
                                            &InitConnectionPointsHook);
+        installed += InstallCallSitePatch(destructorPatch_, "Destructor@DeletingDtor",
+                                           kDestructor_CallSite_DeletingDtor, kDestructor,
+                                           &DestructorHook);
 
         for (size_t i = 0; i < kAddConnectionCallSites.size(); ++i) {
             installed += InstallCallSitePatch(addConnectionPatches_[i], "AddConnection@PlacePoles",
@@ -2498,7 +2638,7 @@ public:
         installed += poleStyleLookupPatch2_.Install(kPoleStyleLookupSite2,
             {0x8b, 0x04, 0xbd, 0xb0, 0x67, 0xb4, 0x00}, &PoleStyleLookupHook, "PoleStyleLookup@2") ? 1 : 0;
 
-        // TEMPORARY PoC-ONLY: FAR drag (docs SS17). A vtable-slot swap, not a code patch.
+        // FAR drag (docs SS17). A vtable-slot swap, not a code patch.
         const bool farInstalled = farDrawNetworkLinePatch_.Install(kPowerToolDrawNetworkLineSlot, kDrawNetworkLine,
                                                                     &FarDrawNetworkLineHook, "FarDrawNetworkLine");
         installed += farInstalled ? 1 : 0;
@@ -2516,7 +2656,16 @@ public:
         LOG_INFO("PowerPoleCustomization: installed {} of {} patches.", installed,
                  initConnectionPointsPatches_.size() + kAddConnectionCallSites.size() +
                  kUpdateConnectionCallSites.size() + kDeterminePolePositionsCallSites.size() +
-                 2 + createFloorPatches_.size() + 4 + 2 + 1 + 1 + 1);
+                 2 + createFloorPatches_.size() + 4 + 2 + 1 + 1 + 1 + 1);
+
+        cIGZMessageServer2Ptr pMS2;
+        if (pMS2) {
+            pMS2->AddNotification(this, kSC4MessagePreCityShutdown);
+            messageServer_ = pMS2;
+        } else {
+            LOG_WARN("PowerPoleCustomization: message server unavailable; city-shutdown flush "
+                     "relies on the destructor hook alone.");
+        }
 
         const cISC4AppPtr app;
         if (app) {
@@ -2542,11 +2691,16 @@ public:
             cheatManager_->RemoveNotification2(this, 0);
             cheatManager_.Reset();
         }
+        if (messageServer_) {
+            messageServer_->RemoveNotification(this, kSC4MessagePreCityShutdown);
+            messageServer_ = nullptr;
+        }
         TeardownStatusOverlay();
         onKeyDownPatch_.Uninstall();
         farDrawNetworkLinePatch_.Uninstall();
         keepWiresPatch_.Uninstall();
         modelInstanceIdPatch_.Uninstall();
+        destructorPatch_.Uninstall();
         for (auto& patch : initConnectionPointsPatches_) patch.Uninstall();
         for (auto& patch : addConnectionPatches_) patch.Uninstall();
         for (auto& patch : updateConnectionPatches_) patch.Uninstall();
@@ -2570,8 +2724,10 @@ public:
     bool DoMessage(cIGZMessage2* pMsg) override {
         if (pMsg) {
             auto* const stdMsg = static_cast<cIGZMessage2Standard*>(pMsg);
-            if (stdMsg->GetType() == kCheatCodeMessageType &&
-                static_cast<uint32_t>(stdMsg->GetData1()) == kCheatKeepWires) {
+            if (stdMsg->GetType() == kSC4MessagePreCityShutdown) {
+                FlushCityScopedState();
+            } else if (stdMsg->GetType() == kCheatCodeMessageType &&
+                       static_cast<uint32_t>(stdMsg->GetData1()) == kCheatKeepWires) {
                 gKeepWiresOnZoneChange = !gKeepWiresOnZoneChange;
                 LOG_INFO("PowerPoleCustomization: keepwires {} -- zone changes {} "
                          "the power-line remove/reposition/rebuild handler.",
@@ -2655,6 +2811,7 @@ private:
 
     std::array<TerrainDecal::RelativeCallPatch, 3> initConnectionPointsPatches_{};
     TerrainDecal::RelativeCallPatch modelInstanceIdPatch_{};
+    TerrainDecal::RelativeCallPatch destructorPatch_{}; // side-table cleanup on pole destruction
     std::array<TerrainDecal::RelativeCallPatch, 4> addConnectionPatches_{};
     std::array<TerrainDecal::RelativeCallPatch, 2> updateConnectionPatches_{};
     std::array<TerrainDecal::RelativeCallPatch, 3> determinePolePositionsPatches_{};
@@ -2673,6 +2830,7 @@ private:
     cIGZImGuiService* imguiService_ = nullptr; // optional; null when SC4RenderServices/imgui.dll absent
     bool overlayRegistered_ = false;
     cRZAutoRefCount<cIGZCheatCodeManager> cheatManager_; // holds the keepwires cheat registration
+    cRZAutoRefCount<cIGZMessageServer2> messageServer_;  // holds the city-shutdown notification
 };
 
 static PowerPoleCustomizationDirector sDirector;
@@ -2699,8 +2857,14 @@ cRZCOMDllDirector* RZGetCOMDllDirector() {
 //      doesn't render anything -- removed from the render path. The vtable mapping itself remains
 //      documented in docs/sc4-powerline-tool-re.md if city-object/save-load registration is wanted
 //      again later; the code for it was deleted from this file (kept unused code out).
-//   5. IMPLEMENTED, awaiting in-game validation: full 1-N geometry and sag rebuild in the active
+//   5. CLOSED (validated in-game 2026-07-19): full 1-N geometry and sag rebuild in the active
 //      tConnection regular-polyline vector, including counts below vanilla's fixed four.
-//   6. IMPLEMENTED, awaiting in-game validation: per-wire width lookup at 0x0064b855. The patch is
+//   6. CLOSED (validated in-game 2026-07-19): per-wire width lookup at 0x0064b855. The patch is
 //      byte-validated before installation and falls back to vanilla width for unregistered wires.
+//   7. CLOSED (2026-07-19): pole lifetime. The complete destructor (0x0064dfc0) is hooked at its
+//      sole call site inside the scalar deleting destructor (0x0064e383), so side-table entries
+//      die with their pole; a PreCityShutdown flush clears all remaining city-scoped state.
+//   8. CLOSED (2026-07-19): custom foundation texture IDs are validated against the resource
+//      manager and registered with the engine's texture registry before use (StaticInit only
+//      registers the four vanilla IDs; an unregistered ID null-derefs in Draw).
 // ------------------------------------------------------------------

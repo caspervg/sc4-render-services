@@ -6,9 +6,11 @@ Now added: named `FAR-<ratio>.<orient>` parsing + a `[PowerPoles.FAR]` default s
 (`ParseFarHeadingKeys`), the resolution-order lookup (`ResolveFarInstance`), drag-time heading
 capture (`gFarDragRatioIndex`/`gFarDragOrient`) feeding `ResolvePoleInstanceForDirectionMask`, and
 the per-endpoint attach-yaw refactor with an optional `kPropAttachBasisDegrees` exemplar property
-(`ComputeSpanBearing`/`AttachBasisAngle`, replacing the single `ComputeYawDelta`). Not yet done:
-in-game verification, and authoring pole prop exemplars that point the `FAR-*` keys at real angled
-S3D art.
+(`ComputeSpanBearing`/`AttachBasisAngle`, replacing the single `ComputeYawDelta`). In-game
+verification completed 2026-07-19. Example angled-art exemplars ship in
+`assets/power-pole-customization/SC4PowerPoleFA2Example.dat` (instances `0xB07EFA20`/`0xB07EFA21`,
+vanilla pole group `0x088E1962`, RKT1 -> the P3 NL266/NR266 26.6-degree tangent S3Ds), with a
+matching commented `[PowerPoles.FAR]` preset in `SC4PowerPoleCustomization.ini`.
 
 ## Art source found (2026-07-04)
 
