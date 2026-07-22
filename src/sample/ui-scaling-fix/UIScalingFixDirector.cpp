@@ -56,6 +56,12 @@ namespace {
     constexpr uintptr_t kMiniMapInitTerrainRaster = 0x007A7840;
     constexpr uintptr_t kMiniMapUpdateTerrainCallSite = 0x007A8721;
     constexpr uintptr_t kMiniMapUpdateTerrain = 0x007A7FF0;
+    // cHTMLDocument's constructor copies the seven legacy HTML font sizes
+    // through SetFontSizeTable. News/advisor text uses hardcoded HTML SIZE=3
+    // tags, so scaling Font.ini alone does not affect it.
+    constexpr uintptr_t kHTMLSetFontSizeTableCallSite = 0x00905C8B;
+    constexpr uintptr_t kHTMLSetFontSizeTable = 0x008FEEB8;
+    constexpr int32_t kHTMLFontSizeCount = 7;
     constexpr uint32_t kMiniMapInternalSizeOffset = 0xE4;
     constexpr uint32_t kMiniMapCityWidthOffset = 0xE8;
     constexpr uint32_t kMiniMapCityHeightOffset = 0xEC;
@@ -99,6 +105,7 @@ namespace {
     uint32_t gCatalogItemsSeen = 0;
     uint32_t gCatalogIconsScaled = 0;
     uint32_t gDataViewsAreaCalls = 0;
+    uint32_t gHTMLDocumentsScaled = 0;
     int32_t gLastLoggedExtendedTerrainExponent = INT32_MAX;
 
     class VTableEntryPatch final {
@@ -224,6 +231,35 @@ namespace {
     int32_t ScalePixels(const int32_t value) {
         const long scaled = std::lround(static_cast<double>(value) * gScale);
         return static_cast<int32_t>(scaled > 1 ? scaled : 1);
+    }
+
+    using HTMLSetFontSizeTableFn = void(__thiscall*)(void*, const uint32_t*, int32_t);
+    void __fastcall HTMLSetFontSizeTableHook(
+        void* self, void*, const uint32_t* fontSizes, const int32_t count) {
+        if (fontSizes == nullptr || count != kHTMLFontSizeCount) {
+            reinterpret_cast<HTMLSetFontSizeTableFn>(kHTMLSetFontSizeTable)(
+                self, fontSizes, count);
+            return;
+        }
+
+        uint32_t scaledFontSizes[kHTMLFontSizeCount]{};
+        for (int32_t i = 0; i < kHTMLFontSizeCount; ++i) {
+            scaledFontSizes[i] = static_cast<uint32_t>(ScalePixels(
+                static_cast<int32_t>(fontSizes[i])));
+        }
+
+        // The original function also caps count at seven and copies the table
+        // immediately, so this stack buffer does not escape the call.
+        reinterpret_cast<HTMLSetFontSizeTableFn>(kHTMLSetFontSizeTable)(
+            self, scaledFontSizes, kHTMLFontSizeCount);
+
+        ++gHTMLDocumentsScaled;
+        if (gHTMLDocumentsScaled == 1) {
+            LOG_INFO("UIScalingFix: scaled HTML font table to [{}, {}, {}, {}, {}, {}, {}].",
+                     scaledFontSizes[0], scaledFontSizes[1], scaledFontSizes[2],
+                     scaledFontSizes[3], scaledFontSizes[4], scaledFontSizes[5],
+                     scaledFontSizes[6]);
+        }
     }
 
     float ReadScaleRecord() {
@@ -638,6 +674,10 @@ public:
         miniMapUpdateTerrainPatch_.Configure(
             "cSC4WinMiniMap::Update terrain call", kMiniMapUpdateTerrainCallSite,
             reinterpret_cast<void*>(&MiniMapUpdateTerrainHook));
+        htmlSetFontSizeTablePatch_.Configure(
+            "cHTMLDocument::SetFontSizeTable constructor call",
+            kHTMLSetFontSizeTableCallSite,
+            reinterpret_cast<void*>(&HTMLSetFontSizeTableHook));
 
         // The Y operands are signed disp8 values, so this exact patch supports
         // scales through 2x. Larger factors need a small code cave rather than
@@ -677,7 +717,19 @@ public:
                       static_cast<uint32_t>(kMiniMapUpdateTerrain));
         }
 
-        if (!terrainPatchTargetMatches || !catalogAddItemPatch_.Install() ||
+        const bool htmlFontPatchInstalled = htmlSetFontSizeTablePatch_.Install();
+        const bool htmlFontPatchTargetMatches = htmlFontPatchInstalled &&
+            htmlSetFontSizeTablePatch_.GetOriginalTarget() == kHTMLSetFontSizeTable;
+        if (htmlFontPatchInstalled && !htmlFontPatchTargetMatches) {
+            LOG_ERROR("UIScalingFix: HTML font-table call at 0x{:08X} targets 0x{:08X}; "
+                      "expected 0x{:08X}.",
+                      static_cast<uint32_t>(kHTMLSetFontSizeTableCallSite),
+                      static_cast<uint32_t>(htmlSetFontSizeTablePatch_.GetOriginalTarget()),
+                      static_cast<uint32_t>(kHTMLSetFontSizeTable));
+        }
+
+        if (!terrainPatchTargetMatches || !htmlFontPatchTargetMatches ||
+            !catalogAddItemPatch_.Install() ||
             !catalogSetItemSizePatch_.Install() ||
             !catalogFrameInitPatch_.Install() || !catalogFramePositionPatch_.Install() ||
             !miniMapSetAreaPatch_.Install() || !miniMapSetOverlayPatch_.Install() ||
@@ -694,6 +746,7 @@ public:
             legendSwatchX2Patch_.Uninstall();
             legendSwatchX1Patch_.Uninstall();
             legendSwatchY1Patch_.Uninstall();
+            htmlSetFontSizeTablePatch_.Uninstall();
             miniMapUpdateTerrainPatch_.Uninstall();
             miniMapSetOverlayPatch_.Uninstall();
             miniMapSetAreaPatch_.Uninstall();
@@ -705,8 +758,8 @@ public:
             return true;
         }
 
-        LOG_INFO("UIScalingFix: scale {:.3f} active; tertiary catalog scaling, Data Views "
-                 "geometry guard, and extended terrain scaling installed.",
+        LOG_INFO("UIScalingFix: scale {:.3f} active; HTML text, tertiary catalog, Data Views "
+                 "geometry, and extended terrain scaling installed.",
                  gScale);
         return true;
     }
@@ -720,6 +773,7 @@ public:
         legendSwatchX2Patch_.Uninstall();
         legendSwatchX1Patch_.Uninstall();
         legendSwatchY1Patch_.Uninstall();
+        htmlSetFontSizeTablePatch_.Uninstall();
         miniMapUpdateTerrainPatch_.Uninstall();
         miniMapSetOverlayPatch_.Uninstall();
         miniMapSetAreaPatch_.Uninstall();
@@ -744,6 +798,7 @@ private:
     VTableEntryPatch catalogFramePositionPatch_{};
     VTableEntryPatch miniMapSetAreaPatch_{};
     VTableEntryPatch miniMapSetOverlayPatch_{};
+    TerrainDecal::RelativeCallPatch htmlSetFontSizeTablePatch_{};
     TerrainDecal::RelativeCallPatch miniMapUpdateTerrainPatch_{};
     ImmediateValuePatch<uint8_t> legendSwatchY1Patch_{};
     ImmediateValuePatch<uint32_t> legendSwatchX1Patch_{};
