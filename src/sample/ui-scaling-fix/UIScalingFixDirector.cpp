@@ -56,6 +56,10 @@ namespace {
     constexpr uintptr_t kMiniMapInitTerrainRaster = 0x007A7840;
     constexpr uintptr_t kMiniMapUpdateTerrainCallSite = 0x007A8721;
     constexpr uintptr_t kMiniMapUpdateTerrain = 0x007A7FF0;
+    // cSC4WinMapView's byte-grid renderer calls a power-of-two-only rasterizer.
+    // Its replication loop overruns non-power-of-two targets such as 384x384.
+    constexpr uintptr_t kDataViewRasterizeCallSite = 0x007A2628;
+    constexpr uintptr_t kDataViewRasterize = 0x0079ED90;
     // cHTMLDocument's constructor copies the seven legacy HTML font sizes
     // through SetFontSizeTable. News/advisor text uses hardcoded HTML SIZE=3
     // tags, so scaling Font.ini alone does not affect it.
@@ -107,6 +111,7 @@ namespace {
     uint32_t gDataViewsAreaCalls = 0;
     uint32_t gHTMLDocumentsScaled = 0;
     int32_t gLastLoggedExtendedTerrainExponent = INT32_MAX;
+    bool gLoggedArbitraryDataViewRaster = false;
 
     class VTableEntryPatch final {
     public:
@@ -460,6 +465,86 @@ namespace {
     using MiniMapInitTerrainRasterFn = void(__thiscall*)(void*);
     using MiniMapUpdateTerrainFn = void(__thiscall*)(void*);
 
+    // MSVC's 32-bit std::vector layout. The source is a vector of byte-vector
+    // rows passed by cSC4WinMapView to the stock rasterizer at 0x0079ED90.
+    struct VectorLayout32 {
+        uintptr_t begin;
+        uintptr_t end;
+        uintptr_t capacity;
+    };
+    static_assert(sizeof(VectorLayout32) == 12);
+
+    void __cdecl DataViewRasterizeHook(
+        const VectorLayout32* rows, const int32_t sourceHeight, const int32_t sourceWidth,
+        cIGZBuffer* target, const int32_t targetWidth, const int32_t targetHeight,
+        const uint32_t* palette, const int32_t orientation) {
+        if (rows == nullptr || target == nullptr || palette == nullptr ||
+            sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0 ||
+            rows->end < rows->begin ||
+            static_cast<size_t>(rows->end - rows->begin) /
+                    sizeof(VectorLayout32) < static_cast<size_t>(sourceHeight) ||
+            orientation != 0 || target->GetBitsPerPixel() != 32) {
+            LOG_ERROR("UIScalingFix: rejected invalid Data Views raster {}x{} -> {}x{} "
+                      "(orientation {}, {} bpp).",
+                      sourceWidth, sourceHeight, targetWidth, targetHeight, orientation,
+                      target != nullptr ? target->GetBitsPerPixel() : 0);
+            return;
+        }
+
+        const int32_t outputWidth = (std::min)(targetWidth, target->Width());
+        const int32_t outputHeight = (std::min)(targetHeight, target->Height());
+        if (outputWidth <= 0 || outputHeight <= 0 || !target->Lock(0x8040)) {
+            LOG_ERROR("UIScalingFix: failed to lock the Data Views {}x{} overlay buffer.",
+                      targetWidth, targetHeight);
+            return;
+        }
+
+        auto* const destination = reinterpret_cast<uint8_t*>(
+            static_cast<uintptr_t>(target->GetColorSurfaceBits()));
+        const uint32_t destinationStride = target->GetColorSurfaceStride();
+        const auto* const sourceRows = reinterpret_cast<const VectorLayout32*>(rows->begin);
+        if (destination == nullptr || destinationStride < static_cast<uint32_t>(outputWidth) * 4U) {
+            target->Unlock(0x8040);
+            LOG_ERROR("UIScalingFix: Data Views overlay has invalid bits or stride {}.",
+                      destinationStride);
+            return;
+        }
+
+        bool valid = true;
+        for (int32_t y = 0; y < outputHeight && valid; ++y) {
+            const int32_t sourceY = static_cast<int32_t>(
+                static_cast<uint64_t>(y) * static_cast<uint32_t>(sourceHeight) /
+                static_cast<uint32_t>(outputHeight));
+            const VectorLayout32& sourceRow = sourceRows[sourceY];
+            if (sourceRow.end < sourceRow.begin ||
+                static_cast<size_t>(sourceRow.end - sourceRow.begin) <
+                    static_cast<size_t>(sourceWidth)) {
+                valid = false;
+                break;
+            }
+            const auto* const source = reinterpret_cast<const uint8_t*>(sourceRow.begin);
+            auto* const output = reinterpret_cast<uint32_t*>(
+                destination + static_cast<size_t>(y) * destinationStride);
+            for (int32_t x = 0; x < outputWidth; ++x) {
+                const int32_t sourceX = static_cast<int32_t>(
+                    static_cast<uint64_t>(x) * static_cast<uint32_t>(sourceWidth) /
+                    static_cast<uint32_t>(outputWidth));
+                output[x] = palette[source[sourceX]];
+            }
+        }
+        target->Unlock(0x8040);
+
+        if (!valid) {
+            LOG_ERROR("UIScalingFix: Data Views source grid changed while rasterizing.");
+        } else if (!gLoggedArbitraryDataViewRaster &&
+                   (targetWidth != sourceWidth && targetWidth % sourceWidth != 0)) {
+            gLoggedArbitraryDataViewRaster = true;
+            LOG_INFO("UIScalingFix: rendered Data Views city overlay {}x{} -> {}x{} with "
+                     "arbitrary-ratio nearest-neighbor scaling.",
+                     sourceWidth, sourceHeight, outputWidth, outputHeight);
+        }
+    }
+
     [[nodiscard]] bool GetNativeTerrainRenderSize(
         const int32_t cityWidth, const int32_t cityHeight, const int32_t exponent,
         int32_t& renderWidth, int32_t& renderHeight) {
@@ -674,6 +759,9 @@ public:
         miniMapUpdateTerrainPatch_.Configure(
             "cSC4WinMiniMap::Update terrain call", kMiniMapUpdateTerrainCallSite,
             reinterpret_cast<void*>(&MiniMapUpdateTerrainHook));
+        dataViewRasterizePatch_.Configure(
+            "Data Views arbitrary-ratio rasterizer", kDataViewRasterizeCallSite,
+            reinterpret_cast<void*>(&DataViewRasterizeHook));
         htmlSetFontSizeTablePatch_.Configure(
             "cHTMLDocument::SetFontSizeTable constructor call",
             kHTMLSetFontSizeTableCallSite,
@@ -728,7 +816,19 @@ public:
                       static_cast<uint32_t>(kHTMLSetFontSizeTable));
         }
 
+        const bool dataViewRasterPatchInstalled = dataViewRasterizePatch_.Install();
+        const bool dataViewRasterPatchTargetMatches = dataViewRasterPatchInstalled &&
+            dataViewRasterizePatch_.GetOriginalTarget() == kDataViewRasterize;
+        if (dataViewRasterPatchInstalled && !dataViewRasterPatchTargetMatches) {
+            LOG_ERROR("UIScalingFix: Data Views rasterizer call at 0x{:08X} targets 0x{:08X}; "
+                      "expected 0x{:08X}.",
+                      static_cast<uint32_t>(kDataViewRasterizeCallSite),
+                      static_cast<uint32_t>(dataViewRasterizePatch_.GetOriginalTarget()),
+                      static_cast<uint32_t>(kDataViewRasterize));
+        }
+
         if (!terrainPatchTargetMatches || !htmlFontPatchTargetMatches ||
+            !dataViewRasterPatchTargetMatches ||
             !catalogAddItemPatch_.Install() ||
             !catalogSetItemSizePatch_.Install() ||
             !catalogFrameInitPatch_.Install() || !catalogFramePositionPatch_.Install() ||
@@ -746,6 +846,7 @@ public:
             legendSwatchX2Patch_.Uninstall();
             legendSwatchX1Patch_.Uninstall();
             legendSwatchY1Patch_.Uninstall();
+            dataViewRasterizePatch_.Uninstall();
             htmlSetFontSizeTablePatch_.Uninstall();
             miniMapUpdateTerrainPatch_.Uninstall();
             miniMapSetOverlayPatch_.Uninstall();
@@ -773,6 +874,7 @@ public:
         legendSwatchX2Patch_.Uninstall();
         legendSwatchX1Patch_.Uninstall();
         legendSwatchY1Patch_.Uninstall();
+        dataViewRasterizePatch_.Uninstall();
         htmlSetFontSizeTablePatch_.Uninstall();
         miniMapUpdateTerrainPatch_.Uninstall();
         miniMapSetOverlayPatch_.Uninstall();
@@ -800,6 +902,7 @@ private:
     VTableEntryPatch miniMapSetOverlayPatch_{};
     TerrainDecal::RelativeCallPatch htmlSetFontSizeTablePatch_{};
     TerrainDecal::RelativeCallPatch miniMapUpdateTerrainPatch_{};
+    TerrainDecal::RelativeCallPatch dataViewRasterizePatch_{};
     ImmediateValuePatch<uint8_t> legendSwatchY1Patch_{};
     ImmediateValuePatch<uint32_t> legendSwatchX1Patch_{};
     ImmediateValuePatch<uint32_t> legendSwatchX2Patch_{};
