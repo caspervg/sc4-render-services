@@ -179,6 +179,14 @@ namespace {
     constexpr uint32_t kConnection_IsRenderOwner = 0x09;
     constexpr uint32_t kConnection_PolylinesBegin = 0x14; // vector<vector<cS3DVector3>>
     constexpr uint32_t kConnection_PolylinesEnd = 0x18;
+    // Second vector<vector<cS3DVector3>> (confirmed 2026-07-19 via AddConnection's decompile and
+    // DrawPowerlines' reads at [entry+0x20]/[entry+0x24]): coarse 4-point copies of each strand,
+    // built by AddConnection ONLY when the span crosses water (terrain service vtbl+0x88 test) and
+    // drawn with the 0xC9AF0FCD texture. Same element layout and the same insert/erase helpers as
+    // the regular list, with a fixed tessellation count of 3 segments after the start point.
+    constexpr uint32_t kConnection_WaterPolylinesBegin = 0x20;
+    constexpr uint32_t kConnection_WaterPolylinesEnd = 0x24;
+    constexpr int32_t kWaterPolylinePointCount = 4; // start + 3 tessellated, matching vanilla
     constexpr uint32_t kConnection_Size = 0x2c;
 
     // DrawPowerlines resolves the vanilla zoom-dependent width pointer at this instruction range.
@@ -268,6 +276,21 @@ namespace {
     // perpendicular FAR headings share one logical model but SC4 rotates the wrong member of the
     // pair. Absent/false preserves vanilla model selection exactly.
     constexpr uint32_t kPropInvertModelQuarterTurn = 0xB22A000E;
+    // Optional Uint32 texture IDs replacing the wire strand texture (vanilla 0xAA9DA78E) and the
+    // buoy/marker-ball texture (vanilla 0xC9AF0FCD) on every connection this pole render-owns.
+    // Validated and engine-registered exactly like the foundation textures (FSH group 0x1ABE787D).
+    constexpr uint32_t kPropWireTextureId = 0xB22A000F;
+    constexpr uint32_t kPropWireBuoyTextureId = 0xB22A0010;
+    // Optional Bool. Rotates the foundation pad (floor + walls) in the ground plane so it follows
+    // the pole's span bearing instead of staying axis-aligned -- the rotation is the minimal
+    // deviation from the nearest 90-degree multiple, so walls keep their vanilla sides. Applied
+    // only when every live connection of the pole agrees on one bearing (junctions stay vanilla).
+    constexpr uint32_t kPropFoundationFollowSpan = 0xB22A0011;
+    // Optional non-negative Float32: scales the water-crossing buoy/ball quads (1.0 = vanilla).
+    constexpr uint32_t kPropWaterBuoySizeScale = 0xB22A0012;
+    // Optional Uint32: points per water-crossing strand polyline; the engine draws points-1 balls,
+    // so vanilla's 4 points = 3 balls. Clamped to [2, 17] (1-16 balls).
+    constexpr uint32_t kPropWaterBuoyPointCount = 0xB22A0013;
     constexpr std::array<uint32_t, 4> kAttachPointProperties = {
         kPropAttachPointsDir0, kPropAttachPointsDir1, kPropAttachPointsDir2, kPropAttachPointsDir3,
     };
@@ -284,6 +307,11 @@ namespace {
     // vanilla CreateFloor runs is sufficient; CreateWalls needs no patch of its own.
     // ------------------------------------------------------------------
     constexpr uintptr_t kCreateFloor = 0x0064bfd0;
+    // cSC4PowerPoleOccupant::CreateWalls -- __thiscall, no args, called immediately after
+    // CreateFloor at every vanilla site (confirmed at SetPosition 0x0064c616). It rebuilds the two
+    // wall quads from the floor's own vertex buffer, so any floor transform applied before it runs
+    // (scale AND rotation) carries into the walls with no separate wall patch.
+    constexpr uintptr_t kCreateWalls = 0x0064c470;
     constexpr uintptr_t kCreateFloor_CallSite_SetPosition = 0x0064c611;
     constexpr uintptr_t kCreateFloor_CallSite_Draw = 0x0064c81f;
     // FUN_0064c6c0 -- almost certainly cSC4PowerPoleOccupant::ChangeZoomLevel (not yet renamed in
@@ -335,6 +363,32 @@ namespace {
     constexpr uintptr_t kPoleTextureZoomGlobal = 0x00b0c0a8;
     constexpr uint32_t kFshTypeId = 0x7ab50e44;
     constexpr uint32_t kPoleTextureGroupId = 0x1abe787d; // group ChangeZoomLevel loads bindings from
+
+    // Wire texture lookup sites inside DrawPowerlines (0x0064b750). Each is a single 5-byte
+    // `MOV ESI, imm32` (opcode 0xBE) whose value feeds BOTH the bucket DIV and the chain-walk
+    // compare of the texture-registry walk -- unlike Draw's floor/wall pair-sites, one patch per
+    // texture suffices. At both sites EBP holds the current tConnection entry (confirmed: the
+    // preceding instructions read the render-owner flag at [EBP+0x9] and the buoy vector at
+    // [EBP+0x20]/[EBP+0x24]), which is exactly the key the DLL's connection-texture map uses.
+    // 0xAA9DA78E textures the strand polylines; 0xC9AF0FCD textures the buoy/marker balls.
+    constexpr uintptr_t kWireStrandTextureSite = 0x0064b7ba;
+    constexpr uintptr_t kWireBuoyTextureSite = 0x0064b9e3;
+    constexpr uint32_t kVanillaWireStrandTextureId = 0xAA9DA78E;
+    constexpr uint32_t kVanillaWireBuoyTextureId = 0xC9AF0FCD;
+    constexpr uint8_t kMovEaxOpcode = 0xB8;
+    constexpr uint8_t kMovEsiOpcode = 0xBE;
+
+    // Water-crossing buoy/ball rendering inside DrawPowerlines (confirmed 2026-07-19): one
+    // billboarded quad is drawn per INTERIOR point of each water polyline (points-1 balls per
+    // strand), with half-size g_afPowerLineWidthFactors[zoom] * 4.0f (the constant at 0x00a8e17c).
+    // The zoom-table read at 0x0064ba6e -- `MOV EAX,[0x00b46798]; FLD [EAX+EDX*4];
+    // LEA EAX,[EAX+EDX*4]`, 11 bytes -- is the single chokepoint: everything after re-reads the
+    // size through EAX. At that instruction EDX holds the zoom and EDI the current inner polyline
+    // vector, so the hook can key a per-polyline-buffer override exactly like the wire-width hook
+    // and return a pointer to either the vanilla slot or a pre-scaled value.
+    constexpr uintptr_t kWaterBallSizeSite = 0x0064ba6e;
+    constexpr uint32_t kMinWaterPolylinePoints = 2;  // 1 ball per strand
+    constexpr uint32_t kMaxWaterPolylinePoints = 17; // 16 balls per strand
 
     // ------------------------------------------------------------------
     // Multiple pole "styles" (docs/sc4-powerline-tool-re.md SS "B. Multiple pole types/families").
@@ -555,6 +609,15 @@ namespace {
         bool hasFloorTexture = false;
         uint32_t foundationWallTextureId = kVanillaWallTextureId;
         bool hasWallTexture = false;
+        uint32_t wireTextureId = kVanillaWireStrandTextureId;
+        bool hasWireTexture = false;
+        uint32_t wireBuoyTextureId = kVanillaWireBuoyTextureId;
+        bool hasBuoyTexture = false;
+        bool foundationFollowSpan = false;
+        float waterBuoySizeScale = 1.0f;
+        bool hasWaterBuoySize = false;
+        uint32_t waterBuoyPointCount = 0; // 0 = vanilla count
+        bool hasWaterBuoyCount = false;
         // In-plane heading (radians, normalized to [0, pi)) the custom attach points were baked for.
         // Only consulted for directions that actually carry custom attach points.
         float attachBasisRadians = 0.0f;
@@ -600,6 +663,20 @@ namespace {
     // Keyed by the inner vector's point-buffer address. Outer vector reallocation deep-copies the
     // inner vectors, so registrations are made only after the full connection rebuild is complete.
     std::unordered_map<const void*, PolylineWidthOverride> gPolylineWidthOverrides;
+
+    // Per-connection wire/buoy texture override, keyed by the tConnection entry address DrawPowerlines
+    // holds in EBP at both texture-lookup sites. Entry addresses move when a pole's connections
+    // vector reallocates, so RegisterOccupantConnectionTextures() erases-by-owner and re-registers
+    // every render-owner entry of the pole on each AddConnection/UpdateConnection -- the only
+    // operations that grow the vector. A shrink (neighbor demolition) keeps the buffer, and because
+    // the texture pair is uniform across one pole's connections, a shifted-but-still-registered
+    // entry resolves to the same texture either way.
+    struct ConnectionTextureOverride {
+        void* owner = nullptr;
+        uint32_t strandTextureId = kVanillaWireStrandTextureId;
+        uint32_t buoyTextureId = kVanillaWireBuoyTextureId;
+    };
+    std::unordered_map<const void*, ConnectionTextureOverride> gConnectionTextureOverrides;
 
     // ------------------------------------------------------------------
     // Property reading. cISCPropertyHolder doesn't have a typed array getter (SCPropertyUtil only
@@ -749,8 +826,9 @@ namespace {
 
     bool EnsurePoleTextureRegistered(const uint32_t textureId, const char* const use) {
         if (textureId == kVanillaFloorTextureId || textureId == kVanillaWallTextureId ||
+            textureId == kVanillaWireStrandTextureId || textureId == kVanillaWireBuoyTextureId ||
             gRegisteredPoleTextures.contains(textureId)) {
-            return true;
+            return true; // the four vanilla IDs are registered by StaticInit itself
         }
 
         // Registered by someone else (another pole DLL, or a future engine change): usable as-is,
@@ -910,6 +988,36 @@ namespace {
             } else {
                 out.foundationWallTextureId = kVanillaWallTextureId;
             }
+        }
+        if (TryReadUint32Property(holder, kPropWireTextureId, out.wireTextureId)) {
+            if (EnsurePoleTextureRegistered(out.wireTextureId, "wire strand")) {
+                out.hasWireTexture = true;
+                any = true;
+            } else {
+                out.wireTextureId = kVanillaWireStrandTextureId;
+            }
+        }
+        if (TryReadUint32Property(holder, kPropWireBuoyTextureId, out.wireBuoyTextureId)) {
+            if (EnsurePoleTextureRegistered(out.wireBuoyTextureId, "wire buoy")) {
+                out.hasBuoyTexture = true;
+                any = true;
+            } else {
+                out.wireBuoyTextureId = kVanillaWireBuoyTextureId;
+            }
+        }
+        if (TryReadBoolProperty(holder, kPropFoundationFollowSpan, out.foundationFollowSpan) &&
+            out.foundationFollowSpan) {
+            any = true;
+        }
+        if (TryReadNonNegativeFloatProperty(holder, kPropWaterBuoySizeScale, out.waterBuoySizeScale)) {
+            out.hasWaterBuoySize = true;
+            any = true;
+        }
+        if (TryReadUint32Property(holder, kPropWaterBuoyPointCount, out.waterBuoyPointCount)) {
+            out.waterBuoyPointCount = std::clamp(out.waterBuoyPointCount,
+                                                 kMinWaterPolylinePoints, kMaxWaterPolylinePoints);
+            out.hasWaterBuoyCount = true;
+            any = true;
         }
 
         // Attach basis is only meaningful alongside custom attach points, so it deliberately does
@@ -1092,11 +1200,14 @@ namespace {
         controlPoint[1] = straightLineY - scaledSag;
     }
 
-    // Builds one tessellated Bezier polyline between two attach points and appends it into the
-    // already-resolved active tConnection. Vanilla still supplies its horizontal control geometry
-    // and tessellation count; only the vertical sag component is scaled/clamped per wire.
-    void AppendPolylineToConnection(void* entry, const AttachPoint& a, const AttachPoint& b,
-                                    const float sagScale, const float maximumSag) {
+    // Builds one tessellated Bezier polyline between two attach points and appends it into one of
+    // the tConnection's two polyline lists (regular at +0x14, water-crossing coarse at +0x20 --
+    // both are vector<vector<cS3DVector3>> and share the engine insert helper). Vanilla still
+    // supplies its horizontal control geometry and tessellation count; only the vertical sag
+    // component is scaled/clamped per wire.
+    void AppendPolylineToList(void* entry, const uint32_t listBeginOffset, const uint32_t listEndOffset,
+                              const AttachPoint& a, const AttachPoint& b,
+                              const float sagScale, const float maximumSag) {
         float control1[3];
         float control2[3];
         int32_t pointCount = 0;
@@ -1116,8 +1227,50 @@ namespace {
         tessellate(p0, control1, control2, p1, reinterpret_cast<uintptr_t>(points.data() + 3), pointCount - 1);
 
         const void* view[3] = {points.data(), points.data() + points.size(), points.data() + points.size()};
-        auto* const polylines = reinterpret_cast<uint8_t*>(entry) + kConnection_PolylinesBegin;
-        void* const insertPos = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_PolylinesEnd);
+        auto* const polylines = reinterpret_cast<uint8_t*>(entry) + listBeginOffset;
+        void* const insertPos = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + listEndOffset);
+        const auto insert = reinterpret_cast<PolylineListInsertFn>(kPolylineListInsert);
+        insert(polylines, insertPos, view, 0, 1, 1);
+    }
+
+    void AppendPolylineToConnection(void* entry, const AttachPoint& a, const AttachPoint& b,
+                                    const float sagScale, const float maximumSag) {
+        AppendPolylineToList(entry, kConnection_PolylinesBegin, kConnection_PolylinesEnd,
+                             a, b, sagScale, maximumSag);
+    }
+
+    // Water-crossing variant. The engine draws one buoy ball at every point EXCEPT the last, so a
+    // plain 0..1 tessellation (vanilla's own layout) puts the first ball exactly on pole A's
+    // attach node. The list's only consumer is that ball loop, so the points are free to place:
+    // for B balls (totalPoints - 1), tessellate B+2 uniform points along the sagged bezier and
+    // drop the t=0 one -- the stored points sit at t = k/(B+1) for k = 1..B+1, the engine draws
+    // balls at the B strictly-interior positions, and neither pole ever wears a ball.
+    void AppendWaterPolylineToConnection(void* entry, const AttachPoint& a, const AttachPoint& b,
+                                         const float sagScale, const float maximumSag,
+                                         const int32_t totalPoints) {
+        const int32_t balls = std::clamp(totalPoints - 1, 1, 62);
+        float control1[3];
+        float control2[3];
+        int32_t ignoredCount = 0;
+        const auto getControlPoints = reinterpret_cast<GetControlPointsFn>(kGetControlPoints);
+        getControlPoints(a.x, a.y, a.z, b.x, b.y, b.z, control1, control2, &ignoredCount);
+        AdjustControlPointSag(control1, a, b, sagScale, maximumSag);
+        AdjustControlPointSag(control2, a, b, sagScale, maximumSag);
+
+        const float p0[3] = {a.x, a.y, a.z};
+        const float p1[3] = {b.x, b.y, b.z};
+        // balls + 2 uniform points including both endpoints; index 0 (= pole A) is discarded.
+        std::vector<float> uniform(static_cast<size_t>(balls + 2) * 3);
+        uniform[0] = a.x;
+        uniform[1] = a.y;
+        uniform[2] = a.z;
+        const auto tessellate = reinterpret_cast<TessellateBezierSegmentFn>(kTessellateBezierSegment);
+        tessellate(p0, control1, control2, p1, reinterpret_cast<uintptr_t>(uniform.data() + 3), balls + 1);
+
+        const std::vector<float> points(uniform.begin() + 3, uniform.end()); // balls + 1 points
+        const void* view[3] = {points.data(), points.data() + points.size(), points.data() + points.size()};
+        auto* const polylines = reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesBegin;
+        void* const insertPos = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesEnd);
         const auto insert = reinterpret_cast<PolylineListInsertFn>(kPolylineListInsert);
         insert(polylines, insertPos, view, 0, 1, 1);
     }
@@ -1141,12 +1294,201 @@ namespace {
                       [occupant](const auto& item) { return item.second.owner == occupant; });
     }
 
+    void ForgetOccupantTextures(void* occupant) {
+        std::erase_if(gConnectionTextureOverrides,
+                      [occupant](const auto& item) { return item.second.owner == occupant; });
+    }
+
+    // Water-crossing buoy/ball size overrides, keyed like the wire-width overrides by the inner
+    // polyline's point-buffer address (EDI's [+0] at the patched size read). Values are the
+    // vanilla per-zoom width factors pre-multiplied by the pole's buoy size scale, so the patched
+    // read stays a single pointer swap.
+    struct WaterBallSizeOverride {
+        void* owner = nullptr;
+        std::array<float, kPowerLineZoomCount> sizeByZoom{};
+    };
+    std::unordered_map<const void*, WaterBallSizeOverride> gWaterBallSizeOverrides;
+
+    void ForgetConnectionWaterBallSizes(void* entry) {
+        if (entry == nullptr) {
+            return;
+        }
+        auto* const begin = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesBegin);
+        auto* const end = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesEnd);
+        for (uint8_t* polyline = begin; polyline != end; polyline += 12) {
+            const void* const points = *reinterpret_cast<void* const*>(polyline);
+            if (points != nullptr) {
+                gWaterBallSizeOverrides.erase(points);
+            }
+        }
+    }
+
+    void ForgetOccupantWaterBallSizes(void* occupant) {
+        std::erase_if(gWaterBallSizeOverrides,
+                      [occupant](const auto& item) { return item.second.owner == occupant; });
+    }
+
+    void RegisterConnectionWaterBallSizes(void* occupant, void* entry, const float sizeScale) {
+        ForgetConnectionWaterBallSizes(entry);
+        if (sizeScale == 1.0f) {
+            return;
+        }
+        const float* const vanillaWidths = *reinterpret_cast<float**>(kPowerLineWidthFactorsPtr);
+        auto* const begin = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesBegin);
+        auto* const end = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesEnd);
+        for (uint8_t* polyline = begin; polyline != end; polyline += 12) {
+            const void* const points = *reinterpret_cast<void* const*>(polyline);
+            if (points == nullptr) {
+                continue;
+            }
+            WaterBallSizeOverride value;
+            value.owner = occupant;
+            for (size_t zoom = 0; zoom < kPowerLineZoomCount; ++zoom) {
+                value.sizeByZoom[zoom] = vanillaWidths[zoom] * sizeScale;
+            }
+            gWaterBallSizeOverrides[points] = value;
+        }
+    }
+
+    const float* __cdecl ResolveWaterBallSizePointer(const void* polyline, const uint32_t zoom) noexcept {
+        const float* const vanillaWidths = *reinterpret_cast<float**>(kPowerLineWidthFactorsPtr);
+        const void* const points = polyline ? *reinterpret_cast<void* const*>(polyline) : nullptr;
+        const auto it = points ? gWaterBallSizeOverrides.find(points) : gWaterBallSizeOverrides.end();
+        if (it != gWaterBallSizeOverrides.end() && zoom < kPowerLineZoomCount) {
+            return &it->second.sizeByZoom[zoom];
+        }
+        return vanillaWidths + zoom;
+    }
+
+#if defined(_MSC_VER) && defined(_M_IX86)
+    // Replaces the 11 bytes at 0x0064ba6e (MOV EAX,[0x00b46798]; FLD [EAX+EDX*4];
+    // LEA EAX,[EAX+EDX*4]). On entry EDX = zoom, EDI = current inner water-polyline vector; on
+    // return EAX must point at the size base value with that value pushed on the FPU stack (the
+    // code that follows both uses ST0 and re-reads [EAX] several times). ECX is dead here
+    // (overwritten at 0x0064ba7f) but preserved anyway alongside EDX.
+    __declspec(naked) void WaterBallSizeHook() {
+        __asm {
+            push ecx
+            push edx
+            push edx
+            push edi
+            call ResolveWaterBallSizePointer
+            add esp, 8
+            pop edx
+            pop ecx
+            fld dword ptr [eax]
+            ret
+        }
+    }
+#else
+#error Power-pole water-ball-size hook requires 32-bit MSVC.
+#endif
+
+    // (Re)registers wire/buoy texture overrides for every render-owner tConnection entry in this
+    // pole's connections vector. Called after AddConnection/UpdateConnection, i.e. after any
+    // reallocation of that vector, so registered entry addresses are always current. The texture
+    // pair comes from this pole's exemplar; a pole without wire texture properties inherits the
+    // other endpoint's pair per connection, mirroring FindAppearanceOverride's precedence.
+    void RegisterOccupantConnectionTextures(void* occupant) {
+        ForgetOccupantTextures(occupant);
+        auto* const begin = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(occupant) + kOccupant_ConnectionsBegin);
+        auto* const end = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(occupant) + kOccupant_ConnectionsEnd);
+        const auto self = gOverrides.find(occupant);
+        const bool selfHasTextures = self != gOverrides.end() &&
+                                     (self->second.hasWireTexture || self->second.hasBuoyTexture);
+        for (uint8_t* entry = begin; entry != end; entry += kConnection_Size) {
+            if (*reinterpret_cast<const uint8_t*>(entry + kConnection_IsRenderOwner) == 0) {
+                continue; // DrawPowerlines only visits render-owner entries
+            }
+            const PoleAttachOverride* source = selfHasTextures ? &self->second : nullptr;
+            if (source == nullptr) {
+                void* const otherPole = *reinterpret_cast<void**>(entry + kConnection_OtherPole);
+                const auto other = gOverrides.find(otherPole);
+                if (other != gOverrides.end() &&
+                    (other->second.hasWireTexture || other->second.hasBuoyTexture)) {
+                    source = &other->second;
+                }
+            }
+            if (source == nullptr) {
+                continue; // fully vanilla pair; the lookup hook falls back by itself
+            }
+            ConnectionTextureOverride value;
+            value.owner = occupant;
+            value.strandTextureId = source->hasWireTexture ? source->wireTextureId
+                                                           : kVanillaWireStrandTextureId;
+            value.buoyTextureId = source->hasBuoyTexture ? source->wireBuoyTextureId
+                                                          : kVanillaWireBuoyTextureId;
+            gConnectionTextureOverrides[entry] = value;
+        }
+    }
+
+    uint32_t __cdecl GetWireStrandTextureOverride(const void* entry) noexcept {
+        const auto it = gConnectionTextureOverrides.find(entry);
+        return it != gConnectionTextureOverrides.end() ? it->second.strandTextureId
+                                                        : kVanillaWireStrandTextureId;
+    }
+
+    uint32_t __cdecl GetWireBuoyTextureOverride(const void* entry) noexcept {
+        const auto it = gConnectionTextureOverrides.find(entry);
+        return it != gConnectionTextureOverrides.end() ? it->second.buoyTextureId
+                                                        : kVanillaWireBuoyTextureId;
+    }
+
+#if defined(_MSC_VER) && defined(_M_IX86)
+    // Both sites replace the 5-byte `MOV ESI, imm32` with `CALL rel32`. At each site EBP holds the
+    // current tConnection entry, ECX the bucket-array base, and EDI the in-progress bucket count --
+    // ECX/EDI must survive (consumed by the SAR/DIV that follow); EAX/EDX are clobbered by the
+    // original code immediately after (MOV EAX,ESI / XOR EDX,EDX), so only the result register ESI
+    // matters beyond preservation.
+    __declspec(naked) void WireStrandTextureHook() {
+        __asm {
+            push ecx
+            push edx
+            push edi
+            push ebp
+            call GetWireStrandTextureOverride
+            add esp, 4
+            mov esi, eax
+            pop edi
+            pop edx
+            pop ecx
+            ret
+        }
+    }
+
+    __declspec(naked) void WireBuoyTextureHook() {
+        __asm {
+            push ecx
+            push edx
+            push edi
+            push ebp
+            call GetWireBuoyTextureOverride
+            add esp, 4
+            mov esi, eax
+            pop edi
+            pop edx
+            pop ecx
+            ret
+        }
+    }
+#else
+#error Power-pole wire-texture hooks require 32-bit MSVC.
+#endif
+
     void ClearConnectionPolylines(void* entry) {
         ForgetConnectionWidths(entry);
         auto* const begin = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_PolylinesBegin);
         auto* const end = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_PolylinesEnd);
         const auto erase = reinterpret_cast<PolylineListEraseFn>(kPolylineListErase);
         erase(reinterpret_cast<uint8_t*>(entry) + kConnection_PolylinesBegin, begin, end);
+    }
+
+    void ClearConnectionWaterPolylines(void* entry) {
+        ForgetConnectionWaterBallSizes(entry);
+        auto* const begin = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesBegin);
+        auto* const end = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesEnd);
+        const auto erase = reinterpret_cast<PolylineListEraseFn>(kPolylineListErase);
+        erase(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesBegin, begin, end);
     }
 
     void RegisterConnectionWidths(void* occupant, void* entry, const PoleAttachOverride* appearance) {
@@ -1277,6 +1619,11 @@ namespace {
             CellCoord(poleB, kOccupant_PosX), CellCoord(poleB, kOccupant_PosZ));
     }
 
+    // Defined in the foundation-pad section below; used by the connection rebuild to keep a
+    // follow-span pad aligned the moment its bearing changes.
+    bool PoleFoundationYaw(void* occupant, float& outYaw);
+    void RebuildFoundation(void* occupant, float halfExtent, float yaw);
+
     // Rebuilds the complete regular-polyline list whenever either endpoint customizes attachment
     // geometry/count or sag. Width-only customization keeps vanilla geometry and merely registers
     // per-polyline width values. The active/render-owning side determines appearance when two pole
@@ -1284,6 +1631,10 @@ namespace {
     void ApplyConnectionCustomization(void* occupant, void* otherPole) {
         const uint32_t direction = DirectionBetween(occupant, otherPole);
         const uint32_t count = std::min(StrandCount(occupant, direction), StrandCount(otherPole, direction));
+        // Re-key texture overrides first: this pole's connections vector may have just reallocated
+        // regardless of which side render-owns the new pair, so every registered entry address of
+        // this pole must be refreshed even when the early-return below fires.
+        RegisterOccupantConnectionTextures(occupant);
         void* const entry = FindConnectionEntry(occupant, otherPole);
         if (entry == nullptr) {
             return; // reciprocal non-rendering side, or no live connection for this pair
@@ -1299,13 +1650,47 @@ namespace {
         const bool haveBearing = ComputeSpanBearing(occupant, otherPole, spanBearing);
         const float yawA = haveBearing ? WrapYaw(spanBearing - AttachBasisAngle(occupant, direction)) : 0.0f;
         const float yawB = haveBearing ? WrapYaw(spanBearing - AttachBasisAngle(otherPole, direction)) : 0.0f;
+        // Vanilla built the water-crossing coarse list only when the span crosses water; reuse
+        // that decision (list non-empty) instead of re-querying the terrain service, then keep it
+        // aligned with the rebuilt strands -- count, attach points, yaw, and sag included. The
+        // buoy source follows the same render-owner-first precedence as the appearance override.
+        const bool hadWaterPolylines =
+            *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesBegin) !=
+            *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesEnd);
+        const PoleAttachOverride* buoySource = nullptr;
+        if (hadWaterPolylines) {
+            const auto self = gOverrides.find(occupant);
+            if (self != gOverrides.end() &&
+                (self->second.hasWaterBuoySize || self->second.hasWaterBuoyCount)) {
+                buoySource = &self->second;
+            } else {
+                const auto other = gOverrides.find(otherPole);
+                if (other != gOverrides.end() &&
+                    (other->second.hasWaterBuoySize || other->second.hasWaterBuoyCount)) {
+                    buoySource = &other->second;
+                }
+            }
+        }
+        const int32_t waterPointCount = (buoySource != nullptr && buoySource->hasWaterBuoyCount)
+            ? static_cast<int32_t>(buoySource->waterBuoyPointCount)
+            : kWaterPolylinePointCount;
+        // Any water-crossing span is rebuilt unconditionally: vanilla's own layout draws its first
+        // buoy ball exactly on pole A's attach node (the ball loop renders every point except the
+        // last of a uniform 0..1 tessellation), and the rebuild replaces that with the
+        // strictly-interior layout of AppendWaterPolylineToConnection. On an otherwise-vanilla
+        // span the strand rebuild this forces is geometry-identical (vanilla table, zero yaw,
+        // default sag), so only the ball positions change.
         const bool rebuildGeometry = HasAttachPointCustomization(occupant, direction) ||
                                      HasAttachPointCustomization(otherPole, direction) ||
                                      (appearance != nullptr && appearance->hasSagCustomization) ||
                                      std::fabs(yawA) > kYawEpsilonRadians ||
-                                     std::fabs(yawB) > kYawEpsilonRadians;
+                                     std::fabs(yawB) > kYawEpsilonRadians ||
+                                     hadWaterPolylines;
         if (rebuildGeometry) {
             ClearConnectionPolylines(entry);
+            if (hadWaterPolylines) {
+                ClearConnectionWaterPolylines(entry);
+            }
             for (uint32_t i = 0; i < count; ++i) {
                 const AttachPoint a = GetAttachPoint(occupant, direction, i, yawA);
                 const AttachPoint b = GetAttachPoint(otherPole, direction, i, yawB);
@@ -1313,11 +1698,36 @@ namespace {
                 const float maximumSag = appearance ? appearance->MaximumSag(i) :
                                                       std::numeric_limits<float>::infinity();
                 AppendPolylineToConnection(entry, a, b, sagScale, maximumSag);
+                if (hadWaterPolylines) {
+                    AppendWaterPolylineToConnection(entry, a, b, sagScale, maximumSag, waterPointCount);
+                }
             }
-            LOG_DEBUG("PowerPoleCustomization: rebuilt {} strands in direction {} for connection {} -> {}.",
-                     count, direction, occupant, otherPole);
+            LOG_DEBUG("PowerPoleCustomization: rebuilt {} strands in direction {} for connection {} -> {}{}.",
+                     count, direction, occupant, otherPole,
+                     hadWaterPolylines ? " (incl. water-crossing coarse list)" : "");
         }
         RegisterConnectionWidths(occupant, entry, appearance);
+        if (hadWaterPolylines) {
+            RegisterConnectionWaterBallSizes(occupant, entry,
+                (buoySource != nullptr && buoySource->hasWaterBuoySize) ? buoySource->waterBuoySizeScale
+                                                                        : 1.0f);
+        }
+
+        // A new/changed connection can change the follow-span bearing (first connection appearing,
+        // or a second one confirming/breaking agreement) -- rebuild the pad on the spot instead of
+        // waiting for the next zoom change to re-run CreateFloor.
+        const auto selfOverride = gOverrides.find(occupant);
+        if (selfOverride != gOverrides.end() &&
+            (selfOverride->second.foundationFollowSpan || selfOverride->second.hasFoundationHalfExtent)) {
+            const float halfExtent = selfOverride->second.hasFoundationHalfExtent
+                                         ? selfOverride->second.foundationHalfExtent
+                                         : kVanillaFoundationHalfExtent;
+            float yaw = 0.0f;
+            if (selfOverride->second.foundationFollowSpan) {
+                PoleFoundationYaw(occupant, yaw);
+            }
+            RebuildFoundation(occupant, halfExtent, yaw);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1327,11 +1737,52 @@ namespace {
     // indexes occupant+0xe8 directly), so a 0 half-extent collapses floor AND walls to a degenerate
     // point with no separate texture-ID risk -- the safe way to get "no visible foundation".
     // ------------------------------------------------------------------
-    void RescaleFoundationFloor(void* occupant, const float halfExtent) {
+    // In-plane pad yaw for a follow-span pole: the shared undirected bearing of its live
+    // connections, reduced to the minimal deviation from the nearest 90-degree multiple so the
+    // walls stay on their vanilla sides. Returns false (pad stays axis-aligned) when the pole has
+    // no connections or its connections disagree on a bearing (junctions/turns).
+    bool PoleFoundationYaw(void* occupant, float& outYaw) {
+        auto* const begin = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(occupant) + kOccupant_ConnectionsBegin);
+        auto* const end = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(occupant) + kOccupant_ConnectionsEnd);
+        bool haveBearing = false;
+        float bearing = 0.0f;
+        for (uint8_t* entry = begin; entry != end; entry += kConnection_Size) {
+            void* const otherPole = *reinterpret_cast<void**>(entry + kConnection_OtherPole);
+            float entryBearing = 0.0f;
+            if (otherPole == nullptr || !ComputeSpanBearing(occupant, otherPole, entryBearing)) {
+                continue;
+            }
+            if (!haveBearing) {
+                bearing = entryBearing;
+                haveBearing = true;
+            } else if (std::fabs(WrapYaw(entryBearing - bearing)) > kYawEpsilonRadians) {
+                return false; // junction: connections disagree, keep the vanilla axis-aligned pad
+            }
+        }
+        if (!haveBearing) {
+            return false;
+        }
+        // Reduce to (-45, 45] degrees around the nearest axis so wall sides are preserved.
+        float yaw = std::fmod(bearing, kPi / 2.0f);
+        if (yaw > kPi / 4.0f) {
+            yaw -= kPi / 2.0f;
+        }
+        if (std::fabs(yaw) <= kYawEpsilonRadians) {
+            return false; // axis-aligned span; nothing to rotate
+        }
+        outYaw = yaw;
+        return true;
+    }
+
+    // Scales and/or yaw-rotates the freshly-built floor quad in place around the pole's XZ
+    // position. Must run before CreateWalls, which derives the wall quads from this buffer.
+    void TransformFoundationFloor(void* occupant, const float halfExtent, const float yaw) {
         const float scale = halfExtent / kVanillaFoundationHalfExtent;
-        if (scale == 1.0f) {
+        if (scale == 1.0f && yaw == 0.0f) {
             return;
         }
+        const float c = std::cos(yaw);
+        const float s = std::sin(yaw);
         const auto* const position = reinterpret_cast<const float*>(reinterpret_cast<uint8_t*>(occupant) + kOccupant_PosX);
         const float posX = position[0];
         const float posZ = position[2]; // kOccupant_PosZ - kOccupant_PosX spans posY in between
@@ -1340,9 +1791,22 @@ namespace {
         auto* const end = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(occupant) + kOccupant_FloorVertsEnd);
         for (uint8_t* vertex = begin; vertex + kFloorVertexStride <= end; vertex += kFloorVertexStride) {
             auto* const xyz = reinterpret_cast<float*>(vertex);
-            xyz[0] = posX + (xyz[0] - posX) * scale;
-            xyz[2] = posZ + (xyz[2] - posZ) * scale;
+            const float dx = (xyz[0] - posX) * scale;
+            const float dz = (xyz[2] - posZ) * scale;
+            xyz[0] = posX + dx * c - dz * s;
+            xyz[2] = posZ + dx * s + dz * c;
         }
+    }
+
+    // Full foundation rebuild outside the engine's own CreateFloor call sites: vanilla floor, our
+    // transform, vanilla walls -- the exact sequence SetPosition runs (CreateFloor 0x0064c611 then
+    // CreateWalls 0x0064c616). Used when a connection change alters the follow-span bearing after
+    // the pad was already built.
+    void RebuildFoundation(void* occupant, const float halfExtent, const float yaw) {
+        using CreateWallsFn = void(__fastcall*)(void* occupant, void* edxUnused);
+        reinterpret_cast<CreateWallsFn>(kCreateFloor)(occupant, nullptr);
+        TransformFoundationFloor(occupant, halfExtent, yaw);
+        reinterpret_cast<CreateWallsFn>(kCreateWalls)(occupant, nullptr);
     }
 
     // ------------------------------------------------------------------
@@ -1631,16 +2095,20 @@ namespace {
         bool installed_ = false;
     };
 
-    // Generic 5-byte `MOV EAX, imm32` -> `CALL rel32` patch, one instance per hash-lookup site. Kept
-    // separate from InlineCallPatch (used for the 23-byte wire-width site) since the byte count and
-    // expected-opcode check differ.
+    // Generic 5-byte `MOV r32, imm32` -> `CALL rel32` patch, one instance per hash-lookup site.
+    // Kept separate from InlineCallPatch (used for the 23-byte wire-width site) since the byte
+    // count and expected-opcode check differ. The opcode selects the destination register the
+    // vanilla instruction wrote (0xB8 = EAX for the Draw floor/wall sites, 0xBE = ESI for the
+    // DrawPowerlines wire/buoy sites); the hook is responsible for producing its result in that
+    // same register.
     class Imm32CallPatch final {
     public:
-        bool Install(const uintptr_t site, const uint32_t expectedImm, void* hookFn, const char* name) {
+        bool Install(const uintptr_t site, const uint32_t expectedImm, void* hookFn, const char* name,
+                     const uint8_t expectedOpcode = kMovEaxOpcode) {
             site_ = site;
             auto* const p = reinterpret_cast<uint8_t*>(site);
             const std::array<uint8_t, 5> expected = {
-                0xB8,
+                expectedOpcode,
                 static_cast<uint8_t>(expectedImm), static_cast<uint8_t>(expectedImm >> 8),
                 static_cast<uint8_t>(expectedImm >> 16), static_cast<uint8_t>(expectedImm >> 24),
             };
@@ -1729,9 +2197,16 @@ namespace {
             return;
         }
         const auto it = gOverrides.find(occupant);
-        if (it != gOverrides.end() && it->second.hasFoundationHalfExtent) {
-            RescaleFoundationFloor(occupant, it->second.foundationHalfExtent);
+        if (it == gOverrides.end()) {
+            return;
         }
+        const float halfExtent = it->second.hasFoundationHalfExtent ? it->second.foundationHalfExtent
+                                                                     : kVanillaFoundationHalfExtent;
+        float yaw = 0.0f;
+        if (it->second.foundationFollowSpan) {
+            PoleFoundationYaw(occupant, yaw);
+        }
+        TransformFoundationFloor(occupant, halfExtent, yaw);
     }
 
     using DestructorFn = void(__thiscall*)(void* occupant);
@@ -1743,6 +2218,8 @@ namespace {
     void __fastcall DestructorHook(void* occupant, void* /*edx*/) {
         gOverrides.erase(occupant);
         ForgetOccupantWidths(occupant);
+        ForgetOccupantTextures(occupant);
+        ForgetOccupantWaterBallSizes(occupant);
         const auto original = reinterpret_cast<DestructorFn>(kDestructor);
         original(occupant);
     }
@@ -1752,6 +2229,8 @@ namespace {
         original(occupant); // always run vanilla first: it still owns model load + default-table selection
         RepairMissingConnectionPointTable(occupant);
         ForgetOccupantWidths(occupant);
+        ForgetOccupantTextures(occupant);
+        ForgetOccupantWaterBallSizes(occupant);
 
         if (!gSettings.enabled) {
             gOverrides.erase(occupant);
@@ -2190,13 +2669,18 @@ namespace {
 
     using OnKeyDownFn = uint8_t(__thiscall*)(void* control, int vkCode, uint32_t modifiers);
 
+    // Bit 0 of the OnKeyDown modifiers argument is Shift -- confirmed against vanilla's own
+    // Tab handler in cSC4ViewInputControlNetworkIntxTool::OnKeyDown (0x00660e80), which picks the
+    // forward/backward intersection-rule direction from exactly `modifiers & 1`.
+    constexpr uint32_t kKeyModifierShift = 0x1;
+
     // Vtable-slot hook (installed like the FAR DrawNetworkLine hook: __fastcall matches __thiscall
     // with a throwaway edx). Consumes Tab only while the power tool is the active network subtool;
     // everything else -- including Tab under road/rail/street -- falls through to vanilla untouched.
     uint8_t __fastcall OnKeyDownHook(void* control, void* /*edx*/, int vkCode, uint32_t modifiers) {
         if (gSettings.enabled && vkCode == static_cast<int>(kVkTab) &&
             IsNetworkControlDrivingPowerTool(control)) {
-            const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            const bool shift = (modifiers & kKeyModifierShift) != 0;
             CycleStyle(shift ? -1 : 1);
             return 1; // consume: don't let vanilla focus handling also act on Tab
         }
@@ -2546,6 +3030,8 @@ namespace {
     void FlushCityScopedState() {
         gOverrides.clear();
         gPolylineWidthOverrides.clear();
+        gConnectionTextureOverrides.clear();
+        gWaterBallSizeOverrides.clear();
         gRegisteredPoleTextures.clear();
         gFarDragActive = false;
         gFarSnapAnchorValid = false;
@@ -2632,6 +3118,15 @@ public:
                                                       &WallTextureHashHook, "WallTextureHash@1") ? 1 : 0;
         installed += wallTextureHashPatch2_.Install(kWallTextureHashSite2, kVanillaWallTextureId,
                                                       &WallTextureHashHook, "WallTextureHash@2") ? 1 : 0;
+        installed += wireStrandTexturePatch_.Install(kWireStrandTextureSite, kVanillaWireStrandTextureId,
+                                                       &WireStrandTextureHook, "WireStrandTexture",
+                                                       kMovEsiOpcode) ? 1 : 0;
+        installed += wireBuoyTexturePatch_.Install(kWireBuoyTextureSite, kVanillaWireBuoyTextureId,
+                                                     &WireBuoyTextureHook, "WireBuoyTexture",
+                                                     kMovEsiOpcode) ? 1 : 0;
+        installed += waterBallSizePatch_.Install(kWaterBallSizeSite,
+            {0xa1, 0x98, 0x67, 0xb4, 0x00, 0xd9, 0x04, 0x90, 0x8d, 0x04, 0x90},
+            &WaterBallSizeHook, "WaterBallSize") ? 1 : 0;
 
         installed += poleStyleLookupPatch1_.Install(kPoleStyleLookupSite1,
             {0x8b, 0x04, 0xbd, 0xb0, 0x67, 0xb4, 0x00}, &PoleStyleLookupHook, "PoleStyleLookup@1") ? 1 : 0;
@@ -2656,7 +3151,7 @@ public:
         LOG_INFO("PowerPoleCustomization: installed {} of {} patches.", installed,
                  initConnectionPointsPatches_.size() + kAddConnectionCallSites.size() +
                  kUpdateConnectionCallSites.size() + kDeterminePolePositionsCallSites.size() +
-                 2 + createFloorPatches_.size() + 4 + 2 + 1 + 1 + 1 + 1);
+                 2 + createFloorPatches_.size() + 4 + 2 + 2 + 1 + 1 + 1 + 1 + 1);
 
         cIGZMessageServer2Ptr pMS2;
         if (pMS2) {
@@ -2711,9 +3206,14 @@ public:
         floorTextureHashPatch2_.Uninstall();
         wallTextureHashPatch1_.Uninstall();
         wallTextureHashPatch2_.Uninstall();
+        wireStrandTexturePatch_.Uninstall();
+        wireBuoyTexturePatch_.Uninstall();
+        waterBallSizePatch_.Uninstall();
         poleStyleLookupPatch1_.Uninstall();
         poleStyleLookupPatch2_.Uninstall();
         gPolylineWidthOverrides.clear();
+        gConnectionTextureOverrides.clear();
+        gWaterBallSizeOverrides.clear();
         gOverrides.clear();
         if (mpFrameWork) {
             mpFrameWork->RemoveHook(this);
@@ -2820,6 +3320,9 @@ private:
     Imm32CallPatch floorTextureHashPatch2_{};
     Imm32CallPatch wallTextureHashPatch1_{};
     Imm32CallPatch wallTextureHashPatch2_{};
+    Imm32CallPatch wireStrandTexturePatch_{}; // DrawPowerlines strand texture (MOV ESI site)
+    Imm32CallPatch wireBuoyTexturePatch_{};   // DrawPowerlines water-crossing texture (MOV ESI site)
+    ByteSpanCallPatch waterBallSizePatch_{};  // DrawPowerlines buoy-ball size read (11-byte site)
     ByteSpanCallPatch poleStyleLookupPatch1_{};
     ByteSpanCallPatch poleStyleLookupPatch2_{};
     ByteSpanCallPatch keepWiresPatch_{};

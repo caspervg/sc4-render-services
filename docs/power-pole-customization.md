@@ -79,6 +79,7 @@ regardless of the pole's model or exemplar. These three properties override that
 | `0xB22A000A` | Power Pole Foundation Half Extent | Float32 | Pad half-extent in meters. `5.0` matches vanilla. `0` collapses the pad and walls to a degenerate point -- the safe way to hide the foundation entirely, since it needs no texture to resolve. Clamped to 50. |
 | `0xB22A000B` | Power Pole Foundation Floor Texture ID | Uint32 | Overrides the floor's texture-cache lookup key (vanilla `0x0912220E`). |
 | `0xB22A000C` | Power Pole Foundation Wall Texture ID | Uint32 | Overrides the walls' texture-cache lookup key (vanilla `0x08080004`). |
+| `0xB22A0011` | Power Pole Foundation Follow Span | Bool | `true` yaw-rotates the pad (floor and walls) so it follows the pole's span bearing instead of staying axis-aligned. The rotation is the minimal deviation from the nearest 90-degree step, so walls keep their vanilla sides; junction poles whose connections disagree on a bearing stay axis-aligned. Rebuilt live whenever a connection is added or updated. Pairs well with FAR poles. |
 
 **Texture ID validation (2026-07-19)**: custom texture IDs are validated and registered at load.
 The engine keeps its own power-pole texture registry seeded with only the four vanilla IDs, and
@@ -88,6 +89,44 @@ resource manager, then registers the ID with the engine's registry and triggers 
 An ID that fails validation logs a warning and keeps the vanilla texture (never a crash). Practical
 consequence for authors: ship pad textures as FSH in group `0x1ABE787D`. If you want no visible
 foundation, set the half-extent to `0`; that path needs no texture at all.
+
+## Wire textures
+
+The wire strands and the coarse water-crossing wires DrawPowerlines renders use two hardcoded
+texture IDs; these properties override them per pole:
+
+| ID | Property | Type | Meaning |
+|---|---|---|---|
+| `0xB22A000F` | Power Line Wire Texture ID | Uint32 | Replaces the strand texture (vanilla `0xAA9DA78E`) on every connection this pole render-owns. |
+| `0xB22A0010` | Power Line Water Wire Texture ID | Uint32 | Replaces the water-crossing/coarse wire texture (vanilla `0xC9AF0FCD`) the engine draws where a span crosses water. |
+
+Both are validated and engine-registered exactly like the foundation textures: the ID must exist
+as FSH `0x7AB50E44` in group `0x1ABE787D` or the pole keeps the vanilla texture (warning logged,
+never a crash). When the two endpoint exemplars disagree, the render-owning pole's properties win;
+a pole without wire-texture properties inherits the other endpoint's.
+
+Water-crossing wires are also kept geometrically aligned: whenever the DLL rebuilds a connection's
+strands (custom attach points, sag, or an off-nominal FAR bearing), it now rebuilds the engine's
+coarse water-crossing polyline list with the same attach points, strand count, yaw, and sag, so
+spans over water match their custom geometry instead of reverting to the vanilla 4-wire shape.
+
+### Water-crossing buoys
+
+The engine draws one billboarded ball per point (except the last) of each water-crossing polyline,
+sized from the per-zoom wire-width table times a fixed 4.0. Vanilla's uniform layout therefore put
+its first ball exactly on a pole's attach node; the DLL now rebuilds every water-crossing span with
+a strictly-interior layout -- for B balls they sit at even fractions k/(B+1) of the span, so no
+ball ever renders on a pole (this fix applies to all spans, customized or not). Two properties
+tune the balls per pole:
+
+| ID | Property | Type | Meaning |
+|---|---|---|---|
+| `0xB22A0012` | Power Line Water Buoy Size Scale | Float32 | Scales the ball quads (1.0 = vanilla). |
+| `0xB22A0013` | Power Line Water Buoy Point Count | Uint32 | Points per water-crossing strand; balls drawn = points - 1, evenly spaced inside the span. Vanilla 4 (= 3 balls at 1/4, 1/2, 3/4). Clamped to 2-17 (1-16 balls). |
+
+Like all appearance properties these live on pole prop exemplars, so different `[PowerPoles.*]`
+styles get different buoy density/size simply by routing to different exemplars. The render-owning
+pole's exemplar wins; otherwise the far endpoint's applies.
 
 ## Model quarter-turn correction
 
@@ -119,9 +158,10 @@ never hard-depends on it.
 ## Property definitions
 
 The definitions are included in `.agents/new_properties.xml`. `Count="-3"` on attachment properties
-enforces repeated XYZ groups; `Count="-1"` permits variable-length per-wire arrays. The selected
-`0xB22A0000` through `0xB22A000E` IDs are reserved by this feature. The final ID in the checked
-`0xB22A0000` through `0xB22A000F` block is currently unused.
+enforces repeated XYZ groups; `Count="-1"` permits variable-length per-wire arrays. The
+`0xB22A0000` through `0xB22A0011` IDs are reserved by this feature (the original conflict check
+covered `0xB22A0000`-`0xB22A000F` against the vendored registry; `0xB22A0010`/`0xB22A0011` were
+verified absent from the same registry on 2026-07-19).
 
 The production exemplar reader, arbitrary 1-N strand rebuild, sag scaling/capping, per-wire width
 lookup, FAR dragging/routing, and the Tab/Shift-Tab style switch were all validated in-game

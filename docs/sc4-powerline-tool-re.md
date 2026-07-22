@@ -1028,3 +1028,70 @@ to the vanilla texture.
 SimCity_1.dat, template = `PowerPole_205`), RKT1 → P3 FA-2 tangent S3Ds
 `5AD0E817-E4586C0B-00030000` (NL266) and `5AD0E817-44586CF1-00030000` (NR266); base instances end
 in `00` per the RKT1 rotation-nibble rule.
+
+## 19. Wire textures, water-crossing list, pad rotation, Shift modifier (2026-07-19)
+
+### A. DrawPowerlines texture sites (Windows, confirmed)
+
+Unlike Draw's floor/wall pair-sites, each DrawPowerlines texture is loaded by a single 5-byte
+`MOV ESI, imm32` whose ESI feeds both the registry bucket DIV and the chain-walk compare:
+
+| Texture | Site | Vanilla ID | Context |
+|---|---|---|---|
+| Wire strands | `0x0064b7ba` | `0xAA9DA78E` | EBP = current tConnection entry (render-owner flag read at `[EBP+0x9]` just before) |
+| Water-crossing wires | `0x0064b9e3` | `0xC9AF0FCD` | EBP = same entry (list read at `[EBP+0x20]/[EBP+0x24]`) |
+
+DLL: both sites patched to `CALL` hooks keyed by the tConnection entry pointer
+(`gConnectionTextureOverrides`, re-registered per pole after every AddConnection/UpdateConnection
+since vector reallocation moves entries). New exemplar properties `0xB22A000F` (strand) and
+`0xB22A0010` (water wire), validated/registered through the §18B machinery.
+
+### B. tConnection +0x20/+0x24 identified: water-crossing coarse polylines
+
+AddConnection's decompile shows the second `vector<vector<cS3DVector3>>` at entry+0x20 is built
+ONLY when the span crosses water (terrain service vtbl+0x88 test on either endpoint's cell) and
+holds a coarse copy of every strand: same GetControlPoints output, `TessellateBezierSegment(...,
+count=3)` (4 points total), same insert/erase helpers as the regular list. Previously called the
+"buoy list" in these docs — renamed. DLL consequence (implemented): the custom strand rebuild now
+also clears and rebuilds this list (when vanilla had populated it) with the same attach points,
+strand count, yaw rotation, and sag, so water spans match custom geometry.
+
+### C. Foundation pad rotation
+
+New Bool property `0xB22A0011` rotates the pad to the pole's span bearing (minimal deviation from
+the nearest 90° step, so walls keep their sides). Uses the confirmed SetPosition sequence
+(CreateFloor `0x0064c611` → CreateWalls `0x0064c618`, CreateWalls = `0x0064c470` __thiscall no
+args, derives walls from the floor vertex buffer) — the DLL re-runs CreateFloor + in-place
+transform + CreateWalls whenever a connection add/update changes the bearing.
+
+### D. OnKeyDown modifiers bit 0 = Shift (confirmed)
+
+`cSC4ViewInputControlNetworkIntxTool::OnKeyDown` (`0x00660e80`) handles Tab (vkCode 9) by picking
+the forward/backward intersection rule from exactly `modifiers & 1`. The DLL's Tab/Shift-Tab hook
+now uses the modifiers argument instead of polling `GetAsyncKeyState`. (The FAR drag hook and the
+overlay still poll — DrawNetworkLine and the render callback are not key events and receive no
+modifier state.)
+
+### E. Water-crossing buoy balls: size + density (2026-07-19, same pass)
+
+DrawPowerlines draws one billboarded quad per INTERIOR point of each water polyline (iterations =
+pointCount - 1; vanilla 4 points = 3 balls), half-sized `g_afPowerLineWidthFactors[zoom] * 4.0f`
+(constant at `0x00a8e17c`). The zoom-table read at **`0x0064ba6e`** (`A1 98 67 B4 00 / D9 04 90 /
+8D 04 90` = MOV EAX,[0x00b46798]; FLD [EAX+EDX*4]; LEA EAX,[EAX+EDX*4], 11 bytes) is the single
+chokepoint -- all later size uses re-read `[EAX]`. At that instruction EDX = zoom, EDI = current
+inner polyline vector; ECX is dead (overwritten at 0x0064ba7f).
+
+DLL: `ByteSpanCallPatch` at `0x0064ba6e` -> hook returning a pointer to either the vanilla slot or
+a per-polyline-buffer pre-scaled table (`gWaterBallSizeOverrides`, keyed like the wire-width map,
+populated from new exemplar properties `0xB22A0012` = size scale). Ball DENSITY comes free from the
+water-list rebuild: `0xB22A0013` sets the points-per-strand count (clamped 2-17), and a count other
+than vanilla's 4 forces the connection geometry rebuild even for otherwise-vanilla spans.
+
+Addendum (same day): the ball loop starts at point index 0 and stops before the last point, so
+vanilla's uniform 0..1 tessellation renders its first ball exactly on pole A's attach node. Since
+the ball loop is the water list's ONLY consumer, the DLL now stores strictly-interior points
+instead: for B balls, tessellate B+2 uniform points along the sagged bezier, drop t=0, store
+t = 1/(B+1)..1.0 -- the engine draws the B interior balls (even k/(B+1) fractions) and never
+touches either pole. Applied to EVERY water-crossing span (the connection rebuild now triggers
+unconditionally when the water list is non-empty; on otherwise-vanilla spans the forced strand
+rebuild is geometry-identical).
