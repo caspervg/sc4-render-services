@@ -579,6 +579,36 @@ set_target_properties(SC4FixedPoolGrowthFixSample PROPERTIES
         PREFIX ""
 )
 
+# High-DPI scripted-UI runtime companion. Reads the scale metadata written by
+# sc4-4k-ui-patch and fixes code-created tertiary catalog icons and Data Views.
+set(UI_SCALING_FIX_SOURCES
+        ${SC4RS_ROOT}/src/sample/ui-scaling-fix/UIScalingFixDirector.cpp
+        ${SC4RS_ROOT}/src/service/decal/RelativeCallPatch.cpp
+        ${SC4RS_ROOT}/src/utils/VersionDetection.cpp
+        ${SC4RS_ROOT}/src/utils/Logger.cpp
+)
+
+add_library(SC4UIScalingFixSample SHARED ${UI_SCALING_FIX_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
+
+target_include_directories(SC4UIScalingFixSample PRIVATE
+        ${SC4RS_ROOT}/src
+)
+
+target_link_libraries(SC4UIScalingFixSample PRIVATE
+        gzcom2
+        spdlog
+)
+
+if(WIN32)
+    target_link_libraries(SC4UIScalingFixSample PRIVATE Version)
+endif()
+
+set_target_properties(SC4UIScalingFixSample PROPERTIES
+        OUTPUT_NAME "SC4UIScalingFixSample"
+        SUFFIX ".dll"
+        PREFIX ""
+)
+
 # Terrain diagonal near-cliff triangulation fix. This patches the terrain
 # redisplay pass after cliff texture classification and only changes quad
 # triangulation flags for non-cliff cells.
@@ -654,7 +684,7 @@ set_target_properties(SC4PowerPoleCustomizationSample PROPERTIES
 
 
 add_custom_target(SC4RenderServicesAllTargets
-        DEPENDS imgui SC4RenderServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample SC4RoadDecalSample SC4TerrainDecalSample SC4CameraViewInputSample SC4DateJumperSample SC4FixedPoolGrowthFixSample SC4TerrainDiagonalFixSample SC4PowerPoleCustomizationSample
+        DEPENDS imgui SC4RenderServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample SC4RoadDecalSample SC4TerrainDecalSample SC4CameraViewInputSample SC4DateJumperSample SC4FixedPoolGrowthFixSample SC4UIScalingFixSample SC4TerrainDiagonalFixSample SC4PowerPoleCustomizationSample
 )
 
 # Automatic deployment to SC4 directories
@@ -790,6 +820,14 @@ if(WIN32 AND NOT DEFINED ENV{CI})
                 $<TARGET_FILE:SC4FixedPoolGrowthFixSample>
                 "${SC4_PLUGINS_DIR}/"
                 COMMENT "Deploying SC4FixedPoolGrowthFixSample.dll to Plugins folder"
+        )
+
+        add_custom_command(TARGET SC4UIScalingFixSample POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${SC4_PLUGINS_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:SC4UIScalingFixSample>
+                "${SC4_PLUGINS_DIR}/"
+                COMMENT "Deploying SC4UIScalingFixSample.dll to Plugins folder"
         )
 
         add_custom_command(TARGET SC4TerrainDiagonalFixSample POST_BUILD
