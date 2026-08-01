@@ -854,14 +854,21 @@ their own vtable slots untouched. No runtime class check needed.
   reusing it for FAR rasterization would give L-shaped cell paths; a FAR hook must rasterize
   its own supercover staircase.
 
-### F. Hook allocation strategy (design, not yet verified in-game)
+### F. Hook allocation strategy (implemented; dense preview runtime validation pending)
 
 The step/cell vectors use the game's allocator; the DLL must not push_back into them with its
-own heap. Plan: the hook first calls the ORIGINAL `DrawNetworkLine` with a fake straight drag
-of exactly the needed cell count (chosen along ±x toward map interior, so vanilla's own path
-performs all allocation), then rewrites the step/cell contents in place (both element types
-are PODs) and shrinks the two end pointers. Runtime-validates resulting capacity and falls
-back to a plain vanilla call on any mismatch.
+own heap. The hook calls the ORIGINAL `DrawNetworkLine` with a legal corner-to-corner city
+diagonal so vanilla grows both vectors using its own allocator. It then reads the real vector
+capacity pointers (`steps +0x5c`, `cells +0x68`), rewrites the POD contents in place, and sets the
+two end pointers. A full city diagonal allocates enough cells for every legal in-city 4-connected
+supercover; this replaces the old fake-straight allocation, which could not represent a dense FAR
+path longer than one city dimension. Any capacity mismatch falls back to a plain vanilla call.
+
+Each complete FAR period is represented by one all-straight `tDraggedStep` whose first/last indices
+span that period's full supercover tile range. `DeterminePolePositions` continues to use the first
+cell as the period's pole node, while the native blue terrain preview can consume every crossed
+tile instead of seeing only isolated node cells. The terminal node remains a one-cell final step;
+boundary transitions receive their own supercover step.
 
 ### G. Related facts picked up on the way
 

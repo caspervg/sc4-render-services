@@ -437,23 +437,27 @@ namespace {
     //
     // The hook, when a FAR ratio is active and the drag is not axis/45-aligned, snaps the cursor
     // to the nearest whole number of FAR periods, then synthesizes the dragged-step/cell arrays:
-    // one step per FAR period whose FIRST cell is the period's integer grid node, plus a final
+    // one step per FAR period containing that period's complete supercover tile range, plus a final
     // single-cell step for the last node, with this+0x74 == this+0x70 (all steps "straight", so
-    // GetPrimaryCell returns each step's first cell). DeterminePolePositionsHook scopes
+    // GetPrimaryCell returns each step's first cell). The dense cell ranges make vanilla's blue
+    // terrain preview continuous while DeterminePolePositionsHook scopes
     // this+0x3a4 = 1 for the same drag, so vanilla DeterminePolePositions forces a pole at every
     // step's primary cell -- exactly the FAR nodes -- and nothing else (docs SS17.C).
     //
     // Allocation: the game's step/cell vectors use the game allocator, so the hook first runs the
-    // ORIGINAL DrawNetworkLine with a fake straight drag of exactly the needed cell count (vanilla
-    // performs all allocation), then rewrites the POD contents in place and shrinks the end
-    // pointers. Any capacity/expectation mismatch falls back to a plain vanilla call.
+    // ORIGINAL DrawNetworkLine across the complete city diagonal (vanilla performs all allocation),
+    // then rewrites the POD contents in place and sets the end pointers. A map diagonal allocates
+    // enough cells for every legal in-city 4-connected supercover, unlike the old fake straight
+    // drag whose allocation was too small for long FAR paths. Any capacity mismatch falls back.
     // ------------------------------------------------------------------
     constexpr uintptr_t kDrawNetworkLine = 0x0063af40;
     constexpr uintptr_t kPowerToolDrawNetworkLineSlot = 0x00aa9f78; // dword inside vtable 0x00aa9f30
     constexpr uint32_t kTool_StepsBegin = 0x54;   // vector<tDraggedStep> begin ptr (stride 0xc)
     constexpr uint32_t kTool_StepsEnd = 0x58;
+    constexpr uint32_t kTool_StepsCapacity = 0x5c;
     constexpr uint32_t kTool_CellsBegin = 0x60;   // vector<SC4Point<uint>> begin ptr (stride 8)
     constexpr uint32_t kTool_CellsEnd = 0x64;
+    constexpr uint32_t kTool_CellsCapacity = 0x68;
     constexpr uint32_t kTool_DiagonalFlag = 0x6c; // byte: drag has a diagonal segment
     constexpr uint32_t kTool_TotalSteps = 0x70;
     constexpr uint32_t kTool_StraightSteps = 0x74;
@@ -2336,9 +2340,7 @@ namespace {
     // center-to-center node segment passes through, from (0,0) inclusive to (run,rise) exclusive,
     // in traversal order. At an exact corner crossing both adjacent cells are included, matching
     // vanilla's own 2-cells-per-column diagonal registration.
-    // Supercover cell set for one FAR period. No longer used by the node-only drag synthesis (which
-    // stores only pole nodes), but retained for reference / a future per-tile wire-occupancy option.
-    [[maybe_unused]] std::vector<std::pair<uint32_t, uint32_t>> BuildFarPeriodPattern(const uint32_t run, const uint32_t rise) {
+    std::vector<std::pair<uint32_t, uint32_t>> BuildFarPeriodPattern(const uint32_t run, const uint32_t rise) {
         std::vector<std::pair<uint32_t, uint32_t>> cells;
         uint32_t u = 0;
         uint32_t v = 0;
@@ -2491,26 +2493,41 @@ namespace {
         const CellXZ lastFarNode = nodeCell(periods);
         const bool hasTransitionTail = terminal.x != lastFarNode.x || terminal.z != lastFarNode.z;
 
-        // Node-only layout: one single-cell step per FAR period node (plus the boundary tail node
-        // and terminal). DeterminePolePositions is scoped to max-cells-between-poles = 1, so a pole
-        // is forced at every step's primary (= only) cell. Intermediate span cells are deliberately
-        // omitted: the wire renders bezier pole-to-pole and power conducts through the connection
-        // graph (proven by vanilla's 10-cell empty pole gaps), so they were never needed for pole
-        // placement or rendering. Omitting them also keeps the hidden per-cell line occupants off the
-        // tiles between poles -- zoning/lot construction then only interrupts the wire when a lot
-        // lands on a pole node itself -- and caps the buffer at ~periods+2 cells so arbitrarily long
-        // FAR runs fit on any city tile (256x256 included) instead of overflowing a straight drag.
+        // Dense preview layout: one step per FAR period, with that step spanning every terrain tile
+        // crossed by the period's 4-connected supercover. DeterminePolePositions treats the first
+        // cell of each all-straight step as its primary cell, so pole placement remains sparse at FAR
+        // nodes while vanilla's blue terrain overlay sees a complete tile path instead of dots.
         std::vector<CellXZ> cells;
         std::vector<DraggedStep> steps;
-        cells.reserve(periods + 3);
+        const auto periodPattern = BuildFarPeriodPattern(ratio.run, ratio.rise);
+        cells.reserve(periods * periodPattern.size() + ratio.run + ratio.rise + 2);
         steps.reserve(periods + 3);
-        const auto pushNode = [&](const CellXZ node) {
-            steps.push_back(DraggedStep{static_cast<uint32_t>(cells.size()),
-                                        static_cast<uint32_t>(cells.size()), 0});
-            cells.push_back(node);
+        const auto appendPattern = [&](const CellXZ origin,
+                                       const std::vector<std::pair<uint32_t, uint32_t>>& pattern,
+                                       const bool patternMajorIsX, const int32_t patternMajorSign,
+                                       const int32_t patternMinorSign) {
+            const uint32_t firstCell = static_cast<uint32_t>(cells.size());
+            for (const auto [u, v] : pattern) {
+                const int32_t du = patternMajorSign * static_cast<int32_t>(u);
+                const int32_t dv = patternMinorSign * static_cast<int32_t>(v);
+                const int32_t x = static_cast<int32_t>(origin.x) + (patternMajorIsX ? du : dv);
+                const int32_t z = static_cast<int32_t>(origin.z) + (patternMajorIsX ? dv : du);
+                if (x < 0 || z < 0 || static_cast<uint32_t>(x) >= cityCellsX ||
+                    static_cast<uint32_t>(z) >= cityCellsZ) {
+                    return false;
+                }
+                cells.push_back(CellXZ{static_cast<uint32_t>(x), static_cast<uint32_t>(z)});
+            }
+            if (cells.size() == firstCell) {
+                return false;
+            }
+            steps.push_back(DraggedStep{firstCell, static_cast<uint32_t>(cells.size() - 1), 0});
+            return true;
         };
         for (uint32_t p = 0; p < periods; ++p) {
-            pushNode(nodeCell(p));
+            if (!appendPattern(nodeCell(p), periodPattern, majorIsX, majorSign, minorSign)) {
+                return original(tool, start, end, straightOnly, networkType);
+            }
         }
         if (hasTransitionTail) {
             // A boundary drag keeps the last whole-period node as a pole, then the boundary cell
@@ -2525,30 +2542,30 @@ namespace {
                 LOG_WARN("PowerPoleCustomization: [FAR PoC] boundary transition reverses direction; falling back.");
                 return original(tool, start, end, straightOnly, networkType);
             }
-            pushNode(lastFarNode);
+            const uint32_t tailRun = static_cast<uint32_t>(std::abs(rawTailMajor));
+            const uint32_t tailRise = static_cast<uint32_t>(std::abs(rawTailMinor));
+            const auto tailPattern = BuildFarPeriodPattern(tailRun, tailRise);
+            const int32_t tailMajorSign = rawTailMajor >= 0 ? 1 : -1;
+            const int32_t tailMinorSign = rawTailMinor >= 0 ? 1 : -1;
+            if (!appendPattern(lastFarNode, tailPattern, majorIsX, tailMajorSign, tailMinorSign)) {
+                return original(tool, start, end, straightOnly, networkType);
+            }
         }
-        pushNode(terminal);
+        const uint32_t terminalIndex = static_cast<uint32_t>(cells.size());
+        cells.push_back(terminal);
+        steps.push_back(DraggedStep{terminalIndex, terminalIndex, 0});
 
-        // Fake straight drag sized so vanilla allocates at least as many cells (and therefore steps:
-        // a straight drag makes one step per cell) as we need. Every allocated cell is overwritten
-        // below, so the fake anchor is irrelevant to the result -- anchor it at the map edge instead
-        // of the real `start` so a run of `totalCells` fits whenever the route length is within a map
-        // dimension. A center anchor has too little clearance on either side and forced a fallback.
+        // Ask vanilla to allocate both vectors with the largest legal in-city drag. A corner-to-
+        // corner diagonal creates roughly width+height cells, which bounds every legal supercover,
+        // while the major-axis step count bounds our one-step-per-period representation. We use the
+        // vectors' real capacity pointers below rather than mistaking their current end for capacity.
         const auto totalCells = static_cast<uint32_t>(cells.size());
-        uint32_t fakeStart[2];
-        uint32_t fakeEnd[2];
-        if (totalCells <= cityCellsX) {
-            fakeStart[0] = 0;         fakeStart[1] = start[1];
-            fakeEnd[0] = totalCells - 1; fakeEnd[1] = start[1];
-        } else if (totalCells <= cityCellsZ) {
-            fakeStart[0] = start[0];  fakeStart[1] = 0;
-            fakeEnd[0] = start[0];    fakeEnd[1] = totalCells - 1;
-        } else {
-            LOG_WARN("PowerPoleCustomization: [FAR PoC] route needs {} cells, exceeds city bounds "
-                     "({}x{}); falling back to vanilla drag.", totalCells, cityCellsX, cityCellsZ);
+        if (cityCellsX == 0 || cityCellsZ == 0) {
             return original(tool, start, end, straightOnly, networkType);
         }
-        if (original(tool, fakeStart, fakeEnd, straightOnly, networkType) == 0) {
+        uint32_t fakeStart[2]{0, 0};
+        uint32_t fakeEnd[2]{cityCellsX - 1, cityCellsZ - 1};
+        if (original(tool, fakeStart, fakeEnd, 0, networkType) == 0) {
             LOG_WARN("PowerPoleCustomization: [FAR PoC] vanilla allocation drag failed; falling back.");
             return original(tool, start, end, straightOnly, networkType);
         }
@@ -2556,13 +2573,16 @@ namespace {
         auto* const base = reinterpret_cast<uint8_t*>(tool);
         auto* const stepsBegin = *reinterpret_cast<uint8_t**>(base + kTool_StepsBegin);
         auto* const cellsBegin = *reinterpret_cast<uint8_t**>(base + kTool_CellsBegin);
-        const auto stepCapacity = static_cast<uint32_t>(
-            (*reinterpret_cast<uint8_t**>(base + kTool_StepsEnd) - stepsBegin) / sizeof(DraggedStep));
-        const auto cellCapacity = static_cast<uint32_t>(
-            (*reinterpret_cast<uint8_t**>(base + kTool_CellsEnd) - cellsBegin) / sizeof(CellXZ));
-        if (stepsBegin == nullptr || cellsBegin == nullptr ||
+        auto* const stepsCapacityEnd = *reinterpret_cast<uint8_t**>(base + kTool_StepsCapacity);
+        auto* const cellsCapacityEnd = *reinterpret_cast<uint8_t**>(base + kTool_CellsCapacity);
+        const auto stepCapacity = stepsBegin != nullptr && stepsCapacityEnd >= stepsBegin
+            ? static_cast<uint32_t>((stepsCapacityEnd - stepsBegin) / sizeof(DraggedStep)) : 0;
+        const auto cellCapacity = cellsBegin != nullptr && cellsCapacityEnd >= cellsBegin
+            ? static_cast<uint32_t>((cellsCapacityEnd - cellsBegin) / sizeof(CellXZ)) : 0;
+        if (stepsBegin == nullptr || cellsBegin == nullptr || stepsCapacityEnd == nullptr ||
+            cellsCapacityEnd == nullptr ||
             stepCapacity < steps.size() || cellCapacity < totalCells) {
-            LOG_WARN("PowerPoleCustomization: [FAR PoC] vanilla drag produced {} steps/{} cells, "
+            LOG_WARN("PowerPoleCustomization: [FAR PoC] vanilla drag allocated {} steps/{} cells, "
                      "need {}/{}; falling back.", stepCapacity, cellCapacity, steps.size(), totalCells);
             return original(tool, start, end, straightOnly, networkType);
         }
