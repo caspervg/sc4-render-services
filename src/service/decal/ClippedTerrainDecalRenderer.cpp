@@ -952,7 +952,7 @@ namespace TerrainDecal
     DrawResult ClippedTerrainDecalRenderer::Draw(const DrawRequest& request)
     {
         const bool debugOverridesActive = !overlayUvWindows_.empty();
-        const bool shadowRecovery = request.mode == DrawMode::ShadowRecovery;
+        const bool shadowRecovery = request.mode != DrawMode::Normal;
 
         if (!options_.enableClippedRendering) {
             LOG_WARN("TerrainDecalRenderer: falling through to vanilla because clipped rendering is disabled");
@@ -1232,7 +1232,7 @@ namespace TerrainDecal
 
         float originalOpacity = 1.0f;
         bool opacityScaled = false;
-        if (shadowRecovery && request.overlaySlotBase) {
+        if (request.mode == DrawMode::ShadowRecovery && request.overlaySlotBase) {
             originalOpacity = ReadOverlaySlotOpacity(request.overlaySlotBase);
             if (std::isfinite(originalOpacity)) {
                 const float opacityScale = std::clamp(options_.shadowRecoveryOpacityScale, 0.0f, 1.0f);
