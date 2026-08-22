@@ -7,7 +7,7 @@ Now added: named `FAR-<ratio>.<orient>` parsing + a `[PowerPoles.FAR]` default s
 capture (`gFarDragRatioIndex`/`gFarDragOrient`) feeding `ResolvePoleInstanceForDirectionMask`, and
 the per-endpoint attach-yaw refactor with an optional `kPropAttachBasisDegrees` exemplar property
 (`ComputeSpanBearing`/`AttachBasisAngle`, replacing the single `ComputeYawDelta`). In-game
-verification completed 2026-07-19. Example angled-art exemplars ship in
+verification completed 2026-07-19. An optional angled-art authoring asset may be present at
 `assets/power-pole-customization/SC4PowerPoleFA2Example.dat` (instances `0xB07EFA20`/`0xB07EFA21`,
 vanilla pole group `0x088E1962`, RKT1 -> the P3 NL266/NR266 26.6-degree tangent S3Ds), with a
 matching commented `[PowerPoles.FAR]` preset in `SC4PowerPoleCustomization.ini`.
@@ -54,7 +54,8 @@ and angle (`2:1 — 26.6°`) rather than requiring familiarity with the internal
 
 `Get0To3Direction` classifies every non-axis-aligned span as diagonal (1 or 3), so a FAR span gets
 the diagonal pole model, visually rotated 45° while the wires run at e.g. 26.57°. The engine picks
-the mesh via the direction-mask → instance-ID table (`[PowerPoles]` / `[PowerPoles.<Name>]`), and
+the mesh via the direction-mask → instance-ID table (the built-in table or a
+`[PowerPoles.<Name>]` style; there is no standalone `[PowerPoles]` INI section), and
 `GetModelInstanceID` only selects among pre-authored rotated S3D variants — a correct FAR pole
 mesh therefore **requires new art**. Code can only route to that art once it exists.
 
@@ -128,7 +129,10 @@ InterPoleDistance=14
   stash that selection in drag-scoped state for `PlacePoles`/`CreatePowerPole`. The direction mask
   alone cannot express a FAR heading. Do not treat that transient state as occupant metadata,
   however: authored mesh and attachment-basis headings must be recoverable from the selected
-  instance/exemplar when an occupant is initialized or reloaded from a saved city.
+  instance/exemplar when an occupant is initialized or reloaded from a saved city. Windows has
+  exactly three direct `PlacePoles` calls: `0x0065206c` is recursive inside its connection loop,
+  while `0x006522c8`/`0x006529cb` are the external zone/commit callers. The DLL hooks only the two
+  external transaction boundaries and also clears state before zone-change reconstruction.
 - **Resolution order** (extended `ResolvePoleInstanceForDirectionMask`):
   1. exact `FAR-<ratio>.<orient>` key in the active style;
   2. same key in a new `[PowerPoles.FAR]` default/fallback section;
@@ -136,9 +140,13 @@ InterPoleDistance=14
      classifies to;
   4. the built-in vanilla entry if that regular key is also absent. Sparse style sections therefore
      degrade without unexpectedly changing pole family before the final fallback.
-- **Junctions/merges**: a pole whose cell already carries other connections ORs direction masks
-  together (multi-bit mask) and always takes the vanilla mask path. FAR buckets apply only to
-  clean two-connection mid-line poles.
+- **Junctions/merges**: a genuinely multi-bit direction mask takes the regular/vanilla path. This
+  is not sufficient for two bearings that share one broad diagonal class: a 45° DP span plus FAR-2
+  DP, or two FAR ratios in that class, still collapses to mask `0x2` (likewise `0x8` for DN). The
+  current shared lookup hook can therefore choose the latest drag's FAR model for that mixed pole.
+  A complete fix needs a merge-specific resolver at CreatePowerPole's existing-pole lookup and a
+  scan of the occupant's live connection bearings; until then same-class merges are a known art-
+  selection limitation rather than guaranteed regular fallback.
 
 ## Two real wrinkles
 
@@ -151,15 +159,17 @@ must be reconstructed during `InitConnectionPoints`, not retained only in a poin
 the original drag, so save/reload remains correct.
 
 **Endpoint/transition poles.** A FAR run's end pole often also carries a straight continuation —
-the mask calls it a junction, the art would want a purpose-built transition model. Cheap and
-recommended initially: let it fall through to the vanilla catchall (works, mildly ugly). Proper
-transition models (`FAR-2.XP+straight` etc.) are combinatorial; do not model them until the base
-set proves out.
+the mask calls it a junction, while the art wants a purpose-built transition model. The current
+resolver can still select the most recent FAR tangent because both the regular and FAR bearings
+collapse to the same coarse direction mask. Proper transition models (`FAR-2.XP+straight` etc.)
+are combinatorial and need a resolver with live connection-bearing context.
 
 Neighbor connections add another transition case: the engine requires the terminal cell to lie on
 the city boundary, while an exact FAR lattice does not always land there. Edge drags therefore keep
 all complete FAR periods and use one shortened final span to the boundary cell. The tool reports
 that crossed edge as an outward cardinal direction for the vanilla neighbor-connection routine.
+The shortened endpoint can currently inherit the main FAR tangent model even though its terminal
+bearing differs; position/bearing-aware transition selection remains an art and resolver gap.
 
 ## Art bill
 

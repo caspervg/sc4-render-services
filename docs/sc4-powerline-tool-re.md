@@ -231,7 +231,7 @@ are OOAnalyzer guesses, mostly `FUN_xxxxxxxx`. A few function names did survive 
 | `cSC4PowerLineTool::sPowerPoleForDirectionsFlag` (Mac 0x00ab9840) | `0x00B467B0` (static array, 16×4 bytes) | confirmed |
 | `cSC4PowerLineTool::CreatePowerPole` (0x0022c06a) | `FUN_00650140` | confirmed — structurally identical, indexes the table above at `&UNK_00b467a9+7+uVar3*4` = `0xB467B0` |
 | `cSC4PowerLineTool::DeterminePolePositions` (0x0022c98a) | `FUN_00650840` | confirmed — 993 instr / 177 blocks, calls CellIsOKForPlacement+FindPoleOccupant+ComputePolePosition matches, and is the function that calls `FUN_00651560` (PlacePoles) exactly where Mac calls `PlacePoles(this,'\0')` |
-| `cSC4PowerLineTool::PlacePoles` (0x0022d4c2) | `FUN_00651560` | confirmed — self-recursive call at the end (matches Mac's `PlacePoles(this,'\0')` recursion), calls CreatePowerPole/AddConnection |
+| `cSC4PowerLineTool::PlacePoles` (0x0022d4c2) | `FUN_00651560` | confirmed — tool in ECX plus one 32-bit 0/1 stack flag (`RET 4`); exactly three direct call sites: loop-recursive `0x0065206c` plus external zone/commit sites `0x006522c8` and `0x006529cb`; calls CreatePowerPole/AddConnection |
 | `cSC4PowerLineTool::CellIsOKForPlacement` (0x0022c1cc) | `FUN_0064fd00` | confirmed — only function referencing both GZCLSID `0x278128A0` and family `0x4A10AFC2` constants together |
 | `cSC4PowerLineTool::CheckForReservedTiles` (0x0022c34c) | `CheckForReservedTiles` @ `0x006392f0` | confirmed — name survived directly |
 | `cSC4PowerLineTool::ComputePolePosition` (0x0022b69c) | `FUN_0064efe0` | confirmed — called from CreatePowerPole/DeterminePolePositions matches |
@@ -427,8 +427,9 @@ signature didn't match Mac's call site.
 `CreateLineOccupant()` in the DLL now does the full sequence for real: allocate, construct,
 `SetPosition`, `SetConnectedPoleA`, `SetConnectedPoleB`. `TopUpExtraStrands()` calls it instead of
 only logging, since the object is now refcounted and reachable rather than an orphaned pool
-allocation. **Still open, and now the load-bearing unknown**: whether pole registration alone is
-sufficient for `DrawPowerlines` to render the strand, since that function (§6) reads polyline data
+allocation. **Still open at this point in the chronology (resolved in §13)**: whether pole
+registration alone is sufficient for `DrawPowerlines` to render the strand, since that function
+(§6) reads polyline data
 cached directly in each *pole's* own `tConnection` entry, not from the line occupant's position at
 render time. This needs in-game verification, not further static analysis — it's a runtime
 question (does a registered-but-not-tConnection-appended strand draw?), not a "find the address"
@@ -464,7 +465,7 @@ position fields, mirroring exactly what `SetPosition` itself does. (A third cand
 `this+0xc8`/`this+0xcc`, appeared in one read of `AddConnection`, but that function still has
 unresolved `unaff_` registers even after fixing its prototype — not trusted as a source either.)
 
-**TODO advanced, not fully closed.** `InitConnectionPointsHook`'s stubbed exemplar retrieval: fixing
+**Historical TODO (closed by the production implementation).** `InitConnectionPointsHook`'s stubbed exemplar retrieval: fixing
 `InitConnectionPoints`'s prototype (it needed the same treatment as `AddConnection`) produced a
 clean decompile showing the real retrieval sequence — call `occupant->pVtbl6` (`this+0x24`)'s own
 vtable slot `+0x10` with `&occupant->pVtbl6` as the this-argument, then the *returned* pointer's own
@@ -472,8 +473,9 @@ slot `+0x2c` behaves like a property getter. What's still unconfirmed: whether t
 pointer is ABI-compatible with the public `cISCPropertyHolder`/`cISCResExemplar` GZCOM interfaces —
 this looks like SC4's internal, unexposed property-access path, and this session didn't verify its
 vtable slot-for-slot against the public interface. Casting without that confirmation risks a crash,
-not just a wrong read, so it's left as a `nullptr` stub with the real call sequence documented
-rather than guessed at.
+not just a wrong read, so that revision left a `nullptr` stub with the real call sequence documented
+rather than guessed at. The current hook instead obtains the public `cISCExemplarPropertyHolder`
+through `QueryInterface`, calls `GetDefaultExemplar`, and was validated in game on 2026-07-19.
 
 `cSC4PowerPoleOccupant`'s Ghidra struct (both the renamed fields and the corrected position
 offsets) and `cSC4PowerPoleOccupant::SetPosition`/`DrawPowerlines`'s plate comments were all updated
@@ -520,18 +522,18 @@ pole's own `tConnection.polylines` vector — the same `vector<vector<cS3DVector
 `AddConnection`/`DrawPowerlines` field layout). That inner structure wasn't independently
 re-confirmed on Windows this session — the next scoped RE task, not a guess to act on yet.
 
-## 12. PoC cheat code added (2026-07-01)
+## 12. Historical PoC cheat (added and removed 2026-07-01)
 
-`PowerPoleCustomizationDirector.cpp` now has a `"polelinetest"` cheat code (search
-`kCheatPoleLineTest`), following the `DateJumperDirector.cpp` pattern (`RegisterCheatCode` in
+An earlier revision of `PowerPoleCustomizationDirector.cpp` had a `"polelinetest"` cheat code
+(`kCheatPoleLineTest`), following the `DateJumperDirector.cpp` pattern (`RegisterCheatCode` in
 `PostAppInit`, dispatch via `DoMessage`'s `kCheatCodeMessageType` case, `GetData1()` for the cheat
-ID). Toggling it makes every pole that goes through `InitConnectionPointsHook` (newly placed or
+ID). Toggling it made every pole that went through `InitConnectionPointsHook` (newly placed or
 reloaded) get a synthetic 6-point override built from its own already-baked vanilla attach point,
 duplicated with a small Y offset — no new art or exemplar needed. This isolates testing of exactly
 the open question from §11 item 5: does `CreateLineOccupant` + `SetConnectedPoleA/B` registration
-alone make `DrawPowerlines` render the extra strands, independent of the still-unresolved
-exemplar-property-reading path. Every block is tagged `TEMPORARY PoC-ONLY` for easy removal once
-that question is answered either way.
+alone make `DrawPowerlines` render the extra strands, independent of the then-unresolved
+exemplar-property-reading path. The experiment answered that question and the cheat was removed;
+the current user-facing diagnostic cheat is `keepwires`.
 
 ## 14. Real render path: append into tConnection.polylines (2026-07-01)
 
@@ -854,7 +856,7 @@ their own vtable slots untouched. No runtime class check needed.
   reusing it for FAR rasterization would give L-shaped cell paths; a FAR hook must rasterize
   its own supercover staircase.
 
-### F. Hook allocation strategy (implemented; dense preview runtime validation pending)
+### F. Hook allocation strategy (implemented; validated in game 2026-07-19)
 
 The step/cell vectors use the game's allocator; the DLL must not push_back into them with its
 own heap. The hook calls the ORIGINAL `DrawNetworkLine` with a legal corner-to-corner city
@@ -869,6 +871,14 @@ span that period's full supercover tile range. `DeterminePolePositions` continue
 cell as the period's pole node, while the native blue terrain preview can consume every crossed
 tile instead of seeing only isolated node cells. The terminal node remains a one-cell final step;
 boundary transitions receive their own supercover step.
+
+FAR heading/hysteresis state is transaction-scoped. Windows xrefs show exactly three direct calls
+to `PlacePoles`: `0x0065206c` is recursive inside its connection loop, while `0x006522c8` and
+`0x006529cb` are the external zone-change and normal input commits. The DLL hooks only those two
+external calls and clears transient FAR state after the complete outer transaction returns; the
+zone-change entry also clears it before rebuilding. Hooking the recursive site would clear the
+heading before later outer-loop iterations. This prevents an idle overlay or a later non-FAR
+creation from inheriting the previous drag heading without disrupting a multi-pass placement.
 
 ### G. Related facts picked up on the way
 
@@ -960,8 +970,10 @@ The original FAR hook violated three assumptions:
 preserves all complete FAR periods and synthesizes a final supercover transition to the actual
 boundary cell. It also writes `+0x7c/+0x80` to the even
 cardinal direction code for the crossed edge (`0=−X`, `2=−Z`, `4=+X`, `6=+Z`). Interior poles remain
-on exact FAR-period nodes. The shortened terminal span is a transition segment and uses the normal
-fallback model policy until dedicated transition art exists.
+on exact FAR-period nodes. The shortened terminal span is a transition segment, but the current
+model resolver can still inherit the run's main FAR tangent because it does not receive live-span
+bearing/position context. Dedicated transition keys plus a bearing-aware resolver are still
+required to choose correct terminal art reliably.
 
 ## 18. Tab / Shift-Tab pole-style switch — OnKeyDown hook (2026-07-05, implemented)
 
@@ -972,7 +984,10 @@ Keyboard input for **every** network tool (road/rail/street/power) is dispatched
 `cSC4ViewInputControlNetworkTool`, primary vtable **`0x00aab008`**. Its
 `cISC4ViewInputControl::OnKeyDown` is interface slot 14 = byte `+0x38`, so the slot dword lives at
 **`0x00aab040`** and holds the OnKeyDown body **`0x00661e90`**. Vanilla `OnKeyDown` reacts only to
-Escape (`0x1b`); Tab is unclaimed.
+Escape (`0x1b`); Tab is unclaimed. That body first calls
+`cSC4ViewInputControl::IsOnTop` at **`0x005fb190`** and ignores even Escape unless the control owns
+the top of the input stack. The Tab hook reproduces that same focus gate before consuming the key,
+so an open dialog, cheat box, or text field continues to receive Tab normally.
 
 Because that vtable is shared, a slot patch is **not** auto-scoped like the power-tool-specific
 `DrawNetworkLine` slot (`0x00aa9f78` in vtable `0x00aa9f30`). The hook runtime-gates on the active
@@ -1010,6 +1025,34 @@ The DLL hooks the single call site `0x0064e383` (`Destructor@DeletingDtor` patch
 window that pool-slot reuse opened. All six functions renamed in the Windows Ghidra database with
 provenance plate comments.
 
+Follow-up audit (2026-08-01) confirmed the outer Windows
+`cSC4PowerPoleOccupant::RemoveConnection` at `0x0064da00`. Its six direct calls are
+`0x0064db09`, `0x006518df`, `0x00651a27`, `0x0065279f`, `0x006527a9`, and `0x006ee04a`; each is a
+five-byte relative call to that exact target. It erases one `0x2c` tConnection and shifts its tail,
+so every address-keyed texture/width/buoy registration at or after the erased entry can become
+stale. The DLL now hooks all six calls, plus BreakAllConnections' in-place inner removal call at
+`0x0064db12`, and re-registers the surviving entries after vanilla completes. A follow-up raw-
+instruction check corrected an initially wrong field interpretation: AddConnection initializes
+`tConnection+0x08` to zero, while DrawPowerlines gates rendering on `+0x09`. The inner removal
+nulls the other-pole pointer at `+0x00` and leaves the entry in the vector while BreakAll's loop
+continues, so rehydration, texture registration, and foundation-bearing scans exclude null-peer
+entries rather than treating `+0x08` as a live byte.
+
+The same pass confirmed the save path: Windows `Read` at `0x0064ea00` deserializes the regular
+polyline vector (`tConnection+0x14`) and water vector (`+0x20`), then calls
+`InitConnectionPoints` at `0x0064ef09`; it never calls AddConnection or UpdateConnection afterward.
+Runtime side tables therefore used to be empty after reload. The Read-specific hook now queues each
+loaded pole, and `kSC4MessagePostCityInit` performs one rebuild/re-registration pass after both
+endpoints and their exemplars exist.
+
+The same address-stability rule applies while adding a span. Windows outer-vector growth helper
+`0x0064e0e0` copy-constructs every existing `0x2c` tConnection through `0x0064cfa0`; that deep-copies
+the inner regular/water vectors, so all point-buffer keys may change on one AddConnection. The Add
+hook now clears owner-wide width/buoy registrations before vanilla and rehydrates every surviving
+active entry afterward. UpdateConnection does not grow the outer vector, but it can replace the
+target span's inner buffers, so both of that entry's old point-buffer registrations are dropped
+before the update.
+
 ### B. Power-pole texture registry (Windows, confirmed) — why custom texture IDs used to be a guaranteed crash
 
 `StaticInit` (`0x0064cc20`) seeds a hash_map rooted at `0x00b46784` with exactly four texture IDs
@@ -1025,8 +1068,11 @@ differs from the draw context's zoom. Map insert function (the exact call Static
 DLL consequence (implemented): a custom foundation texture ID is accepted only after
 `TestForKey(0x7AB50E44, 0x1ABE787D, id)` succeeds; it is then inserted via `0x004f8d30`, the insert
 is verified by re-running Draw's own read-only bucket walk, the fresh slot is zeroed, and
-`0x00b0c0a8` is zeroed so the engine reloads all bindings on the next frame. Any failure falls back
-to the vanilla texture.
+`0x00b0c0a8` is set to `UINT32_MAX` so the engine reloads all bindings on the next frame. Zero is a
+real zoom: `StaticInit` creates exactly five width entries and Draw indexes them as 0..4, so the old
+zero sentinel failed to reload a newly inserted texture while the view was at zoom 0. Any failure
+falls back to the vanilla texture. Cached custom IDs are also rechecked against the live registry,
+because the registry is recreated between cities while the DLL remains loaded.
 
 ### C. Beta example content
 

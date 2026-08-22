@@ -28,7 +28,9 @@ namespace TerrainDecal
         uintptr_t callSiteAddress_ = 0;
         void* hookFn_ = nullptr;
         int32_t originalRel_ = 0;
+        int32_t patchedRel_ = 0;
         uintptr_t originalTarget_ = 0;
         bool installed_ = false;
+        bool configurationRejected_ = false;
     };
 }

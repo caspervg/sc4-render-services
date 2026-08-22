@@ -74,28 +74,55 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace {
     constexpr uint32_t kDirectorID = 0xB07E11E5; // arbitrary, must not collide with another director in this Plugins folder
     constexpr uint16_t kSupportedGameVersion = 641;
     constexpr uint32_t kCheatCodeMessageType = 0x230E27AC; // fixed SC4 message type, same constant every sample uses
+    constexpr uint32_t kSC4MessagePostCityInit = 0x26D31EC1; // emitted after all saved occupants are loaded
     constexpr uint32_t kSC4MessagePreCityShutdown = 0x26D31EC2; // same constant DateJumper/RenderServices use
 
     // Experimental, deliberately runtime-scoped switch: while enabled, the lot developer's
     // ClearLotBlockingObjects loop leaves power-pole and hidden power-line occupants alone.
     constexpr uint32_t kCheatKeepWires = 0xB07E1002;
     bool gKeepWiresOnZoneChange = false;
+    constexpr uint32_t kExemplarTypeId = 0x6534284A;
+    constexpr uint32_t kVanillaPowerPoleGroupId = 0x088E1962;
+
+    // No exception may unwind through a SimCity call frame. Hook bodies catch customization-side
+    // failures and use this best-effort logger (which is itself noexcept even if formatting fails).
+    void LogCurrentHookException(const char* const hookName) noexcept {
+        try {
+            throw;
+        } catch (const std::exception& ex) {
+            try {
+                LOG_ERROR("PowerPoleCustomization: {} customization failed: {}", hookName, ex.what());
+            } catch (...) {
+            }
+        } catch (...) {
+            try {
+                LOG_ERROR("PowerPoleCustomization: {} customization failed with an unknown exception.",
+                          hookName);
+            } catch (...) {
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // Hook sites -- SimCity 4.exe 1.1.641 absolute addresses.
@@ -144,6 +171,20 @@ namespace {
         0x0064d968, 0x0064d970,
     };
 
+    // cSC4PowerPoleOccupant::RemoveConnection. All six direct Windows callers were confirmed with
+    // the paired Ghidra projects: BreakAllConnections, two PlacePoles branches, two zone-change
+    // branches, and the terrain-height update path. Removal compacts the 0x2c-byte tConnection
+    // vector, invalidating every address-keyed side-table entry at and after the erased element.
+    constexpr uintptr_t kRemoveConnection = 0x0064da00;
+    constexpr std::array<uintptr_t, 6> kRemoveConnectionCallSites = {
+        0x0064db09, 0x006518df, 0x00651a27, 0x0065279f, 0x006527a9, 0x006ee04a,
+    };
+    // BreakAllConnections removes the reciprocal side through RemoveConnection above, but clears
+    // its own non-erased entry through this lower-level helper. Hook that one call too so teardown
+    // that does not immediately destroy the pole cannot leave stale point-buffer registrations.
+    constexpr uintptr_t kRemoveConnectionEntry = 0x0064a560;
+    constexpr uintptr_t kRemoveConnectionEntry_CallSite_BreakAll = 0x0064db12;
+
     // ------------------------------------------------------------------
     // cSC4PowerPoleOccupant field offsets (Windows). See docs/sc4-powerline-tool-re.md SS9 --
     // only offsets independently confirmed by a real call site, not guessed by Mac-offset-by-analogy.
@@ -172,8 +213,9 @@ namespace {
     // fields and the 0x2c stride. This is the struct DrawPowerlines actually renders from -- NOT
     // cSC4PowerLineOccupant (confirmed insufficient in-game, 2026-07-01, docs SS13).
     // UpdateConnection's raw Windows instructions independently confirm that +0x00 is the other
-    // pole pointer and +0x09 is the active/render-owning flag. +0xc/+0x10 are cell coordinates,
-    // not pole pointers.
+    // pole pointer and +0x09 is the render-owning flag. AddConnection initializes +0x08 to zero, so
+    // it is not a live marker; inner RemoveConnection at 0x0064a560 nulls +0x00 when disconnecting.
+    // +0xc/+0x10 are cell coordinates, not pole pointers.
     // ------------------------------------------------------------------
     constexpr uint32_t kConnection_OtherPole = 0x00;
     constexpr uint32_t kConnection_IsRenderOwner = 0x09;
@@ -229,10 +271,12 @@ namespace {
     using PolylineListInsertFn = void(__thiscall*)(void* polylinesVector, void* position, const void* value,
                                                      uint32_t unused, uint32_t count, uint8_t noTailRelocate);
 
-    // vector<vector<cS3DVector3>>::erase(begin,end), used by vanilla UpdateConnection to destroy
-    // every inner vector and reset the outer vector's end pointer before rebuilding it.
-    constexpr uintptr_t kPolylineListErase = 0x0064cf40;
-    using PolylineListEraseFn = void*(__thiscall*)(void* polylinesVector, void* begin, void* end);
+    // Complete vector<vector<cS3DVector3>> destructor. Windows RemoveConnection calls this exact
+    // helper for both tConnection lists at 0x0064da89/0x0064da91. It destroys every inner point
+    // vector and frees the outer allocation, which lets us build engine-owned temporary lists and
+    // commit them with a no-throw three-pointer swap.
+    constexpr uintptr_t kPolylineListDestructor = 0x004638b0;
+    using PolylineListDestructorFn = void(__fastcall*)(void* polylinesVector);
 
     // cSC4NetworkRoutines::Get0To3Direction -- confirmed identical logic to the Mac twin
     // (byte-for-byte equivalent branch structure, verified by decompiling both).
@@ -248,10 +292,11 @@ namespace {
     // (see kConnection_PolylinesBegin below), independent of any cSC4PowerLineOccupant's existence.
 
     // ------------------------------------------------------------------
-    // Custom exemplar property IDs. The full 0xB22A0000-0xB22A000F block was checked against the
-    // vendored new_properties.xml registry (2026-07-01); no property in that registry uses the
-    // block. Unregistered third-party properties can never be ruled out globally, but these IDs
-    // have no known registry conflict and are intentionally kept contiguous for this feature.
+    // Custom exemplar property IDs. The original 0xB22A0000-0xB22A000F block was checked against
+    // the vendored new_properties.xml registry on 2026-07-01 and the later IDs through 0xB22A0013
+    // were checked as they were added; none is used by that registry. Unregistered third-party
+    // properties can never be ruled out globally, but these IDs have no known registry conflict
+    // and are intentionally kept contiguous for this feature.
     // ------------------------------------------------------------------
     constexpr uint32_t kPropAttachPointsDir0 = 0xB22A0000;
     constexpr uint32_t kPropAttachPointsDir1 = 0xB22A0001;
@@ -291,6 +336,9 @@ namespace {
     // Optional Uint32: points per water-crossing strand polyline; the engine draws points-1 balls,
     // so vanilla's 4 points = 3 balls. Clamped to [2, 17] (1-16 balls).
     constexpr uint32_t kPropWaterBuoyPointCount = 0xB22A0013;
+    // Model-local coordinates beyond this are not meaningful in an SC4 city and can overflow the
+    // engine's float Bezier arithmetic even though each source value is individually finite.
+    constexpr float kMaxAttachCoordinateMagnitude = 1'000'000.0f;
     constexpr std::array<uint32_t, 4> kAttachPointProperties = {
         kPropAttachPointsDir0, kPropAttachPointsDir1, kPropAttachPointsDir2, kPropAttachPointsDir3,
     };
@@ -354,8 +402,8 @@ namespace {
     // same read-only bucket walk Draw performs; verification failure falls back to the vanilla
     // texture instead of trusting the insert. ChangeZoomLevel reloads the binding of every
     // registered entry whenever the zoom global at 0x00b0c0a8 differs from the draw context's
-    // zoom, so zeroing that global right after inserting forces the engine itself to load the new
-    // texture on the next frame -- no manual texture-manager call needed.
+    // zoom, so storing an impossible zoom right after inserting forces the engine itself to load
+    // the new texture on the next frame -- no manual texture-manager call needed.
     constexpr uintptr_t kPoleTextureRegistry = 0x00b46784;
     constexpr uintptr_t kPoleTextureRegistryInsert = 0x004f8d30;
     constexpr uintptr_t kPoleTextureBucketsBegin = 0x00b46788;
@@ -425,6 +473,14 @@ namespace {
     constexpr uint32_t kTool_MaxCellsBetweenPoles = 0x3a4; // cSC4PowerLineTool instance field
     constexpr uint32_t kMaxInterPoleDistance = 50; // sanity clamp; vanilla is 10
 
+    // cSC4PowerLineTool::PlacePoles has exactly three Windows direct callers (Ghidra xrefs). The
+    // call at 0x0065206c is recursive inside PlacePoles' connection loop, so clearing there would
+    // break later iterations of the outer pass. Only the two external callers are transaction ends.
+    constexpr uintptr_t kPlacePoles = 0x00651560;
+    constexpr std::array<uintptr_t, 2> kPlacePolesTransactionCallSites = {
+        0x006522c8, 0x006529cb,
+    };
+
     // ------------------------------------------------------------------
     // FAR (fractional-angle) power-line dragging -- validated in-game 2026-07-19. See
     // docs/sc4-powerline-tool-re.md SS17 for the complete evidence trail.
@@ -489,6 +545,7 @@ namespace {
     constexpr uintptr_t kNetworkToolInputControlVtable = 0x00aab008;
     constexpr uintptr_t kOnKeyDownSlot = 0x00aab040;   // vtable + 0x38 (interface slot 14)
     constexpr uintptr_t kOnKeyDown = 0x00661e90;       // cSC4ViewInputControlNetworkTool::OnKeyDown
+    constexpr uintptr_t kInputControlIsOnTop = 0x005fb190; // vanilla OnKeyDown's first focus check
     constexpr uint32_t kIC_NetworkType = 0x50;         // current network type on the input control
     constexpr uint32_t kNetworkTypePower = 5;
     constexpr uint32_t kVkTab = 0x09;
@@ -550,6 +607,7 @@ namespace {
     uint32_t gFarSnapCandidate = kAxisSnapCandidate;
 
     struct PoleStyle {
+        std::string configName;
         std::string name;
         std::array<uint32_t, 16> instanceByDirectionMask{};
         std::array<bool, 16> hasMask{};
@@ -564,6 +622,7 @@ namespace {
     // Index 0 = vanilla (no override). gStyles[gActiveStyleIndex - 1] for gActiveStyleIndex >= 1.
     std::vector<PoleStyle> gStyles;
     uint32_t gActiveStyleIndex = 0;
+    uint32_t gLastObservedVanillaInterPoleDistance = 10;
 
     // The optional [PowerPoles.FAR] section: a style-independent fallback consulted for FAR headings
     // when the active style doesn't define the exact key. Only its farInstanceByHeading is used; it
@@ -580,6 +639,14 @@ namespace {
     };
 
     Settings gSettings;
+    // Kept separate from the INI setting: hooks are installed before lifecycle subscriptions are
+    // proven. If startup rollback cannot reclaim a site, every surviving callback must still take
+    // its vanilla path while this DLL remains loaded.
+    bool gRuntimeHooksEnabled = false;
+
+    bool RuntimeCustomizationEnabled() noexcept {
+        return gRuntimeHooksEnabled && gSettings.enabled;
+    }
 
     // ------------------------------------------------------------------
     // Per-pole attach-point override -- the data-driven core of this mod.
@@ -659,6 +726,11 @@ namespace {
     // point or wire-appearance property is present. Everything else stays entirely vanilla.
     std::unordered_map<void*, PoleAttachOverride> gOverrides;
 
+    // The Read hook runs while the object stream is still constructing other poles, so rebuilding
+    // a saved connection there can observe an endpoint whose exemplar has not been initialized yet.
+    // Queue those poles and rehydrate them on kSC4MessagePostCityInit, after the whole city is live.
+    std::unordered_set<void*> gPendingLoadedPoles;
+
     struct PolylineWidthOverride {
         void* owner = nullptr;
         std::array<float, kPowerLineZoomCount> widthByZoom{};
@@ -671,10 +743,9 @@ namespace {
     // Per-connection wire/buoy texture override, keyed by the tConnection entry address DrawPowerlines
     // holds in EBP at both texture-lookup sites. Entry addresses move when a pole's connections
     // vector reallocates, so RegisterOccupantConnectionTextures() erases-by-owner and re-registers
-    // every render-owner entry of the pole on each AddConnection/UpdateConnection -- the only
-    // operations that grow the vector. A shrink (neighbor demolition) keeps the buffer, and because
-    // the texture pair is uniform across one pole's connections, a shifted-but-still-registered
-    // entry resolves to the same texture either way.
+    // every render-owner entry of the pole after connection additions, updates, removals, and saved-
+    // city rehydration. This covers both vector reallocation while growing and entry compaction
+    // while shrinking.
     struct ConnectionTextureOverride {
         void* owner = nullptr;
         uint32_t strandTextureId = kVanillaWireStrandTextureId;
@@ -706,6 +777,11 @@ namespace {
         }
 
         const float* const values = variant->RefFloat32();
+        if (values == nullptr) {
+            LOG_WARN("PowerPoleCustomization: property 0x{:08X} returned a null Float32 array; "
+                     "ignoring.", propertyId);
+            return false;
+        }
         uint32_t firstCoordinate = 0;
         uint32_t availableCount = 0;
         uint32_t requestedCount = 0;
@@ -713,7 +789,9 @@ namespace {
             availableCount = valueCount / 3;
             requestedCount = availableCount;
         } else if (valueCount >= 4 && (valueCount - 1) % 3 == 0 && std::isfinite(values[0]) &&
-                   values[0] >= 1.0f && std::floor(values[0]) == values[0]) {
+                   values[0] >= 1.0f && std::floor(values[0]) == values[0] &&
+                   static_cast<double>(values[0]) <=
+                       static_cast<double>(std::numeric_limits<uint32_t>::max())) {
             // Compatibility with the original PoC draft: [count, xyz...]. New properties should
             // use plain XYZ triples; new_properties.xml enforces groups of three.
             firstCoordinate = 1;
@@ -731,6 +809,14 @@ namespace {
             const float* const xyz = values + firstCoordinate + i * 3;
             if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2])) {
                 LOG_WARN("PowerPoleCustomization: property 0x{:08X} contains a non-finite coordinate; ignoring.", propertyId);
+                outPoints.clear();
+                return false;
+            }
+            if (std::fabs(xyz[0]) > kMaxAttachCoordinateMagnitude ||
+                std::fabs(xyz[1]) > kMaxAttachCoordinateMagnitude ||
+                std::fabs(xyz[2]) > kMaxAttachCoordinateMagnitude) {
+                LOG_WARN("PowerPoleCustomization: property 0x{:08X} contains a coordinate outside "
+                         "+/-{} meters; ignoring.", propertyId, kMaxAttachCoordinateMagnitude);
                 outPoints.clear();
                 return false;
             }
@@ -812,36 +898,50 @@ namespace {
     // ------------------------------------------------------------------
     std::unordered_set<uint32_t> gRegisteredPoleTextures; // IDs this DLL inserted this session
 
-    // Read-only re-find using the exact node layout Draw's own walk uses.
-    bool PoleTextureRegistryContains(const uint32_t textureId) {
-        const auto* const bucketsBegin = *reinterpret_cast<uint8_t* const*>(kPoleTextureBucketsBegin);
-        const auto* const bucketsEnd = *reinterpret_cast<uint8_t* const*>(kPoleTextureBucketsEnd);
-        if (bucketsBegin == nullptr || bucketsEnd <= bucketsBegin) {
-            return false;
+    // Read-only re-find using the exact node layout Draw's own walk uses. The returned pointer is
+    // the node's +0x08 binding slot; Draw dereferences that slot without a null check.
+    uint32_t* FindPoleTextureRegistrySlot(const uint32_t textureId) noexcept {
+        const uintptr_t bucketsBegin = reinterpret_cast<uintptr_t>(
+            *reinterpret_cast<uint8_t* const*>(kPoleTextureBucketsBegin));
+        const uintptr_t bucketsEnd = reinterpret_cast<uintptr_t>(
+            *reinterpret_cast<uint8_t* const*>(kPoleTextureBucketsEnd));
+        if (bucketsBegin == 0 || bucketsEnd <= bucketsBegin) {
+            return nullptr;
         }
-        const auto bucketCount = static_cast<uint32_t>((bucketsEnd - bucketsBegin) / 4);
-        const uint8_t* node =
-            reinterpret_cast<const uint8_t* const*>(bucketsBegin)[textureId % bucketCount];
+        const uintptr_t span = bucketsEnd - bucketsBegin;
+        constexpr uintptr_t kMaxPlausibleBucketCount = 1u << 20;
+        if (span % sizeof(uint32_t) != 0) {
+            return nullptr;
+        }
+        const uintptr_t bucketCount = span / sizeof(uint32_t);
+        if (bucketCount == 0 || bucketCount > kMaxPlausibleBucketCount) {
+            return nullptr;
+        }
+        uint8_t* node = reinterpret_cast<uint8_t* const*>(bucketsBegin)[textureId % bucketCount];
         while (node != nullptr && *reinterpret_cast<const uint32_t*>(node + 4) != textureId) {
-            node = *reinterpret_cast<const uint8_t* const*>(node);
+            node = *reinterpret_cast<uint8_t* const*>(node);
         }
-        return node != nullptr;
+        return node == nullptr ? nullptr : reinterpret_cast<uint32_t*>(node + 8);
+    }
+
+    uint32_t ReadyPoleTextureOrVanilla(const uint32_t textureId,
+                                       const uint32_t vanillaTextureId) noexcept {
+        if (!RuntimeCustomizationEnabled() || textureId == vanillaTextureId) {
+            return vanillaTextureId;
+        }
+        const uint32_t* const slot = FindPoleTextureRegistrySlot(textureId);
+        return slot != nullptr && *slot != 0 ? textureId : vanillaTextureId;
     }
 
     bool EnsurePoleTextureRegistered(const uint32_t textureId, const char* const use) {
         if (textureId == kVanillaFloorTextureId || textureId == kVanillaWallTextureId ||
-            textureId == kVanillaWireStrandTextureId || textureId == kVanillaWireBuoyTextureId ||
-            gRegisteredPoleTextures.contains(textureId)) {
+            textureId == kVanillaWireStrandTextureId || textureId == kVanillaWireBuoyTextureId) {
             return true; // the four vanilla IDs are registered by StaticInit itself
         }
 
-        // Registered by someone else (another pole DLL, or a future engine change): usable as-is,
-        // and its live binding must not be disturbed.
-        if (PoleTextureRegistryContains(textureId)) {
-            gRegisteredPoleTextures.insert(textureId);
-            return true;
-        }
-
+        // A node inserted by another DLL is not proof that the referenced FSH exists. Validate the
+        // resource first; otherwise forcing a reload can still leave a null binding for Draw to
+        // dereference.
         const cIGZPersistResourceManagerPtr resourceManager;
         const cGZPersistResourceKey key(kFshTypeId, kPoleTextureGroupId, textureId);
         if (!resourceManager || !resourceManager->TestForKey(key)) {
@@ -852,18 +952,36 @@ namespace {
             return false;
         }
 
+        // Always re-check the live engine map. It is rebuilt between cities while this DLL and its
+        // process-wide cache remain loaded; trusting gRegisteredPoleTextures alone can therefore
+        // hand DrawPowerlines an absent ID and trigger its unchecked null dereference.
+        if (uint32_t* const existingSlot = FindPoleTextureRegistrySlot(textureId)) {
+            if (*existingSlot == 0) {
+                // Another DLL may have inserted the key without loading its binding. Draw blindly
+                // dereferences the binding pointer, so force the engine's all-texture reload before
+                // accepting the ID even though the hash node itself already exists.
+                *reinterpret_cast<uint32_t*>(kPoleTextureZoomGlobal) =
+                    std::numeric_limits<uint32_t>::max();
+            }
+            gRegisteredPoleTextures.insert(textureId);
+            return true;
+        }
+        gRegisteredPoleTextures.erase(textureId);
+
         using RegistryInsertFn = uint32_t*(__thiscall*)(void* map, const uint32_t* key);
-        uint32_t* const slot = reinterpret_cast<RegistryInsertFn>(kPoleTextureRegistryInsert)(
+        uint32_t* const insertedSlot = reinterpret_cast<RegistryInsertFn>(kPoleTextureRegistryInsert)(
             reinterpret_cast<void*>(kPoleTextureRegistry), &textureId);
-        if (slot == nullptr || !PoleTextureRegistryContains(textureId)) {
+        uint32_t* const verifiedSlot = FindPoleTextureRegistrySlot(textureId);
+        if (insertedSlot == nullptr || verifiedSlot == nullptr) {
             LOG_ERROR("PowerPoleCustomization: engine texture-registry insert for {} texture ID "
                       "0x{:08X} could not be verified; keeping the vanilla texture.", use, textureId);
             return false;
         }
-        *slot = 0; // fresh node: no binding yet (StaticInit zeroes its own fresh slots the same way)
+        *verifiedSlot = 0; // fresh node: no binding yet (StaticInit zeroes its own slots likewise)
         // Force the engine to reload every registered binding (including this one) on the next
-        // Draw: zoom values are 1-5, so 0 always mismatches.
-        *reinterpret_cast<uint32_t*>(kPoleTextureZoomGlobal) = 0;
+        // Draw. StaticInit allocates exactly five width entries and Draw indexes them directly, so
+        // the valid internal zoom domain is 0..4; UINT32_MAX cannot equal a real draw-context zoom.
+        *reinterpret_cast<uint32_t*>(kPoleTextureZoomGlobal) = std::numeric_limits<uint32_t>::max();
         gRegisteredPoleTextures.insert(textureId);
         LOG_INFO("PowerPoleCustomization: registered {} texture ID 0x{:08X} with the engine's "
                  "power-pole texture registry.", use, textureId);
@@ -893,8 +1011,12 @@ namespace {
                                            const bool useExplicitRotation, uint32_t* const outType,
                                            uint32_t* const outGroup) {
         auto* const occupant = reinterpret_cast<uint8_t*>(resourceKeys) - kOccupant_ModelResourceKeys;
-        if (ShouldInvertModelQuarterTurn(occupant)) {
-            quarterTurn ^= 1u;
+        try {
+            if (RuntimeCustomizationEnabled() && ShouldInvertModelQuarterTurn(occupant)) {
+                quarterTurn ^= 1u;
+            }
+        } catch (...) {
+            LogCurrentHookException("GetModelInstanceID");
         }
 
         const auto original = reinterpret_cast<GetModelInstanceIDFn>(kGetModelInstanceID);
@@ -916,6 +1038,11 @@ namespace {
 
         const uint32_t count = std::min(variant->GetCount(), gSettings.maxPointsPerDirection);
         const float* const values = variant->RefFloat32();
+        if (values == nullptr) {
+            LOG_WARN("PowerPoleCustomization: property 0x{:08X} returned a null Float32 array; "
+                     "ignoring.", propertyId);
+            return false;
+        }
         outValues.reserve(count);
         for (uint32_t i = 0; i < count; ++i) {
             if (!std::isfinite(values[i]) || values[i] < 0.0f) {
@@ -1029,12 +1156,14 @@ namespace {
         // stays fully vanilla. Stored normalized to [0, pi) to match ComputeSpanBearing's range.
         float basisDegrees = 0.0f;
         if (TryReadFiniteFloatProperty(holder, kPropAttachBasisDegrees, basisDegrees)) {
-            constexpr float pi = 3.14159265358979323846f;
-            float basisRadians = std::fmod(basisDegrees * (pi / 180.0f), pi);
+            // Do the conversion in double: every finite Float32 degree value remains finite in
+            // double, while multiplying a very large Float32 in its own precision can overflow.
+            constexpr double pi = 3.14159265358979323846;
+            double basisRadians = std::fmod(static_cast<double>(basisDegrees) * (pi / 180.0), pi);
             if (basisRadians < 0.0f) {
                 basisRadians += pi;
             }
-            out.attachBasisRadians = basisRadians;
+            out.attachBasisRadians = static_cast<float>(basisRadians);
             out.hasAttachBasis = true;
         }
         return any;
@@ -1150,12 +1279,16 @@ namespace {
     }
 
     // ------------------------------------------------------------------
-    // Finds the active/render-owning tConnection for this exact pole pair. Windows UpdateConnection
-    // performs the same scan: entry+0x00 must equal otherPole and entry+0x09 must be nonzero. Only
-    // that side contains the polylines DrawPowerlines visits; the reciprocal inactive entry normally
-    // has an empty polyline vector and must not be topped up.
+    // Finds the render-owning tConnection for this exact pole pair. Windows UpdateConnection
+    // performs the same scan: entry+0x00 must equal otherPole and entry+0x09 must be nonzero.
+    // BreakAll's inner removal nulls +0x00 before its loop continues. Only the render-owning side
+    // contains the polylines DrawPowerlines visits; the reciprocal entry normally has an empty
+    // polyline vector.
     // ------------------------------------------------------------------
     void* FindConnectionEntry(void* pole, void* otherPole) {
+        if (pole == nullptr || otherPole == nullptr) {
+            return nullptr;
+        }
         auto* const begin = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(pole) + kOccupant_ConnectionsBegin);
         auto* const end = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(pole) + kOccupant_ConnectionsEnd);
         for (uint8_t* entry = begin; entry != end; entry += kConnection_Size) {
@@ -1186,61 +1319,64 @@ namespace {
         return it != gOverrides.end() && it->second.PointCount(direction) > 0;
     }
 
-    void AdjustControlPointSag(float* controlPoint, const AttachPoint& a, const AttachPoint& b,
+    bool AdjustControlPointSag(float* controlPoint, const AttachPoint& a, const AttachPoint& b,
                                const float sagScale, const float maximumSag) {
-        const float dx = b.x - a.x;
-        const float dy = b.y - a.y;
-        const float dz = b.z - a.z;
-        const float lengthSquared = dx * dx + dy * dy + dz * dz;
-        if (lengthSquared <= std::numeric_limits<float>::epsilon()) {
-            return;
+        // Exemplar values are finite Float32s, but products of otherwise-valid extreme values can
+        // still overflow Float32. Keep the derivation in double and reject a result that cannot be
+        // represented safely instead of feeding INF/NaN into the engine tessellator.
+        const double dx = static_cast<double>(b.x) - a.x;
+        const double dy = static_cast<double>(b.y) - a.y;
+        const double dz = static_cast<double>(b.z) - a.z;
+        const double lengthSquared = dx * dx + dy * dy + dz * dz;
+        if (!std::isfinite(lengthSquared)) {
+            return false;
+        }
+        if (lengthSquared <= std::numeric_limits<double>::epsilon()) {
+            return true;
         }
 
-        const float along = ((controlPoint[0] - a.x) * dx + (controlPoint[1] - a.y) * dy +
-                             (controlPoint[2] - a.z) * dz) / lengthSquared;
-        const float straightLineY = a.y + dy * along;
-        const float vanillaSag = std::max(0.0f, straightLineY - controlPoint[1]);
-        const float scaledSag = std::min(vanillaSag * sagScale, maximumSag);
-        controlPoint[1] = straightLineY - scaledSag;
+        const double along = ((static_cast<double>(controlPoint[0]) - a.x) * dx +
+                              (static_cast<double>(controlPoint[1]) - a.y) * dy +
+                              (static_cast<double>(controlPoint[2]) - a.z) * dz) / lengthSquared;
+        const double straightLineY = static_cast<double>(a.y) + dy * along;
+        const double vanillaSag = std::max(0.0, straightLineY - controlPoint[1]);
+        const double scaledSag = std::min(vanillaSag * static_cast<double>(sagScale),
+                                          static_cast<double>(maximumSag));
+        const double adjustedY = straightLineY - scaledSag;
+        if (!std::isfinite(adjustedY) ||
+            adjustedY < -std::numeric_limits<float>::max() ||
+            adjustedY > std::numeric_limits<float>::max()) {
+            return false;
+        }
+        controlPoint[1] = static_cast<float>(adjustedY);
+        return true;
     }
 
-    // Builds one tessellated Bezier polyline between two attach points and appends it into one of
-    // the tConnection's two polyline lists (regular at +0x14, water-crossing coarse at +0x20 --
-    // both are vector<vector<cS3DVector3>> and share the engine insert helper). Vanilla still
-    // supplies its horizontal control geometry and tessellation count; only the vertical sag
-    // component is scaled/clamped per wire.
-    void AppendPolylineToList(void* entry, const uint32_t listBeginOffset, const uint32_t listEndOffset,
-                              const AttachPoint& a, const AttachPoint& b,
-                              const float sagScale, const float maximumSag) {
+    // Builds one tessellated Bezier polyline without touching the live tConnection. All replacement
+    // polylines are prepared this way before the old engine vectors are cleared, so a bad_alloc or
+    // invalid derived point leaves the original geometry intact.
+    bool BuildPolylinePoints(const AttachPoint& a, const AttachPoint& b, const float sagScale,
+                             const float maximumSag, std::vector<float>& points) {
         float control1[3];
         float control2[3];
         int32_t pointCount = 0;
         const auto getControlPoints = reinterpret_cast<GetControlPointsFn>(kGetControlPoints);
         getControlPoints(a.x, a.y, a.z, b.x, b.y, b.z, control1, control2, &pointCount);
-        AdjustControlPointSag(control1, a, b, sagScale, maximumSag);
-        AdjustControlPointSag(control2, a, b, sagScale, maximumSag);
+        if (!AdjustControlPointSag(control1, a, b, sagScale, maximumSag) ||
+            !AdjustControlPointSag(control2, a, b, sagScale, maximumSag)) {
+            return false;
+        }
         pointCount = std::clamp(pointCount, 2, 64); // vanilla treats this as total points, including p0
 
         const float p0[3] = {a.x, a.y, a.z};
         const float p1[3] = {b.x, b.y, b.z};
-        std::vector<float> points(static_cast<size_t>(pointCount) * 3);
+        points.assign(static_cast<size_t>(pointCount) * 3, 0.0f);
         points[0] = a.x;
         points[1] = a.y;
         points[2] = a.z;
         const auto tessellate = reinterpret_cast<TessellateBezierSegmentFn>(kTessellateBezierSegment);
         tessellate(p0, control1, control2, p1, reinterpret_cast<uintptr_t>(points.data() + 3), pointCount - 1);
-
-        const void* view[3] = {points.data(), points.data() + points.size(), points.data() + points.size()};
-        auto* const polylines = reinterpret_cast<uint8_t*>(entry) + listBeginOffset;
-        void* const insertPos = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + listEndOffset);
-        const auto insert = reinterpret_cast<PolylineListInsertFn>(kPolylineListInsert);
-        insert(polylines, insertPos, view, 0, 1, 1);
-    }
-
-    void AppendPolylineToConnection(void* entry, const AttachPoint& a, const AttachPoint& b,
-                                    const float sagScale, const float maximumSag) {
-        AppendPolylineToList(entry, kConnection_PolylinesBegin, kConnection_PolylinesEnd,
-                             a, b, sagScale, maximumSag);
+        return std::ranges::all_of(points, [](const float value) { return std::isfinite(value); });
     }
 
     // Water-crossing variant. The engine draws one buoy ball at every point EXCEPT the last, so a
@@ -1249,17 +1385,19 @@ namespace {
     // for B balls (totalPoints - 1), tessellate B+2 uniform points along the sagged bezier and
     // drop the t=0 one -- the stored points sit at t = k/(B+1) for k = 1..B+1, the engine draws
     // balls at the B strictly-interior positions, and neither pole ever wears a ball.
-    void AppendWaterPolylineToConnection(void* entry, const AttachPoint& a, const AttachPoint& b,
-                                         const float sagScale, const float maximumSag,
-                                         const int32_t totalPoints) {
+    bool BuildWaterPolylinePoints(const AttachPoint& a, const AttachPoint& b, const float sagScale,
+                                  const float maximumSag, const int32_t totalPoints,
+                                  std::vector<float>& points) {
         const int32_t balls = std::clamp(totalPoints - 1, 1, 62);
         float control1[3];
         float control2[3];
         int32_t ignoredCount = 0;
         const auto getControlPoints = reinterpret_cast<GetControlPointsFn>(kGetControlPoints);
         getControlPoints(a.x, a.y, a.z, b.x, b.y, b.z, control1, control2, &ignoredCount);
-        AdjustControlPointSag(control1, a, b, sagScale, maximumSag);
-        AdjustControlPointSag(control2, a, b, sagScale, maximumSag);
+        if (!AdjustControlPointSag(control1, a, b, sagScale, maximumSag) ||
+            !AdjustControlPointSag(control2, a, b, sagScale, maximumSag)) {
+            return false;
+        }
 
         const float p0[3] = {a.x, a.y, a.z};
         const float p1[3] = {b.x, b.y, b.z};
@@ -1271,12 +1409,38 @@ namespace {
         const auto tessellate = reinterpret_cast<TessellateBezierSegmentFn>(kTessellateBezierSegment);
         tessellate(p0, control1, control2, p1, reinterpret_cast<uintptr_t>(uniform.data() + 3), balls + 1);
 
-        const std::vector<float> points(uniform.begin() + 3, uniform.end()); // balls + 1 points
-        const void* view[3] = {points.data(), points.data() + points.size(), points.data() + points.size()};
-        auto* const polylines = reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesBegin;
-        void* const insertPos = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesEnd);
+        points.assign(uniform.begin() + 3, uniform.end()); // balls + 1 points
+        return std::ranges::all_of(points, [](const float value) { return std::isfinite(value); });
+    }
+
+    using EnginePolylineList = std::array<void*, 3>; // begin, end, capacity (12 bytes on x86)
+    static_assert(sizeof(void*) == 4 && sizeof(EnginePolylineList) == 12,
+                  "Power-pole engine vector layout requires the 32-bit target.");
+
+    // Appends a fully prepared point array into an engine-owned vector. The confirmed insert helper
+    // deep-copies the temporary {begin,end,cap} view; no allocator ownership crosses the boundary.
+    void AppendPreparedPolyline(void* polylines, const std::vector<float>& points) {
+        const float* const pointsBegin = points.empty() ? nullptr : points.data();
+        const float* const pointsEnd = pointsBegin == nullptr ? nullptr : pointsBegin + points.size();
+        const void* view[3] = {pointsBegin, pointsEnd, pointsEnd};
+        void* const insertPos = reinterpret_cast<void**>(polylines)[1];
         const auto insert = reinterpret_cast<PolylineListInsertFn>(kPolylineListInsert);
         insert(polylines, insertPos, view, 0, 1, 1);
+    }
+
+    void DestroyEnginePolylineList(EnginePolylineList& list) noexcept {
+        const auto destroy = reinterpret_cast<PolylineListDestructorFn>(kPolylineListDestructor);
+        destroy(list.data());
+        list.fill(nullptr);
+    }
+
+    void SwapEnginePolylineList(void* entry, const uint32_t listBeginOffset,
+                                EnginePolylineList& replacement) noexcept {
+        auto** const live = reinterpret_cast<void**>(
+            reinterpret_cast<uint8_t*>(entry) + listBeginOffset);
+        for (size_t i = 0; i < replacement.size(); ++i) {
+            std::swap(live[i], replacement[i]);
+        }
     }
 
     void ForgetConnectionWidths(void* entry) {
@@ -1332,12 +1496,34 @@ namespace {
                       [occupant](const auto& item) { return item.second.owner == occupant; });
     }
 
+    bool TryScalePowerLineWidths(const float* const vanillaWidths, const float scale,
+                                 std::array<float, kPowerLineZoomCount>& outValues) noexcept {
+        if (vanillaWidths == nullptr || !std::isfinite(scale) || scale < 0.0f) {
+            return false;
+        }
+        for (size_t zoom = 0; zoom < kPowerLineZoomCount; ++zoom) {
+            const double scaled = static_cast<double>(vanillaWidths[zoom]) * scale;
+            if (!std::isfinite(vanillaWidths[zoom]) || vanillaWidths[zoom] < 0.0f ||
+                !std::isfinite(scaled) || scaled > std::numeric_limits<float>::max()) {
+                return false;
+            }
+            outValues[zoom] = static_cast<float>(scaled);
+        }
+        return true;
+    }
+
     void RegisterConnectionWaterBallSizes(void* occupant, void* entry, const float sizeScale) {
         ForgetConnectionWaterBallSizes(entry);
         if (sizeScale == 1.0f) {
             return;
         }
         const float* const vanillaWidths = *reinterpret_cast<float**>(kPowerLineWidthFactorsPtr);
+        std::array<float, kPowerLineZoomCount> scaledSizes{};
+        if (!TryScalePowerLineWidths(vanillaWidths, sizeScale, scaledSizes)) {
+            LOG_WARN("PowerPoleCustomization: buoy size scale {} for pole {} overflows the engine's "
+                     "Float32 size range; using vanilla buoy sizes.", sizeScale, occupant);
+            return;
+        }
         auto* const begin = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesBegin);
         auto* const end = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesEnd);
         for (uint8_t* polyline = begin; polyline != end; polyline += 12) {
@@ -1347,21 +1533,22 @@ namespace {
             }
             WaterBallSizeOverride value;
             value.owner = occupant;
-            for (size_t zoom = 0; zoom < kPowerLineZoomCount; ++zoom) {
-                value.sizeByZoom[zoom] = vanillaWidths[zoom] * sizeScale;
-            }
+            value.sizeByZoom = scaledSizes;
             gWaterBallSizeOverrides[points] = value;
         }
     }
 
     const float* __cdecl ResolveWaterBallSizePointer(const void* polyline, const uint32_t zoom) noexcept {
         const float* const vanillaWidths = *reinterpret_cast<float**>(kPowerLineWidthFactorsPtr);
+        if (!RuntimeCustomizationEnabled()) {
+            return vanillaWidths + (zoom < kPowerLineZoomCount ? zoom : kPowerLineZoomCount - 1);
+        }
         const void* const points = polyline ? *reinterpret_cast<void* const*>(polyline) : nullptr;
         const auto it = points ? gWaterBallSizeOverrides.find(points) : gWaterBallSizeOverrides.end();
         if (it != gWaterBallSizeOverrides.end() && zoom < kPowerLineZoomCount) {
             return &it->second.sizeByZoom[zoom];
         }
-        return vanillaWidths + zoom;
+        return vanillaWidths + (zoom < kPowerLineZoomCount ? zoom : kPowerLineZoomCount - 1);
     }
 
 #if defined(_MSC_VER) && defined(_M_IX86)
@@ -1388,11 +1575,11 @@ namespace {
 #error Power-pole water-ball-size hook requires 32-bit MSVC.
 #endif
 
-    // (Re)registers wire/buoy texture overrides for every render-owner tConnection entry in this
-    // pole's connections vector. Called after AddConnection/UpdateConnection, i.e. after any
-    // reallocation of that vector, so registered entry addresses are always current. The texture
-    // pair comes from this pole's exemplar; a pole without wire texture properties inherits the
-    // other endpoint's pair per connection, mirroring FindAppearanceOverride's precedence.
+    // (Re)registers wire/buoy texture overrides for every active render-owner tConnection entry in
+    // this pole's vector. Called after connection mutation and saved-city rehydration, so registered
+    // entry addresses are always current. The texture pair comes from this pole's exemplar; a pole
+    // without wire texture properties inherits the other endpoint's pair per connection, mirroring
+    // FindAppearanceOverride's precedence.
     void RegisterOccupantConnectionTextures(void* occupant) {
         ForgetOccupantTextures(occupant);
         auto* const begin = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(occupant) + kOccupant_ConnectionsBegin);
@@ -1401,7 +1588,8 @@ namespace {
         const bool selfHasTextures = self != gOverrides.end() &&
                                      (self->second.hasWireTexture || self->second.hasBuoyTexture);
         for (uint8_t* entry = begin; entry != end; entry += kConnection_Size) {
-            if (*reinterpret_cast<const uint8_t*>(entry + kConnection_IsRenderOwner) == 0) {
+            if (*reinterpret_cast<void**>(entry + kConnection_OtherPole) == nullptr ||
+                *reinterpret_cast<const uint8_t*>(entry + kConnection_IsRenderOwner) == 0) {
                 continue; // DrawPowerlines only visits render-owner entries
             }
             const PoleAttachOverride* source = selfHasTextures ? &self->second : nullptr;
@@ -1428,14 +1616,16 @@ namespace {
 
     uint32_t __cdecl GetWireStrandTextureOverride(const void* entry) noexcept {
         const auto it = gConnectionTextureOverrides.find(entry);
-        return it != gConnectionTextureOverrides.end() ? it->second.strandTextureId
-                                                        : kVanillaWireStrandTextureId;
+        const uint32_t requested = it != gConnectionTextureOverrides.end()
+            ? it->second.strandTextureId : kVanillaWireStrandTextureId;
+        return ReadyPoleTextureOrVanilla(requested, kVanillaWireStrandTextureId);
     }
 
     uint32_t __cdecl GetWireBuoyTextureOverride(const void* entry) noexcept {
         const auto it = gConnectionTextureOverrides.find(entry);
-        return it != gConnectionTextureOverrides.end() ? it->second.buoyTextureId
-                                                        : kVanillaWireBuoyTextureId;
+        const uint32_t requested = it != gConnectionTextureOverrides.end()
+            ? it->second.buoyTextureId : kVanillaWireBuoyTextureId;
+        return ReadyPoleTextureOrVanilla(requested, kVanillaWireBuoyTextureId);
     }
 
 #if defined(_MSC_VER) && defined(_M_IX86)
@@ -1479,20 +1669,45 @@ namespace {
 #error Power-pole wire-texture hooks require 32-bit MSVC.
 #endif
 
-    void ClearConnectionPolylines(void* entry) {
-        ForgetConnectionWidths(entry);
-        auto* const begin = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_PolylinesBegin);
-        auto* const end = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_PolylinesEnd);
-        const auto erase = reinterpret_cast<PolylineListEraseFn>(kPolylineListErase);
-        erase(reinterpret_cast<uint8_t*>(entry) + kConnection_PolylinesBegin, begin, end);
-    }
+    bool CommitPreparedConnectionGeometry(
+        void* entry, const bool includeWater,
+        const std::vector<std::vector<float>>& newRegular,
+        const std::vector<std::vector<float>>& newWater) {
+        if (includeWater && newWater.size() != newRegular.size()) {
+            LOG_ERROR("PowerPoleCustomization: internal regular/water strand-count mismatch; "
+                      "keeping the live geometry untouched.");
+            return false;
+        }
 
-    void ClearConnectionWaterPolylines(void* entry) {
-        ForgetConnectionWaterBallSizes(entry);
-        auto* const begin = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesBegin);
-        auto* const end = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesEnd);
-        const auto erase = reinterpret_cast<PolylineListEraseFn>(kPolylineListErase);
-        erase(reinterpret_cast<uint8_t*>(entry) + kConnection_WaterPolylinesBegin, begin, end);
+        EnginePolylineList preparedRegular{};
+        EnginePolylineList preparedWater{};
+        try {
+            for (size_t i = 0; i < newRegular.size(); ++i) {
+                AppendPreparedPolyline(preparedRegular.data(), newRegular[i]);
+                if (includeWater) {
+                    AppendPreparedPolyline(preparedWater.data(), newWater[i]);
+                }
+            }
+        } catch (...) {
+            LogCurrentHookException("connection geometry preparation");
+            DestroyEnginePolylineList(preparedWater);
+            DestroyEnginePolylineList(preparedRegular);
+            return false;
+        }
+
+        // All game-heap allocation finished while the live connection was untouched. The commit is
+        // now only pointer swaps; the temporaries receive the old lists and destroy them afterward.
+        ForgetConnectionWidths(entry);
+        if (includeWater) {
+            ForgetConnectionWaterBallSizes(entry);
+        }
+        SwapEnginePolylineList(entry, kConnection_PolylinesBegin, preparedRegular);
+        if (includeWater) {
+            SwapEnginePolylineList(entry, kConnection_WaterPolylinesBegin, preparedWater);
+        }
+        DestroyEnginePolylineList(preparedWater);
+        DestroyEnginePolylineList(preparedRegular);
+        return true;
     }
 
     void RegisterConnectionWidths(void* occupant, void* entry, const PoleAttachOverride* appearance) {
@@ -1516,8 +1731,11 @@ namespace {
             }
             PolylineWidthOverride value;
             value.owner = occupant;
-            for (size_t zoom = 0; zoom < kPowerLineZoomCount; ++zoom) {
-                value.widthByZoom[zoom] = vanillaWidths[zoom] * scale;
+            if (!TryScalePowerLineWidths(vanillaWidths, scale, value.widthByZoom)) {
+                LOG_WARN("PowerPoleCustomization: wire-width scale {} for pole {} wire {} overflows "
+                         "the engine's Float32 width range; using vanilla width.",
+                         scale, occupant, wireIndex);
+                continue;
             }
             gPolylineWidthOverrides[points] = value;
         }
@@ -1527,12 +1745,15 @@ namespace {
         const float* const vanillaWidths = *reinterpret_cast<float**>(kPowerLineWidthFactorsPtr);
         const uint32_t zoom = *reinterpret_cast<const uint32_t*>(
             reinterpret_cast<const uint8_t*>(occupant) + 0xc4);
+        if (!RuntimeCustomizationEnabled()) {
+            return vanillaWidths + (zoom < kPowerLineZoomCount ? zoom : kPowerLineZoomCount - 1);
+        }
         const void* const points = polyline ? *reinterpret_cast<void* const*>(polyline) : nullptr;
         const auto it = points ? gPolylineWidthOverrides.find(points) : gPolylineWidthOverrides.end();
         if (it != gPolylineWidthOverrides.end() && it->second.owner == occupant && zoom < kPowerLineZoomCount) {
             return &it->second.widthByZoom[zoom];
         }
-        return vanillaWidths + zoom;
+        return vanillaWidths + (zoom < kPowerLineZoomCount ? zoom : kPowerLineZoomCount - 1);
     }
 
 #if defined(_MSC_VER) && defined(_M_IX86)
@@ -1554,6 +1775,20 @@ namespace {
 #error Power-pole wire-width hook requires 32-bit MSVC.
 #endif
 
+    bool TryComputeRelativeCall(const uintptr_t site, const void* target, int32_t& outRelative,
+                                const char* const name) {
+        const int64_t difference = static_cast<int64_t>(reinterpret_cast<uintptr_t>(target)) -
+                                   static_cast<int64_t>(site + 5);
+        if (difference < std::numeric_limits<int32_t>::min() ||
+            difference > std::numeric_limits<int32_t>::max()) {
+            LOG_ERROR("PowerPoleCustomization: {} target is outside rel32 range of site 0x{:08X}; "
+                      "not patching.", name, static_cast<uint32_t>(site));
+            return false;
+        }
+        outRelative = static_cast<int32_t>(difference);
+        return true;
+    }
+
     class InlineCallPatch final {
     public:
         bool Install() {
@@ -1566,6 +1801,11 @@ namespace {
                           static_cast<uint32_t>(kWireWidthLookupPatchSite));
                 return false;
             }
+            int32_t relative = 0;
+            if (!TryComputeRelativeCall(kWireWidthLookupPatchSite, &WireWidthLookupHook, relative,
+                                        "wire-width patch")) {
+                return false;
+            }
 
             DWORD oldProtect = 0;
             if (!VirtualProtect(site, kWireWidthLookupPatchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
@@ -1573,16 +1813,19 @@ namespace {
                 return false;
             }
             std::memcpy(original_.data(), site, original_.size());
-            const auto relative = static_cast<int32_t>(
-                reinterpret_cast<intptr_t>(&WireWidthLookupHook) -
-                (static_cast<intptr_t>(kWireWidthLookupPatchSite) + 5));
-            site[0] = 0xe8;
-            std::memcpy(site + 1, &relative, sizeof(relative));
-            std::fill(site + 5, site + kWireWidthLookupPatchSize, static_cast<uint8_t>(0x90));
+            patched_ = original_;
+            patched_[0] = 0xe8;
+            std::memcpy(patched_.data() + 1, &relative, sizeof(relative));
+            std::fill(patched_.begin() + 5, patched_.end(), static_cast<uint8_t>(0x90));
+            std::memcpy(site, patched_.data(), patched_.size());
             FlushInstructionCache(GetCurrentProcess(), site, kWireWidthLookupPatchSize);
-            DWORD ignored = 0;
-            VirtualProtect(site, kWireWidthLookupPatchSize, oldProtect, &ignored);
             installed_ = true;
+            DWORD ignored = 0;
+            if (!VirtualProtect(site, kWireWidthLookupPatchSize, oldProtect, &ignored)) {
+                LOG_ERROR("PowerPoleCustomization: failed to restore page protection after installing "
+                          "the wire-width patch (error {}).", GetLastError());
+                return false; // installed_ remains true so all-or-nothing rollback restores bytes
+            }
             return true;
         }
 
@@ -1591,20 +1834,32 @@ namespace {
                 return;
             }
             auto* const site = reinterpret_cast<uint8_t*>(kWireWidthLookupPatchSite);
-            DWORD oldProtect = 0;
-            if (VirtualProtect(site, kWireWidthLookupPatchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                std::memcpy(site, original_.data(), original_.size());
-                FlushInstructionCache(GetCurrentProcess(), site, kWireWidthLookupPatchSize);
-                DWORD ignored = 0;
-                VirtualProtect(site, kWireWidthLookupPatchSize, oldProtect, &ignored);
+            if (std::memcmp(site, patched_.data(), patched_.size()) != 0) {
+                LOG_ERROR("PowerPoleCustomization: refusing to uninstall the wire-width patch because "
+                          "its byte span is no longer owned by this DLL.");
+                return;
             }
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(site, kWireWidthLookupPatchSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                LOG_ERROR("PowerPoleCustomization: VirtualProtect failed while uninstalling the "
+                          "wire-width patch (error {}).", GetLastError());
+                return;
+            }
+            std::memcpy(site, original_.data(), original_.size());
+            FlushInstructionCache(GetCurrentProcess(), site, kWireWidthLookupPatchSize);
             installed_ = false;
+            DWORD ignored = 0;
+            if (!VirtualProtect(site, kWireWidthLookupPatchSize, oldProtect, &ignored)) {
+                LOG_ERROR("PowerPoleCustomization: failed to restore page protection after uninstalling "
+                          "the wire-width patch (error {}).", GetLastError());
+            }
         }
 
         [[nodiscard]] bool IsInstalled() const noexcept { return installed_; }
 
     private:
         std::array<uint8_t, kWireWidthLookupPatchSize> original_{};
+        std::array<uint8_t, kWireWidthLookupPatchSize> patched_{};
         bool installed_ = false;
     };
 
@@ -1627,6 +1882,7 @@ namespace {
     // follow-span pad aligned the moment its bearing changes.
     bool PoleFoundationYaw(void* occupant, float& outYaw);
     void RebuildFoundation(void* occupant, float halfExtent, float yaw);
+    void RefreshFoundationAfterConnectionChange(void* occupant);
 
     // Rebuilds the complete regular-polyline list whenever either endpoint customizes attachment
     // geometry/count or sag. Width-only customization keeps vanilla geometry and merely registers
@@ -1639,6 +1895,9 @@ namespace {
         // regardless of which side render-owns the new pair, so every registered entry address of
         // this pole must be refreshed even when the early-return below fires.
         RegisterOccupantConnectionTextures(occupant);
+        // The reciprocal/non-rendering side still owns a foundation. Refresh before the render-owner
+        // test so both endpoints react when a span appears, disappears, or changes bearing.
+        RefreshFoundationAfterConnectionChange(occupant);
         void* const entry = FindConnectionEntry(occupant, otherPole);
         if (entry == nullptr) {
             return; // reciprocal non-rendering side, or no live connection for this pair
@@ -1681,7 +1940,7 @@ namespace {
         // Any water-crossing span is rebuilt unconditionally: vanilla's own layout draws its first
         // buoy ball exactly on pole A's attach node (the ball loop renders every point except the
         // last of a uniform 0..1 tessellation), and the rebuild replaces that with the
-        // strictly-interior layout of AppendWaterPolylineToConnection. On an otherwise-vanilla
+        // strictly-interior layout produced by BuildWaterPolylinePoints. On an otherwise-vanilla
         // span the strand rebuild this forces is geometry-identical (vanilla table, zero yaw,
         // default sag), so only the ball positions change.
         const bool rebuildGeometry = HasAttachPointCustomization(occupant, direction) ||
@@ -1691,24 +1950,35 @@ namespace {
                                      std::fabs(yawB) > kYawEpsilonRadians ||
                                      hadWaterPolylines;
         if (rebuildGeometry) {
-            ClearConnectionPolylines(entry);
-            if (hadWaterPolylines) {
-                ClearConnectionWaterPolylines(entry);
-            }
+            // Prepare every replacement before destroying the live geometry. This keeps allocation
+            // failures and invalid derived coordinates on the old, complete engine-owned vectors.
+            std::vector<std::vector<float>> regularPoints(count);
+            std::vector<std::vector<float>> waterPoints(hadWaterPolylines ? count : 0);
+            bool prepared = true;
             for (uint32_t i = 0; i < count; ++i) {
                 const AttachPoint a = GetAttachPoint(occupant, direction, i, yawA);
                 const AttachPoint b = GetAttachPoint(otherPole, direction, i, yawB);
                 const float sagScale = appearance ? appearance->SagScale(i) : 1.0f;
                 const float maximumSag = appearance ? appearance->MaximumSag(i) :
                                                       std::numeric_limits<float>::infinity();
-                AppendPolylineToConnection(entry, a, b, sagScale, maximumSag);
-                if (hadWaterPolylines) {
-                    AppendWaterPolylineToConnection(entry, a, b, sagScale, maximumSag, waterPointCount);
+                if (!BuildPolylinePoints(a, b, sagScale, maximumSag, regularPoints[i]) ||
+                    (hadWaterPolylines && !BuildWaterPolylinePoints(
+                        a, b, sagScale, maximumSag, waterPointCount, waterPoints[i]))) {
+                    prepared = false;
+                    break;
                 }
             }
-            LOG_DEBUG("PowerPoleCustomization: rebuilt {} strands in direction {} for connection {} -> {}{}.",
-                     count, direction, occupant, otherPole,
-                     hadWaterPolylines ? " (incl. water-crossing coarse list)" : "");
+            if (!prepared) {
+                LOG_ERROR("PowerPoleCustomization: derived non-finite points for connection {} -> {}; "
+                          "keeping its previous geometry.", occupant, otherPole);
+            } else {
+                if (CommitPreparedConnectionGeometry(
+                        entry, hadWaterPolylines, regularPoints, waterPoints)) {
+                    LOG_DEBUG("PowerPoleCustomization: rebuilt {} strands in direction {} for "
+                              "connection {} -> {}{}.", count, direction, occupant, otherPole,
+                              hadWaterPolylines ? " (incl. water-crossing coarse list)" : "");
+                }
+            }
         }
         RegisterConnectionWidths(occupant, entry, appearance);
         if (hadWaterPolylines) {
@@ -1717,21 +1987,6 @@ namespace {
                                                                         : 1.0f);
         }
 
-        // A new/changed connection can change the follow-span bearing (first connection appearing,
-        // or a second one confirming/breaking agreement) -- rebuild the pad on the spot instead of
-        // waiting for the next zoom change to re-run CreateFloor.
-        const auto selfOverride = gOverrides.find(occupant);
-        if (selfOverride != gOverrides.end() &&
-            (selfOverride->second.foundationFollowSpan || selfOverride->second.hasFoundationHalfExtent)) {
-            const float halfExtent = selfOverride->second.hasFoundationHalfExtent
-                                         ? selfOverride->second.foundationHalfExtent
-                                         : kVanillaFoundationHalfExtent;
-            float yaw = 0.0f;
-            if (selfOverride->second.foundationFollowSpan) {
-                PoleFoundationYaw(occupant, yaw);
-            }
-            RebuildFoundation(occupant, halfExtent, yaw);
-        }
     }
 
     // ------------------------------------------------------------------
@@ -1813,6 +2068,69 @@ namespace {
         reinterpret_cast<CreateWallsFn>(kCreateWalls)(occupant, nullptr);
     }
 
+    // A connection change can alter the follow-span bearing (the first/last span appearing, or a
+    // junction beginning/ending). Rebuild immediately instead of waiting for a zoom change to call
+    // CreateFloor. This deliberately runs for render-owner and reciprocal connection entries.
+    void RefreshFoundationAfterConnectionChange(void* occupant) {
+        const auto selfOverride = gOverrides.find(occupant);
+        if (selfOverride == gOverrides.end() ||
+            (!selfOverride->second.foundationFollowSpan && !selfOverride->second.hasFoundationHalfExtent)) {
+            return;
+        }
+        const float halfExtent = selfOverride->second.hasFoundationHalfExtent
+                                     ? selfOverride->second.foundationHalfExtent
+                                     : kVanillaFoundationHalfExtent;
+        float yaw = 0.0f;
+        if (selfOverride->second.foundationFollowSpan) {
+            PoleFoundationYaw(occupant, yaw);
+        }
+        RebuildFoundation(occupant, halfExtent, yaw);
+    }
+
+    // Rebuild every runtime-only registration for an occupant whose outer connection vector was
+    // loaded or compacted. The point-buffer and tConnection addresses are not stable across those
+    // operations, so erasing by owner first is required even when the visible geometry is unchanged.
+    uint32_t RehydrateOccupantConnections(void* occupant) {
+        ForgetOccupantWidths(occupant);
+        ForgetOccupantTextures(occupant);
+        ForgetOccupantWaterBallSizes(occupant);
+
+        auto* const begin = *reinterpret_cast<uint8_t**>(
+            reinterpret_cast<uint8_t*>(occupant) + kOccupant_ConnectionsBegin);
+        auto* const end = *reinterpret_cast<uint8_t**>(
+            reinterpret_cast<uint8_t*>(occupant) + kOccupant_ConnectionsEnd);
+        uint32_t liveConnections = 0;
+        for (uint8_t* entry = begin; entry != end; entry += kConnection_Size) {
+            void* const otherPole = *reinterpret_cast<void**>(entry + kConnection_OtherPole);
+            if (otherPole == nullptr) {
+                continue;
+            }
+            ++liveConnections;
+            ApplyConnectionCustomization(occupant, otherPole);
+        }
+        if (liveConnections == 0) {
+            RefreshFoundationAfterConnectionChange(occupant);
+        }
+        return liveConnections;
+    }
+
+    void RehydrateLoadedConnections() {
+        auto pending = std::move(gPendingLoadedPoles);
+        gPendingLoadedPoles.clear();
+        uint32_t connectionEntries = 0;
+        for (void* const occupant : pending) {
+            try {
+                connectionEntries += RehydrateOccupantConnections(occupant);
+            } catch (...) {
+                LogCurrentHookException("PostCityInit rehydration");
+            }
+        }
+        if (!pending.empty()) {
+            LOG_INFO("PowerPoleCustomization: rehydrated {} saved poles ({} connection entries) "
+                     "after city load.", pending.size(), connectionEntries);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Foundation texture IDs. Draw() looks up the floor/wall texture via a hash-bucket chain walk
     // keyed by a hardcoded 32-bit constant read twice per texture (see the 4 patch-site constants
@@ -1822,14 +2140,16 @@ namespace {
     // ------------------------------------------------------------------
     uint32_t __cdecl GetFloorTextureHashOverride(void* occupant) noexcept {
         const auto it = gOverrides.find(occupant);
-        return (it != gOverrides.end() && it->second.hasFloorTexture) ? it->second.foundationFloorTextureId
-                                                                       : kVanillaFloorTextureId;
+        const uint32_t requested = it != gOverrides.end() && it->second.hasFloorTexture
+            ? it->second.foundationFloorTextureId : kVanillaFloorTextureId;
+        return ReadyPoleTextureOrVanilla(requested, kVanillaFloorTextureId);
     }
 
     uint32_t __cdecl GetWallTextureHashOverride(void* occupant) noexcept {
         const auto it = gOverrides.find(occupant);
-        return (it != gOverrides.end() && it->second.hasWallTexture) ? it->second.foundationWallTextureId
-                                                                      : kVanillaWallTextureId;
+        const uint32_t requested = it != gOverrides.end() && it->second.hasWallTexture
+            ? it->second.foundationWallTextureId : kVanillaWallTextureId;
+        return ReadyPoleTextureOrVanilla(requested, kVanillaWallTextureId);
     }
 
 #if defined(_MSC_VER) && defined(_M_IX86)
@@ -1944,11 +2264,14 @@ namespace {
     uint32_t __cdecl ResolvePoleInstanceForDirectionMask(const uint32_t directionMask) noexcept {
         const auto* const vanillaTable = reinterpret_cast<const uint32_t*>(kPowerPoleForDirectionsFlag);
         const uint32_t mask = directionMask & 0xF;
-        // A clean lone-diagonal pole placed during an active FAR drag routes to the FAR model for
-        // the drag's exact (ratio, orientation). Junctions/merges (multi-bit masks) and every
-        // regular drag stay on the regular path -- FAR buckets apply only to clean two-connection
-        // mid-line poles (docs/far-power-lines-design.md). Any FAR span classifies as diagonal
-        // (Get0To3Direction returns 1 or 3), so its lone-direction mask is exactly 0x2 or 0x8.
+        if (!RuntimeCustomizationEnabled()) {
+            return vanillaTable[mask];
+        }
+        // A lone-diagonal mask placed during an active FAR drag routes to the drag's exact FAR
+        // model. Multi-bit junctions and every regular drag stay on the regular path. Known gap:
+        // the four-bit mask cannot distinguish two different bearings/ratios in the same broad
+        // diagonal class, so a same-class merge can still look like a lone 0x2/0x8 mask and receive
+        // the latest FAR model. Resolving that needs a merge-site hook plus live-bearing inspection.
         if (gFarDragActive && (mask == 0x2 || mask == 0x8)) {
             const uint32_t headingIndex = gFarDragRatioIndex * kFarOrientCount + gFarDragOrient;
             return ResolveFarInstance(headingIndex, mask, vanillaTable);
@@ -1978,6 +2301,12 @@ namespace {
     // discard it and return directly to the caller, cleaning the original five stack arguments.
     __declspec(naked) void KeepWiresOnZoneChangeHook() {
         __asm {
+            // UpdateOnZoneChange can create a replacement pole before it asks DrawNetworkLine for
+            // a new path. Never let that non-drag placement inherit the previous user's FAR model.
+            mov byte ptr [gFarDragActive], 0
+            mov byte ptr [gFarSnapAnchorValid], 0
+            cmp byte ptr [gRuntimeHooksEnabled], 0
+            je run_original
             cmp byte ptr [gKeepWiresOnZoneChange], 0
             je run_original
             add esp, 4
@@ -2001,30 +2330,50 @@ namespace {
     public:
         bool Install(const uintptr_t site, std::initializer_list<uint8_t> expectedBytes, void* hookFn,
                      const char* name) {
+            if (installed_) {
+                return true;
+            }
             site_ = site;
             size_ = static_cast<uint32_t>(expectedBytes.size());
+            name_ = name;
+            if (size_ < 5) {
+                LOG_ERROR("PowerPoleCustomization: {} patch is only {} bytes; a rel32 call needs 5.",
+                          name, size_);
+                return false;
+            }
             auto* const p = reinterpret_cast<uint8_t*>(site);
             if (!std::equal(expectedBytes.begin(), expectedBytes.end(), p)) {
                 LOG_ERROR("PowerPoleCustomization: {} bytes at 0x{:08X} do not match 1.1.641; not patching.",
                           name, static_cast<uint32_t>(site));
                 return false;
             }
+            int32_t relative = 0;
+            if (!TryComputeRelativeCall(site, hookFn, relative, name)) {
+                return false;
+            }
+
+            // Prepare both byte images before making executable memory writable. Vector growth can
+            // throw; no exception should strand the code page RWX halfway through installation.
+            original_.assign(p, p + size_);
+            patched_ = original_;
+            patched_[0] = 0xe8;
+            std::memcpy(patched_.data() + 1, &relative, sizeof(relative));
+            std::fill(patched_.begin() + 5, patched_.end(), static_cast<uint8_t>(0x90));
 
             DWORD oldProtect = 0;
             if (!VirtualProtect(p, size_, PAGE_EXECUTE_READWRITE, &oldProtect)) {
                 LOG_ERROR("PowerPoleCustomization: VirtualProtect failed for {} (error {}).", name, GetLastError());
                 return false;
             }
-            original_.assign(p, p + size_);
-            const auto relative = static_cast<int32_t>(
-                reinterpret_cast<intptr_t>(hookFn) - (static_cast<intptr_t>(site) + 5));
-            p[0] = 0xe8;
-            std::memcpy(p + 1, &relative, sizeof(relative));
-            std::fill(p + 5, p + size_, static_cast<uint8_t>(0x90));
+            std::memcpy(p, patched_.data(), patched_.size());
             FlushInstructionCache(GetCurrentProcess(), p, size_);
-            DWORD ignored = 0;
-            VirtualProtect(p, size_, oldProtect, &ignored);
             installed_ = true;
+            DWORD ignored = 0;
+            if (!VirtualProtect(p, size_, oldProtect, &ignored)) {
+                LOG_ERROR("PowerPoleCustomization: failed to restore page protection after installing "
+                          "{} (error {}).", name_, GetLastError());
+                return false; // installed_ remains true so all-or-nothing rollback restores bytes
+            }
             return true;
         }
 
@@ -2033,20 +2382,35 @@ namespace {
                 return;
             }
             auto* const p = reinterpret_cast<uint8_t*>(site_);
-            DWORD oldProtect = 0;
-            if (VirtualProtect(p, size_, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                std::memcpy(p, original_.data(), original_.size());
-                FlushInstructionCache(GetCurrentProcess(), p, size_);
-                DWORD ignored = 0;
-                VirtualProtect(p, size_, oldProtect, &ignored);
+            if (patched_.size() != size_ || std::memcmp(p, patched_.data(), size_) != 0) {
+                LOG_ERROR("PowerPoleCustomization: refusing to uninstall {} because its byte span is "
+                          "no longer owned by this DLL.", name_);
+                return;
             }
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(p, size_, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                LOG_ERROR("PowerPoleCustomization: VirtualProtect failed while uninstalling {} "
+                          "(error {}).", name_, GetLastError());
+                return;
+            }
+            std::memcpy(p, original_.data(), original_.size());
+            FlushInstructionCache(GetCurrentProcess(), p, size_);
             installed_ = false;
+            DWORD ignored = 0;
+            if (!VirtualProtect(p, size_, oldProtect, &ignored)) {
+                LOG_ERROR("PowerPoleCustomization: failed to restore page protection after uninstalling "
+                          "{} (error {}).", name_, GetLastError());
+            }
         }
+
+        [[nodiscard]] bool IsInstalled() const noexcept { return installed_; }
 
     private:
         uintptr_t site_ = 0;
         uint32_t size_ = 0;
+        std::string name_;
         std::vector<uint8_t> original_;
+        std::vector<uint8_t> patched_;
         bool installed_ = false;
     };
 
@@ -2057,7 +2421,12 @@ namespace {
     class VTableSlotPatch final {
     public:
         bool Install(const uintptr_t slotAddress, const uintptr_t expectedTarget, void* hookFn, const char* name) {
+            if (installed_) {
+                return true;
+            }
             slot_ = slotAddress;
+            name_ = name;
+            replacement_ = reinterpret_cast<uintptr_t>(hookFn);
             auto* const slot = reinterpret_cast<uintptr_t*>(slotAddress);
             if (*slot != expectedTarget) {
                 LOG_ERROR("PowerPoleCustomization: {} vtable slot 0x{:08X} holds 0x{:08X}, expected 0x{:08X}; not patching.",
@@ -2072,10 +2441,14 @@ namespace {
                 return false;
             }
             original_ = *slot;
-            *slot = reinterpret_cast<uintptr_t>(hookFn);
-            DWORD ignored = 0;
-            VirtualProtect(slot, sizeof(uintptr_t), oldProtect, &ignored);
+            *slot = replacement_;
             installed_ = true;
+            DWORD ignored = 0;
+            if (!VirtualProtect(slot, sizeof(uintptr_t), oldProtect, &ignored)) {
+                LOG_ERROR("PowerPoleCustomization: failed to restore page protection after installing "
+                          "{} (error {}).", name_, GetLastError());
+                return false; // installed_ remains true so all-or-nothing rollback restores the slot
+            }
             return true;
         }
 
@@ -2084,18 +2457,33 @@ namespace {
                 return;
             }
             auto* const slot = reinterpret_cast<uintptr_t*>(slot_);
-            DWORD oldProtect = 0;
-            if (VirtualProtect(slot, sizeof(uintptr_t), PAGE_READWRITE, &oldProtect)) {
-                *slot = original_;
-                DWORD ignored = 0;
-                VirtualProtect(slot, sizeof(uintptr_t), oldProtect, &ignored);
+            if (*slot != replacement_) {
+                LOG_ERROR("PowerPoleCustomization: refusing to uninstall {} because its vtable slot is "
+                          "no longer owned by this DLL.", name_);
+                return;
             }
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(slot, sizeof(uintptr_t), PAGE_READWRITE, &oldProtect)) {
+                LOG_ERROR("PowerPoleCustomization: VirtualProtect failed while uninstalling {} "
+                          "(error {}).", name_, GetLastError());
+                return;
+            }
+            *slot = original_;
             installed_ = false;
+            DWORD ignored = 0;
+            if (!VirtualProtect(slot, sizeof(uintptr_t), oldProtect, &ignored)) {
+                LOG_ERROR("PowerPoleCustomization: failed to restore page protection after uninstalling "
+                          "{} (error {}).", name_, GetLastError());
+            }
         }
+
+        [[nodiscard]] bool IsInstalled() const noexcept { return installed_; }
 
     private:
         uintptr_t slot_ = 0;
         uintptr_t original_ = 0;
+        uintptr_t replacement_ = 0;
+        std::string name_;
         bool installed_ = false;
     };
 
@@ -2109,7 +2497,11 @@ namespace {
     public:
         bool Install(const uintptr_t site, const uint32_t expectedImm, void* hookFn, const char* name,
                      const uint8_t expectedOpcode = kMovEaxOpcode) {
+            if (installed_) {
+                return true;
+            }
             site_ = site;
+            name_ = name;
             auto* const p = reinterpret_cast<uint8_t*>(site);
             const std::array<uint8_t, 5> expected = {
                 expectedOpcode,
@@ -2121,6 +2513,10 @@ namespace {
                           name, static_cast<uint32_t>(site));
                 return false;
             }
+            int32_t relative = 0;
+            if (!TryComputeRelativeCall(site, hookFn, relative, name)) {
+                return false;
+            }
 
             DWORD oldProtect = 0;
             if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
@@ -2128,14 +2524,18 @@ namespace {
                 return false;
             }
             std::memcpy(original_.data(), p, original_.size());
-            const auto relative = static_cast<int32_t>(
-                reinterpret_cast<intptr_t>(hookFn) - (static_cast<intptr_t>(site) + 5));
-            p[0] = 0xe8;
-            std::memcpy(p + 1, &relative, sizeof(relative));
+            patched_ = original_;
+            patched_[0] = 0xe8;
+            std::memcpy(patched_.data() + 1, &relative, sizeof(relative));
+            std::memcpy(p, patched_.data(), patched_.size());
             FlushInstructionCache(GetCurrentProcess(), p, 5);
-            DWORD ignored = 0;
-            VirtualProtect(p, 5, oldProtect, &ignored);
             installed_ = true;
+            DWORD ignored = 0;
+            if (!VirtualProtect(p, 5, oldProtect, &ignored)) {
+                LOG_ERROR("PowerPoleCustomization: failed to restore page protection after installing "
+                          "{} (error {}).", name_, GetLastError());
+                return false; // installed_ remains true so all-or-nothing rollback restores bytes
+            }
             return true;
         }
 
@@ -2144,14 +2544,25 @@ namespace {
                 return;
             }
             auto* const p = reinterpret_cast<uint8_t*>(site_);
-            DWORD oldProtect = 0;
-            if (VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                std::memcpy(p, original_.data(), original_.size());
-                FlushInstructionCache(GetCurrentProcess(), p, 5);
-                DWORD ignored = 0;
-                VirtualProtect(p, 5, oldProtect, &ignored);
+            if (std::memcmp(p, patched_.data(), patched_.size()) != 0) {
+                LOG_ERROR("PowerPoleCustomization: refusing to uninstall {} because its byte span is "
+                          "no longer owned by this DLL.", name_);
+                return;
             }
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                LOG_ERROR("PowerPoleCustomization: VirtualProtect failed while uninstalling {} "
+                          "(error {}).", name_, GetLastError());
+                return;
+            }
+            std::memcpy(p, original_.data(), original_.size());
+            FlushInstructionCache(GetCurrentProcess(), p, 5);
             installed_ = false;
+            DWORD ignored = 0;
+            if (!VirtualProtect(p, 5, oldProtect, &ignored)) {
+                LOG_ERROR("PowerPoleCustomization: failed to restore page protection after uninstalling "
+                          "{} (error {}).", name_, GetLastError());
+            }
         }
 
         [[nodiscard]] bool IsInstalled() const noexcept { return installed_; }
@@ -2159,6 +2570,8 @@ namespace {
     private:
         uintptr_t site_ = 0;
         std::array<uint8_t, 5> original_{};
+        std::array<uint8_t, 5> patched_{};
+        std::string name_;
         bool installed_ = false;
     };
 
@@ -2168,6 +2581,8 @@ namespace {
     using InitConnectionPointsFn = void(__thiscall*)(void* occupant);
     using AddConnectionFn = void(__thiscall*)(void* occupant, void* otherPole, void* lineInfoVector);
     using UpdateConnectionFn = void(__thiscall*)(void* occupant, void* otherPole);
+    using RemoveConnectionFn = void(__thiscall*)(void* occupant, void* otherPole, uint32_t notify);
+    using RemoveConnectionEntryFn = void(__thiscall*)(void* occupant, void* entry, uint32_t notify);
     using CreateFloorFn = void(__fastcall*)(void* occupant, void* /*unused edx*/);
 
     // Vanilla selects one of its two fixed attachment tables from bits 8-11 of the model's RKT1
@@ -2197,20 +2612,24 @@ namespace {
     void __fastcall CreateFloorHook(void* occupant, void* edxUnused) {
         const auto original = reinterpret_cast<CreateFloorFn>(kCreateFloor);
         original(occupant, edxUnused);
-        if (!gSettings.enabled) {
-            return;
+        try {
+            if (!RuntimeCustomizationEnabled()) {
+                return;
+            }
+            const auto it = gOverrides.find(occupant);
+            if (it == gOverrides.end()) {
+                return;
+            }
+            const float halfExtent = it->second.hasFoundationHalfExtent
+                ? it->second.foundationHalfExtent : kVanillaFoundationHalfExtent;
+            float yaw = 0.0f;
+            if (it->second.foundationFollowSpan) {
+                PoleFoundationYaw(occupant, yaw);
+            }
+            TransformFoundationFloor(occupant, halfExtent, yaw);
+        } catch (...) {
+            LogCurrentHookException("CreateFloor");
         }
-        const auto it = gOverrides.find(occupant);
-        if (it == gOverrides.end()) {
-            return;
-        }
-        const float halfExtent = it->second.hasFoundationHalfExtent ? it->second.foundationHalfExtent
-                                                                     : kVanillaFoundationHalfExtent;
-        float yaw = 0.0f;
-        if (it->second.foundationFollowSpan) {
-            PoleFoundationYaw(occupant, yaw);
-        }
-        TransformFoundationFloor(occupant, halfExtent, yaw);
     }
 
     using DestructorFn = void(__thiscall*)(void* occupant);
@@ -2220,26 +2639,29 @@ namespace {
     // customization can attach to a future pole that recycles the same 292-byte pool slot, and
     // keeps both maps from growing across a long session.
     void __fastcall DestructorHook(void* occupant, void* /*edx*/) {
-        gOverrides.erase(occupant);
-        ForgetOccupantWidths(occupant);
-        ForgetOccupantTextures(occupant);
-        ForgetOccupantWaterBallSizes(occupant);
+        try {
+            gPendingLoadedPoles.erase(occupant);
+            gOverrides.erase(occupant);
+            ForgetOccupantWidths(occupant);
+            ForgetOccupantTextures(occupant);
+            ForgetOccupantWaterBallSizes(occupant);
+        } catch (...) {
+            LogCurrentHookException("Destructor cleanup");
+        }
         const auto original = reinterpret_cast<DestructorFn>(kDestructor);
         original(occupant);
     }
 
-    void __fastcall InitConnectionPointsHook(void* occupant, void* /*edx*/) {
-        const auto original = reinterpret_cast<InitConnectionPointsFn>(kInitConnectionPoints);
-        original(occupant); // always run vanilla first: it still owns model load + default-table selection
-        RepairMissingConnectionPointTable(occupant);
+    void ApplyInitConnectionPointsCustomization(void* occupant) {
         ForgetOccupantWidths(occupant);
         ForgetOccupantTextures(occupant);
         ForgetOccupantWaterBallSizes(occupant);
+        gOverrides.erase(occupant); // a failed refresh must never leave the previous exemplar's data
 
-        if (!gSettings.enabled) {
-            gOverrides.erase(occupant);
+        if (!RuntimeCustomizationEnabled()) {
             return;
         }
+        RepairMissingConnectionPointTable(occupant);
 
         // cSC4PowerPoleOccupant::QueryInterface delegates through cSC4Occupant to
         // cSCExemplarPropertyHolder. Windows 1.1.641 confirms IID 0x0AC2B5F7 returns the adjusted
@@ -2256,33 +2678,140 @@ namespace {
         PoleAttachOverride candidate;
         if (TryBuildOverride(exemplar, candidate)) {
             gOverrides[occupant] = std::move(candidate);
-        } else {
-            gOverrides.erase(occupant);
+        }
+    }
+
+    void __fastcall InitConnectionPointsHook(void* occupant, void* /*edx*/) {
+        const auto original = reinterpret_cast<InitConnectionPointsFn>(kInitConnectionPoints);
+        original(occupant); // vanilla engine failures retain their original propagation semantics
+        try {
+            ApplyInitConnectionPointsCustomization(occupant);
+        } catch (...) {
+            LogCurrentHookException("InitConnectionPoints");
+        }
+    }
+
+    // Read calls InitConnectionPoints only after deserializing both polyline vectors. Do not rebuild
+    // them in the middle of object-stream loading; queue this occupant for the PostCityInit pass,
+    // when the reciprocal pole and both exemplar overrides are guaranteed to have initialized.
+    void __fastcall InitConnectionPointsReadHook(void* occupant, void* /*edx*/) {
+        const auto original = reinterpret_cast<InitConnectionPointsFn>(kInitConnectionPoints);
+        original(occupant);
+        try {
+            ApplyInitConnectionPointsCustomization(occupant);
+            if (!RuntimeCustomizationEnabled()) {
+                return;
+            }
+            const auto* const begin = *reinterpret_cast<uint8_t* const*>(
+                reinterpret_cast<const uint8_t*>(occupant) + kOccupant_ConnectionsBegin);
+            const auto* const end = *reinterpret_cast<uint8_t* const*>(
+                reinterpret_cast<const uint8_t*>(occupant) + kOccupant_ConnectionsEnd);
+            if (begin != end) {
+                gPendingLoadedPoles.insert(occupant);
+            }
+        } catch (...) {
+            LogCurrentHookException("InitConnectionPoints@Read");
         }
     }
 
     void __fastcall AddConnectionHook(void* occupant, void* /*edx*/, void* otherPole, void* lineInfoVector) {
-        if (gSettings.enabled) {
-            ForgetConnectionWidths(FindConnectionEntry(occupant, otherPole));
+        try {
+            if (RuntimeCustomizationEnabled()) {
+                // A growing outer tConnection vector uses its copy constructor for every existing
+                // entry (0x0064e0e0 -> 0x0064cfa0), which deep-copies both inner polyline vectors.
+                // Their point-buffer keys can all change, not just the newly added span's key.
+                ForgetOccupantWidths(occupant);
+                ForgetOccupantWaterBallSizes(occupant);
+            }
+        } catch (...) {
+            LogCurrentHookException("AddConnection pre-cleanup");
         }
         const auto original = reinterpret_cast<AddConnectionFn>(kAddConnection);
         original(occupant, otherPole, lineInfoVector);
 
-        if (!gSettings.enabled) {
+        if (!RuntimeCustomizationEnabled()) {
             return;
         }
-
-        ApplyConnectionCustomization(occupant, otherPole);
+        try {
+            RehydrateOccupantConnections(occupant);
+        } catch (...) {
+            LogCurrentHookException("AddConnection");
+        }
     }
 
     void __fastcall UpdateConnectionHook(void* occupant, void* /*edx*/, void* otherPole) {
-        if (gSettings.enabled) {
-            ForgetConnectionWidths(FindConnectionEntry(occupant, otherPole));
+        try {
+            if (RuntimeCustomizationEnabled()) {
+                void* const entry = FindConnectionEntry(occupant, otherPole);
+                ForgetConnectionWidths(entry);
+                ForgetConnectionWaterBallSizes(entry);
+            }
+        } catch (...) {
+            LogCurrentHookException("UpdateConnection pre-cleanup");
         }
         const auto original = reinterpret_cast<UpdateConnectionFn>(kUpdateConnection);
         original(occupant, otherPole);
-        if (gSettings.enabled) {
-            ApplyConnectionCustomization(occupant, otherPole);
+        if (RuntimeCustomizationEnabled()) {
+            try {
+                ApplyConnectionCustomization(occupant, otherPole);
+            } catch (...) {
+                LogCurrentHookException("UpdateConnection");
+            }
+        }
+    }
+
+    // RemoveConnection compacts the tConnection vector, while its inner polyline buffers are freed.
+    // Drop all owner registrations before vanilla mutates either structure, then register surviving
+    // connections at their new addresses and refresh a foundation whose last bearing may be gone.
+    void __fastcall RemoveConnectionHook(void* occupant, void* /*edx*/, void* otherPole, uint32_t notify) {
+        try {
+            if (RuntimeCustomizationEnabled()) {
+                ForgetOccupantWidths(occupant);
+                ForgetOccupantTextures(occupant);
+                ForgetOccupantWaterBallSizes(occupant);
+            }
+        } catch (...) {
+            LogCurrentHookException("RemoveConnection pre-cleanup");
+        }
+        const auto original = reinterpret_cast<RemoveConnectionFn>(kRemoveConnection);
+        original(occupant, otherPole, notify);
+        if (RuntimeCustomizationEnabled()) {
+            try {
+                RehydrateOccupantConnections(occupant);
+            } catch (...) {
+                LogCurrentHookException("RemoveConnection");
+            }
+        }
+    }
+
+    // BreakAllConnections clears every entry in one fixed-stride loop instead of compacting the
+    // outer vector. This call-site-specific hook drops registrations once at the first entry and
+    // refreshes once at the last; rebuilding after every entry is quadratic and exposes teardown's
+    // intermediate state to foundation/geometry work for no benefit.
+    void __fastcall RemoveConnectionEntryHook(void* occupant, void* /*edx*/, void* entry, uint32_t notify) {
+        const auto* const connectionsBegin = *reinterpret_cast<uint8_t* const*>(
+            reinterpret_cast<const uint8_t*>(occupant) + kOccupant_ConnectionsBegin);
+        const auto* const connectionsEnd = *reinterpret_cast<uint8_t* const*>(
+            reinterpret_cast<const uint8_t*>(occupant) + kOccupant_ConnectionsEnd);
+        const bool firstEntry = entry == connectionsBegin;
+        const bool lastEntry = reinterpret_cast<const uint8_t*>(entry) + kConnection_Size == connectionsEnd;
+        try {
+            if (RuntimeCustomizationEnabled() && firstEntry) {
+                ForgetOccupantWidths(occupant);
+                ForgetOccupantTextures(occupant);
+                ForgetOccupantWaterBallSizes(occupant);
+            }
+        } catch (...) {
+            LogCurrentHookException("RemoveConnectionEntry pre-cleanup");
+        }
+        const auto original = reinterpret_cast<RemoveConnectionEntryFn>(kRemoveConnectionEntry);
+        original(occupant, entry, notify);
+        if (RuntimeCustomizationEnabled() && lastEntry) {
+            try {
+                RehydrateOccupantConnections(occupant);
+            } catch (...) {
+                LogCurrentHookException("RemoveConnectionEntry");
+            }
         }
     }
 
@@ -2297,12 +2826,21 @@ namespace {
     }
 
     using DeterminePolePositionsFn = void(__thiscall*)(void* tool);
+    // Ghidra: every caller pushes a 32-bit 0/1 flag and the callee ends in RET 4. Keep the full
+    // stack slot in both signatures even though the source-level value behaves like a bool.
+    using PlacePolesFn = void(__thiscall*)(void* tool, uint32_t placementPass);
 
     void __fastcall DeterminePolePositionsHook(void* tool, void* /*edx*/) {
         auto* const field = reinterpret_cast<uint32_t*>(
             reinterpret_cast<uint8_t*>(tool) + kTool_MaxCellsBetweenPoles);
         const uint32_t saved = *field;
-        if (gSettings.enabled) {
+        struct RestoreField final {
+            uint32_t* field;
+            uint32_t value;
+            ~RestoreField() noexcept { *field = value; }
+        } restore{field, saved};
+        gLastObservedVanillaInterPoleDistance = saved;
+        if (RuntimeCustomizationEnabled()) {
             uint32_t resolved = ResolveMaxCellsBetweenPoles(saved);
             // During a FAR drag every synthetic step is one FAR period, and
             // the cadence field counts step indices, not literal cells (docs SS17.C). Poles can
@@ -2315,7 +2853,17 @@ namespace {
         }
         const auto original = reinterpret_cast<DeterminePolePositionsFn>(kDeterminePolePositions);
         original(tool);
-        *field = saved; // restore vanilla; the placement loop is this field's only reader
+    }
+
+    void __fastcall PlacePolesHook(void* tool, void* /*edx*/, const uint32_t placementPass) {
+        struct ResetFarTransaction final {
+            ~ResetFarTransaction() noexcept {
+                gFarDragActive = false;
+                gFarSnapAnchorValid = false;
+            }
+        } reset;
+        const auto original = reinterpret_cast<PlacePolesFn>(kPlacePoles);
+        original(tool, placementPass); // reset runs on return and preserves engine exception propagation
     }
 
     // ------------------------------------------------------------------
@@ -2391,6 +2939,8 @@ namespace {
         return std::atan2(static_cast<float>(ratio.rise), static_cast<float>(ratio.run));
     }
 
+    bool ActiveStyleSupportsRatio(uint32_t ratioIndex);
+
     uint32_t SelectSnapCandidate(const uint32_t startX, const uint32_t startZ,
                                  const uint32_t absoluteDx, const uint32_t absoluteDz) {
         const uint32_t major = std::max(absoluteDx, absoluteDz);
@@ -2400,6 +2950,9 @@ namespace {
         uint32_t bestCandidate = kAxisSnapCandidate;
         float bestDifference = std::fabs(angle - SnapCandidateAngle(bestCandidate));
         for (uint32_t candidate = 1; candidate <= kDiagonalSnapCandidate; ++candidate) {
+            if (candidate != kDiagonalSnapCandidate && !ActiveStyleSupportsRatio(candidate - 1)) {
+                continue; // never snap to a FAR ratio that has no model mapping for this style
+            }
             const float difference = std::fabs(angle - SnapCandidateAngle(candidate));
             const bool candidateIsRegular = candidate == kAxisSnapCandidate || candidate == kDiagonalSnapCandidate;
             const bool bestIsRegular = bestCandidate == kAxisSnapCandidate || bestCandidate == kDiagonalSnapCandidate;
@@ -2411,9 +2964,16 @@ namespace {
         }
 
         if (gFarSnapAnchorValid && gFarSnapAnchorX == startX && gFarSnapAnchorZ == startZ) {
-            const float previousDifference = std::fabs(angle - SnapCandidateAngle(gFarSnapCandidate));
-            if (previousDifference <= bestDifference + kSnapHysteresisRadians) {
-                bestCandidate = gFarSnapCandidate;
+            const bool previousIsRegular = gFarSnapCandidate == kAxisSnapCandidate ||
+                                           gFarSnapCandidate == kDiagonalSnapCandidate;
+            const bool previousIsSupported = previousIsRegular ||
+                (gFarSnapCandidate > kAxisSnapCandidate && gFarSnapCandidate < kDiagonalSnapCandidate &&
+                 ActiveStyleSupportsRatio(gFarSnapCandidate - 1));
+            if (previousIsSupported) {
+                const float previousDifference = std::fabs(angle - SnapCandidateAngle(gFarSnapCandidate));
+                if (previousDifference <= bestDifference + kSnapHysteresisRadians) {
+                    bestCandidate = gFarSnapCandidate;
+                }
             }
         }
 
@@ -2424,13 +2984,22 @@ namespace {
         return bestCandidate;
     }
 
-    uint8_t __fastcall FarDrawNetworkLineHook(void* tool, void* /*edx*/, uint32_t* start, uint32_t* end,
-                                              uint8_t straightOnly, int networkType) {
+    uint8_t __fastcall FarDrawNetworkLineHookImpl(void* tool, void* /*edx*/, uint32_t* start, uint32_t* end,
+                                                  uint8_t straightOnly, int networkType,
+                                                  bool& inOriginalCall) {
         const auto original = reinterpret_cast<DrawNetworkLineFn>(kDrawNetworkLine);
+        const auto callOriginal = [&](uint32_t* const originalStart, uint32_t* const originalEnd,
+                                      const uint8_t originalStraightOnly) -> uint8_t {
+            inOriginalCall = true;
+            const uint8_t result = original(
+                tool, originalStart, originalEnd, originalStraightOnly, networkType);
+            inOriginalCall = false;
+            return result;
+        };
         gFarDragActive = false;
-        if (!gSettings.enabled || (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) {
+        if (!RuntimeCustomizationEnabled() || (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) {
             gFarSnapAnchorValid = false;
-            return original(tool, start, end, straightOnly, networkType);
+            return callOriginal(start, end, straightOnly);
         }
 
         const int32_t dx = static_cast<int32_t>(end[0]) - static_cast<int32_t>(start[0]);
@@ -2439,12 +3008,12 @@ namespace {
         const uint32_t adz = static_cast<uint32_t>(std::abs(dz));
         if (adx == 0 && adz == 0) {
             gFarSnapAnchorValid = false;
-            return original(tool, start, end, straightOnly, networkType);
+            return callOriginal(start, end, straightOnly);
         }
 
         const uint32_t snapCandidate = SelectSnapCandidate(start[0], start[1], adx, adz);
         if (snapCandidate == kAxisSnapCandidate || snapCandidate == kDiagonalSnapCandidate) {
-            return original(tool, start, end, straightOnly, networkType); // vanilla handles regular headings
+            return callOriginal(start, end, straightOnly); // vanilla handles regular headings
         }
 
         const FarRatio ratio = kFarRatios[snapCandidate - 1];
@@ -2486,7 +3055,7 @@ namespace {
             --periods;
         }
         if (periods < 1) {
-            return original(tool, start, end, straightOnly, networkType);
+            return callOriginal(start, end, straightOnly);
         }
 
         const CellXZ terminal = boundaryTerminal ? requestedEnd : nodeCell(periods);
@@ -2526,7 +3095,7 @@ namespace {
         };
         for (uint32_t p = 0; p < periods; ++p) {
             if (!appendPattern(nodeCell(p), periodPattern, majorIsX, majorSign, minorSign)) {
-                return original(tool, start, end, straightOnly, networkType);
+                return callOriginal(start, end, straightOnly);
             }
         }
         if (hasTransitionTail) {
@@ -2540,7 +3109,7 @@ namespace {
                 : static_cast<int32_t>(terminal.x) - static_cast<int32_t>(lastFarNode.x);
             if (rawTailMajor * majorSign < 0 || rawTailMinor * minorSign < 0) {
                 LOG_WARN("PowerPoleCustomization: [FAR PoC] boundary transition reverses direction; falling back.");
-                return original(tool, start, end, straightOnly, networkType);
+                return callOriginal(start, end, straightOnly);
             }
             const uint32_t tailRun = static_cast<uint32_t>(std::abs(rawTailMajor));
             const uint32_t tailRise = static_cast<uint32_t>(std::abs(rawTailMinor));
@@ -2548,7 +3117,7 @@ namespace {
             const int32_t tailMajorSign = rawTailMajor >= 0 ? 1 : -1;
             const int32_t tailMinorSign = rawTailMinor >= 0 ? 1 : -1;
             if (!appendPattern(lastFarNode, tailPattern, majorIsX, tailMajorSign, tailMinorSign)) {
-                return original(tool, start, end, straightOnly, networkType);
+                return callOriginal(start, end, straightOnly);
             }
         }
         const uint32_t terminalIndex = static_cast<uint32_t>(cells.size());
@@ -2561,13 +3130,13 @@ namespace {
         // vectors' real capacity pointers below rather than mistaking their current end for capacity.
         const auto totalCells = static_cast<uint32_t>(cells.size());
         if (cityCellsX == 0 || cityCellsZ == 0) {
-            return original(tool, start, end, straightOnly, networkType);
+            return callOriginal(start, end, straightOnly);
         }
         uint32_t fakeStart[2]{0, 0};
         uint32_t fakeEnd[2]{cityCellsX - 1, cityCellsZ - 1};
-        if (original(tool, fakeStart, fakeEnd, 0, networkType) == 0) {
+        if (callOriginal(fakeStart, fakeEnd, 0) == 0) {
             LOG_WARN("PowerPoleCustomization: [FAR PoC] vanilla allocation drag failed; falling back.");
-            return original(tool, start, end, straightOnly, networkType);
+            return callOriginal(start, end, straightOnly);
         }
 
         auto* const base = reinterpret_cast<uint8_t*>(tool);
@@ -2584,7 +3153,7 @@ namespace {
             stepCapacity < steps.size() || cellCapacity < totalCells) {
             LOG_WARN("PowerPoleCustomization: [FAR PoC] vanilla drag allocated {} steps/{} cells, "
                      "need {}/{}; falling back.", stepCapacity, cellCapacity, steps.size(), totalCells);
-            return original(tool, start, end, straightOnly, networkType);
+            return callOriginal(start, end, straightOnly);
         }
 
         // Rewrite the POD contents in place and shrink the end pointers -- no game-allocator
@@ -2649,6 +3218,27 @@ namespace {
         return 1;
     }
 
+    uint8_t __fastcall FarDrawNetworkLineHook(void* tool, void* /*edx*/, uint32_t* start, uint32_t* end,
+                                              uint8_t straightOnly, int networkType) {
+        const uint32_t savedEnd[2] = {end[0], end[1]};
+        bool inOriginalCall = false;
+        try {
+            return FarDrawNetworkLineHookImpl(
+                tool, nullptr, start, end, straightOnly, networkType, inOriginalCall);
+        } catch (...) {
+            if (inOriginalCall) {
+                throw; // preserve the original engine call's exception behavior; never replay it
+            }
+            LogCurrentHookException("FarDrawNetworkLine");
+            end[0] = savedEnd[0];
+            end[1] = savedEnd[1];
+            gFarDragActive = false;
+            gFarSnapAnchorValid = false;
+        }
+        const auto original = reinterpret_cast<DrawNetworkLineFn>(kDrawNetworkLine);
+        return original(tool, start, end, straightOnly, networkType);
+    }
+
     // ------------------------------------------------------------------
     // Tab / Shift-Tab pole-style switch + optional ImGui status overlay.
     // See docs/power-line-style-ui-design.md. The key hook has no ImGui dependency; the overlay only
@@ -2659,8 +3249,11 @@ namespace {
     // rather than misbehaving. The runtime checks below are pure reads + compares (no writes).
     // ------------------------------------------------------------------
 
-    // Cached only to gate overlay visibility. Read on the render thread; set once at init.
+    // Cached only to gate overlay visibility. City lifecycle messages and the render callback can
+    // interleave, so acquisition/use/release is serialized and disabled outside an active city.
     cISC4View3DWin* gView3D = nullptr;
+    std::mutex gView3DMutex;
+    std::atomic_bool gCityActive{false};
 
     // True when `control` is the shared network-tool input control AND the subtool it is currently
     // driving is the power line tool. Used by the key hook (control = its own `this`) and by the
@@ -2677,17 +3270,25 @@ namespace {
     void CycleStyle(const int dir) {
         if (gStyles.empty()) {
             gActiveStyleIndex = 0;
+            gFarDragActive = false;
+            gFarSnapAnchorValid = false;
             return;
         }
         const uint32_t count = static_cast<uint32_t>(gStyles.size()) + 1; // + vanilla(0)
         const uint32_t step = dir >= 0 ? 1u : count - 1u;
         gActiveStyleIndex = (gActiveStyleIndex + step) % count;
+        // The last drag's classification was resolved under the previous style's supported FAR
+        // ratios. Do not let it select a stale angled model or remain highlighted in the overlay.
+        gFarDragActive = false;
+        gFarSnapAnchorValid = false;
         const std::string activeName = gActiveStyleIndex == 0 ? "vanilla" : gStyles[gActiveStyleIndex - 1].name;
-        LOG_INFO("PowerPoleCustomization: active pole style -> \"{}\" ({} of {}) -- applies to newly-placed poles.",
+        LOG_INFO("PowerPoleCustomization: active pole style -> \"{}\" ({} of {}) -- applies to subsequent "
+                 "placement; touched junctions may be restyled.",
                  activeName, gActiveStyleIndex, gStyles.size());
     }
 
     using OnKeyDownFn = uint8_t(__thiscall*)(void* control, int vkCode, uint32_t modifiers);
+    using InputControlIsOnTopFn = bool(__thiscall*)(void* control);
 
     // Bit 0 of the OnKeyDown modifiers argument is Shift -- confirmed against vanilla's own
     // Tab handler in cSC4ViewInputControlNetworkIntxTool::OnKeyDown (0x00660e80), which picks the
@@ -2698,12 +3299,26 @@ namespace {
     // with a throwaway edx). Consumes Tab only while the power tool is the active network subtool;
     // everything else -- including Tab under road/rail/street -- falls through to vanilla untouched.
     uint8_t __fastcall OnKeyDownHook(void* control, void* /*edx*/, int vkCode, uint32_t modifiers) {
-        if (gSettings.enabled && vkCode == static_cast<int>(kVkTab) &&
-            IsNetworkControlDrivingPowerTool(control)) {
-            const bool shift = (modifiers & kKeyModifierShift) != 0;
-            CycleStyle(shift ? -1 : 1);
-            return 1; // consume: don't let vanilla focus handling also act on Tab
+        try {
+            const auto isOnTop = reinterpret_cast<InputControlIsOnTopFn>(kInputControlIsOnTop);
+            if (RuntimeCustomizationEnabled() && !gStyles.empty() &&
+                vkCode == static_cast<int>(kVkTab) &&
+                IsNetworkControlDrivingPowerTool(control) && isOnTop(control)) {
+                // A style switch between the last preview and mouse-up would commit the already-
+                // built FAR path with a different model/cadence. Consume this keypress without
+                // switching; the user can press Tab again after the drag transaction has ended.
+                if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) {
+                    return 1;
+                }
+                const bool shift = (modifiers & kKeyModifierShift) != 0;
+                CycleStyle(shift ? -1 : 1);
+                return 1; // don't let vanilla focus handling also act on Tab
+            }
+        } catch (...) {
+            LogCurrentHookException("OnKeyDown");
         }
+        // Keep the engine call outside the customization catch: a vanilla exception must not cause
+        // the same input event to be dispatched a second time.
         const auto original = reinterpret_cast<OnKeyDownFn>(kOnKeyDown);
         return original(control, vkCode, modifiers);
     }
@@ -2711,7 +3326,10 @@ namespace {
     // View3D (and the 3D-view window it lives under) does not exist at PostAppInit -- it appears
     // once a city view is up. Acquire it lazily on the render thread, retrying until it resolves,
     // instead of failing overlay setup permanently at app init.
-    cISC4View3DWin* EnsureView3D() {
+    cISC4View3DWin* EnsureView3DLocked() {
+        if (!gCityActive.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
         if (gView3D != nullptr) {
             return gView3D;
         }
@@ -2727,7 +3345,8 @@ namespace {
     }
 
     bool OverlayShouldShow() {
-        cISC4View3DWin* const view = EnsureView3D();
+        const std::lock_guard lock(gView3DMutex);
+        cISC4View3DWin* const view = EnsureView3DLocked();
         return view != nullptr && IsNetworkControlDrivingPowerTool(view->GetCurrentViewInputControl());
     }
 
@@ -2744,7 +3363,11 @@ namespace {
     // The active style's supported FAR ratios: the style's own headings plus the [PowerPoles.FAR]
     // default fallback (which applies under any style, vanilla included).
     bool ActiveStyleSupportsRatio(const uint32_t ratioIndex) {
-        if (gActiveStyleIndex >= 1 && StyleDefinesRatio(gStyles[gActiveStyleIndex - 1], ratioIndex)) {
+        if (ratioIndex >= kFarRatios.size()) {
+            return false;
+        }
+        if (gActiveStyleIndex >= 1 && gActiveStyleIndex <= gStyles.size() &&
+            StyleDefinesRatio(gStyles[gActiveStyleIndex - 1], ratioIndex)) {
             return true;
         }
         return gHasFarDefault && StyleDefinesRatio(gFarDefaultStyle, ratioIndex);
@@ -2777,9 +3400,10 @@ namespace {
                         gActiveStyleIndex, static_cast<uint32_t>(gStyles.size()));
         }
 
-        const uint32_t interPole = (gActiveStyleIndex >= 1 && gStyles[gActiveStyleIndex - 1].hasMaxCells)
+        const uint32_t interPole = (gActiveStyleIndex >= 1 && gActiveStyleIndex <= gStyles.size() &&
+                                    gStyles[gActiveStyleIndex - 1].hasMaxCells)
             ? gStyles[gActiveStyleIndex - 1].maxCellsBetweenPoles
-            : 10u; // vanilla default (docs SS2)
+            : gLastObservedVanillaInterPoleDistance;
         ImGui::Text("Poles every %u cells", interPole);
 
         // Best-effort live heading: reflects the most recent snap while a drag is/was in progress.
@@ -2837,29 +3461,49 @@ namespace {
     // ------------------------------------------------------------------
     // Settings (SC4PowerPoleCustomization.ini, same layout convention as SC4TerrainDiagonalFix.ini).
     // ------------------------------------------------------------------
-    bool ParseBool(const std::string& value, const bool defaultValue) {
-        std::string text(value);
-        std::ranges::transform(text, text.begin(), [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (text == "true" || text == "1" || text == "yes") return true;
-        if (text == "false" || text == "0" || text == "no") return false;
-        return defaultValue;
+    std::string_view TrimIniScalar(std::string_view text) {
+        if (const size_t comment = text.find_first_of(";#"); comment != std::string_view::npos) {
+            text = text.substr(0, comment);
+        }
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+            text.remove_prefix(1);
+        }
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+            text.remove_suffix(1);
+        }
+        return text;
     }
 
-    uint32_t ParseUInt32(const std::string& value, const uint32_t defaultValue) {
-        uint32_t result = defaultValue;
-        const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), result);
-        return (ec == std::errc() && ptr == value.data() + value.size()) ? result : defaultValue;
+    bool TryParseBool(const std::string& value, bool& result) {
+        std::string text(TrimIniScalar(value));
+        std::ranges::transform(text, text.begin(), [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (text == "true" || text == "1" || text == "yes") {
+            result = true;
+            return true;
+        }
+        if (text == "false" || text == "0" || text == "no") {
+            result = false;
+            return true;
+        }
+        return false;
+    }
+
+    bool TryParseUInt32(const std::string& value, uint32_t& result) {
+        const std::string_view text = TrimIniScalar(value);
+        result = 0;
+        const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), result);
+        return !text.empty() && ec == std::errc() && ptr == text.data() + text.size();
     }
 
     // Instance IDs remain hexadecimal values even though direction masks now use named REG.* keys.
     bool TryParseHexUInt32(const std::string& value, uint32_t& result) {
-        std::string_view text = value;
+        std::string_view text = TrimIniScalar(value);
         if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
             text.remove_prefix(2);
         }
         result = 0;
         const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), result, 16);
-        return ec == std::errc() && ptr == text.data() + text.size();
+        return !text.empty() && ec == std::errc() && ptr == text.data() + text.size();
     }
 
     std::filesystem::path GetDllDirectoryPath() {
@@ -2869,11 +3513,23 @@ namespace {
                 reinterpret_cast<LPCWSTR>(&GetDllDirectoryPath), &module)) {
             return {};
         }
-        wchar_t path[MAX_PATH]{};
-        if (GetModuleFileNameW(module, path, MAX_PATH) == 0) {
-            return {};
+        std::vector<wchar_t> path(512);
+        constexpr size_t kMaximumPathCharacters = 32768;
+        while (true) {
+            const DWORD copied = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+            if (copied == 0) {
+                return {};
+            }
+            if (copied < path.size() - 1) {
+                return std::filesystem::path(path.data(), path.data() + copied).parent_path();
+            }
+            if (path.size() >= kMaximumPathCharacters) {
+                break;
+            }
+            path.resize(std::min(path.size() * 2, kMaximumPathCharacters));
         }
-        return std::filesystem::path(path).parent_path();
+        LOG_ERROR("PowerPoleCustomization: DLL path exceeds the Windows maximum; settings disabled.");
+        return {};
     }
 
     // [PowerPoles.<Name>] sections use named REG.* connection combinations. The names below are in
@@ -2908,9 +3564,9 @@ namespace {
                 continue;
             }
             uint32_t instanceId = 0;
-            if (!TryParseHexUInt32(section.get(key), instanceId)) {
-                LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] {} has invalid hexadecimal instance "
-                         "ID \"{}\"; ignoring it.", sectionLabel, key, section.get(key));
+            if (!TryParseHexUInt32(section.get(key), instanceId) || instanceId == 0) {
+                LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] {} must be a nonzero hexadecimal "
+                         "instance ID; ignoring \"{}\".", sectionLabel, key, section.get(key));
                 continue;
             }
             style.farInstanceByHeading[i] = instanceId;
@@ -2951,6 +3607,16 @@ namespace {
             if (lowerName == "powerpoles.far") {
                 const uint32_t farCount = ParseFarHeadingKeys(section, gFarDefaultStyle, styleName);
                 WarnUnknownFarKeys(section, styleName);
+                for (const auto& entry : section) {
+                    std::string key = entry.first;
+                    std::ranges::transform(key, key.begin(), [](const unsigned char c) {
+                        return static_cast<char>(std::tolower(c));
+                    });
+                    if (!key.starts_with("far-")) {
+                        LOG_WARN("PowerPoleCustomization: [PowerPoles.FAR] unknown key {}; only FAR-* "
+                                 "heading keys are valid here.", entry.first);
+                    }
+                }
                 if (farCount > 0) {
                     gHasFarDefault = true;
                     LOG_INFO("PowerPoleCustomization: loaded [PowerPoles.FAR] default ({} of {} FAR "
@@ -2963,15 +3629,29 @@ namespace {
             }
 
             PoleStyle style;
+            style.configName = styleName;
             style.name = styleName;
+            if (section.has("DisplayName")) {
+                const std::string configuredName = section.get("DisplayName");
+                const std::string_view displayName = TrimIniScalar(configuredName);
+                if (displayName.empty()) {
+                    LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] DisplayName is empty; using "
+                             "the normalized section name.", styleName);
+                } else {
+                    // Preserve the full byte sequence; blindly truncating a local UTF-8 name can
+                    // split a code point and feed invalid text to ImGui/logging.
+                    style.name.assign(displayName);
+                }
+            }
             uint32_t definedCount = 0;
             for (uint32_t mask = 0; mask < 16; ++mask) {
                 const std::string key(kRegularDirectionKeys[mask]);
                 if (section.has(key)) {
                     uint32_t instanceId = 0;
-                    if (!TryParseHexUInt32(section.get(key), instanceId)) {
-                        LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] {} has invalid hexadecimal "
-                                 "instance ID \"{}\"; ignoring it.", style.name, key, section.get(key));
+                    if (!TryParseHexUInt32(section.get(key), instanceId) || instanceId == 0) {
+                        LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] {} must be a nonzero "
+                                 "hexadecimal instance ID; ignoring \"{}\".", style.name, key,
+                                 section.get(key));
                         continue;
                     }
                     style.instanceByDirectionMask[mask] = instanceId;
@@ -2983,21 +3663,40 @@ namespace {
             const uint32_t farCount = ParseFarHeadingKeys(section, style, style.name);
 
             for (const auto& entry : section) {
-                const std::string& key = entry.first;
+                std::string key = entry.first;
+                std::ranges::transform(key, key.begin(), [](const unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
                 if (key.starts_with("0x")) {
                     LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] legacy mask key {} is unsupported; "
-                             "use a named REG.* key.", style.name, key);
+                             "use a named REG.* key.", style.name, entry.first);
                 } else if (key.starts_with("reg.") &&
                            std::ranges::find(kRegularDirectionKeys, key) == kRegularDirectionKeys.end()) {
                     LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] unknown or non-canonical regular "
-                             "direction key {}; ignoring it.", style.name, key);
+                             "direction key {}; ignoring it.", style.name, entry.first);
+                } else if (!key.starts_with("far-") && key != "interpoledistance" &&
+                           key != "displayname" &&
+                           std::ranges::find(kRegularDirectionKeys, key) == kRegularDirectionKeys.end()) {
+                    LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] unknown key {}; ignoring it.",
+                             style.name, entry.first);
                 }
             }
             WarnUnknownFarKeys(section, style.name);
             if (section.has("InterPoleDistance")) {
-                const uint32_t d = std::clamp(ParseUInt32(section.get("InterPoleDistance"), 0u), 1u, kMaxInterPoleDistance);
-                style.maxCellsBetweenPoles = d;
-                style.hasMaxCells = true;
+                const std::string value = section.get("InterPoleDistance");
+                uint32_t parsed = 0;
+                if (!TryParseUInt32(value, parsed)) {
+                    LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] InterPoleDistance has invalid "
+                             "decimal value \"{}\"; leaving spacing inherited.", style.name, value);
+                } else {
+                    const uint32_t clamped = std::clamp(parsed, 1u, kMaxInterPoleDistance);
+                    if (clamped != parsed) {
+                        LOG_WARN("PowerPoleCustomization: [PowerPoles.{}] InterPoleDistance {} is outside "
+                                 "1..{}; clamping to {}.", style.name, parsed, kMaxInterPoleDistance, clamped);
+                    }
+                    style.maxCellsBetweenPoles = clamped;
+                    style.hasMaxCells = true;
+                }
             }
 
             if (definedCount == 0 && farCount == 0 && !style.hasMaxCells) {
@@ -3019,21 +3718,61 @@ namespace {
         gFarDefaultStyle = PoleStyle{};
         gHasFarDefault = false;
         gActiveStyleIndex = 0;
-        const auto settingsPath = GetDllDirectoryPath() / "SC4PowerPoleCustomization.ini";
-        mINI::INIFile file(settingsPath.string());
+        const auto dllDirectory = GetDllDirectoryPath();
+        if (dllDirectory.empty()) {
+            LOG_ERROR("PowerPoleCustomization: could not resolve the DLL directory; using defaults "
+                      "and refusing to read a relative INI path.");
+            return;
+        }
+        const auto settingsPath = dllDirectory / "SC4PowerPoleCustomization.ini";
+        // Pass the filesystem path through unchanged so non-ASCII DLL directories work on Windows.
+        mINI::INIFile file(settingsPath);
         mINI::INIStructure ini;
-        if (!file.read(ini) || !ini.has("SC4PowerPoleCustomization")) {
-            LOG_INFO("PowerPoleCustomization: using default settings; no readable {}.", settingsPath.string());
+        if (!file.read(ini)) {
+            LOG_INFO("PowerPoleCustomization: using default settings; no readable INI beside the DLL.");
             return;
         }
 
-        const auto section = ini.get("SC4PowerPoleCustomization");
-        if (section.has("Enabled")) {
-            gSettings.enabled = ParseBool(section.get("Enabled"), gSettings.enabled);
-        }
-        if (section.has("MaxPointsPerDirection")) {
-            gSettings.maxPointsPerDirection = std::clamp(
-                ParseUInt32(section.get("MaxPointsPerDirection"), gSettings.maxPointsPerDirection), 1u, 15u);
+        if (ini.has("SC4PowerPoleCustomization")) {
+            const auto section = ini.get("SC4PowerPoleCustomization");
+            if (section.has("Enabled")) {
+                const std::string value = section.get("Enabled");
+                bool parsed = gSettings.enabled;
+                if (TryParseBool(value, parsed)) {
+                    gSettings.enabled = parsed;
+                } else {
+                    LOG_WARN("PowerPoleCustomization: Enabled has invalid boolean value \"{}\"; "
+                             "keeping default {}.", value, gSettings.enabled);
+                }
+            }
+            if (section.has("MaxPointsPerDirection")) {
+                const std::string value = section.get("MaxPointsPerDirection");
+                uint32_t parsed = 0;
+                if (!TryParseUInt32(value, parsed)) {
+                    LOG_WARN("PowerPoleCustomization: MaxPointsPerDirection has invalid decimal value "
+                             "\"{}\"; keeping default {}.", value, gSettings.maxPointsPerDirection);
+                } else {
+                    const uint32_t clamped = std::clamp(parsed, 1u, 15u);
+                    if (clamped != parsed) {
+                        LOG_WARN("PowerPoleCustomization: MaxPointsPerDirection {} is outside 1..15; "
+                                 "clamping to {}.", parsed, clamped);
+                    }
+                    gSettings.maxPointsPerDirection = clamped;
+                }
+            }
+            for (const auto& entry : section) {
+                std::string key = entry.first;
+                std::ranges::transform(key, key.begin(), [](const unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                if (key != "enabled" && key != "maxpointsperdirection") {
+                    LOG_WARN("PowerPoleCustomization: [SC4PowerPoleCustomization] unknown key {}; "
+                             "ignoring it.", entry.first);
+                }
+            }
+        } else {
+            LOG_INFO("PowerPoleCustomization: [{}] is absent; using core defaults and still loading "
+                     "PowerPoles.* style sections.", "SC4PowerPoleCustomization");
         }
 
         LOG_INFO("PowerPoleCustomization: settings enabled={}, maxPointsPerDirection={}",
@@ -3042,12 +3781,76 @@ namespace {
         LoadPoleStyles(ini);
     }
 
+    // CreatePowerPole does not reliably recover from a style ID whose prop exemplar is absent: it
+    // can allocate the occupant and then receive a null exemplar. Validate every configured model
+    // after the application's resource index is ready, before enabling the lookup hooks.
+    void ValidatePoleStyleResources() {
+        const cIGZPersistResourceManagerPtr resourceManager;
+        const auto validateStyle = [&resourceManager](PoleStyle& style, const std::string& label) {
+            uint32_t validModels = 0;
+            for (uint32_t mask = 0; mask < style.hasMask.size(); ++mask) {
+                if (!style.hasMask[mask]) {
+                    continue;
+                }
+                const uint32_t instanceId = style.instanceByDirectionMask[mask];
+                const cGZPersistResourceKey key(
+                    kExemplarTypeId, kVanillaPowerPoleGroupId, instanceId);
+                if (!resourceManager || !resourceManager->TestForKey(key)) {
+                    LOG_WARN("PowerPoleCustomization: [{}] {} references missing prop exemplar "
+                             "0x{:08X} in group 0x{:08X}; disabling that model key.", label,
+                             kRegularDirectionKeys[mask], instanceId, kVanillaPowerPoleGroupId);
+                    style.hasMask[mask] = false;
+                    style.instanceByDirectionMask[mask] = 0;
+                } else {
+                    ++validModels;
+                }
+            }
+            for (uint32_t heading = 0; heading < style.hasFarHeading.size(); ++heading) {
+                if (!style.hasFarHeading[heading]) {
+                    continue;
+                }
+                const uint32_t instanceId = style.farInstanceByHeading[heading];
+                const cGZPersistResourceKey key(
+                    kExemplarTypeId, kVanillaPowerPoleGroupId, instanceId);
+                if (!resourceManager || !resourceManager->TestForKey(key)) {
+                    LOG_WARN("PowerPoleCustomization: [{}] {} references missing prop exemplar "
+                             "0x{:08X} in group 0x{:08X}; disabling that model key.", label,
+                             kFarHeadingKeys[heading], instanceId, kVanillaPowerPoleGroupId);
+                    style.hasFarHeading[heading] = false;
+                    style.farInstanceByHeading[heading] = 0;
+                } else {
+                    ++validModels;
+                }
+            }
+            return validModels;
+        };
+
+        validateStyle(gFarDefaultStyle, "PowerPoles.FAR");
+        gHasFarDefault = std::ranges::any_of(gFarDefaultStyle.hasFarHeading,
+                                             [](const bool present) { return present; });
+        for (PoleStyle& style : gStyles) {
+            validateStyle(style, "PowerPoles." + style.configName);
+        }
+        std::erase_if(gStyles, [](const PoleStyle& style) {
+            const bool hasRegular = std::ranges::any_of(style.hasMask,
+                                                        [](const bool present) { return present; });
+            const bool hasFar = std::ranges::any_of(style.hasFarHeading,
+                                                    [](const bool present) { return present; });
+            return !hasRegular && !hasFar && !style.hasMaxCells;
+        });
+        if (gActiveStyleIndex > gStyles.size()) {
+            gActiveStyleIndex = 0;
+        }
+    }
+
     // City teardown: every pole is destroyed (the destructor hook empties the side tables
     // per-pole), the engine's texture registry is torn down by its own static shutdown, and the
     // View3D window this DLL cached for overlay visibility is destroyed with the city. Belt and
     // suspenders: drop everything city-scoped here so nothing stale survives into the next city,
     // whatever destruction order the engine picked.
     void FlushCityScopedState() {
+        gCityActive.store(false, std::memory_order_release);
+        gPendingLoadedPoles.clear();
         gOverrides.clear();
         gPolylineWidthOverrides.clear();
         gConnectionTextureOverrides.clear();
@@ -3055,9 +3858,13 @@ namespace {
         gRegisteredPoleTextures.clear();
         gFarDragActive = false;
         gFarSnapAnchorValid = false;
-        if (gView3D != nullptr) {
-            gView3D->Release();
-            gView3D = nullptr;
+        gLastObservedVanillaInterPoleDistance = 10;
+        {
+            const std::lock_guard lock(gView3DMutex);
+            if (gView3D != nullptr) {
+                gView3D->Release();
+                gView3D = nullptr;
+            }
         }
         LOG_DEBUG("PowerPoleCustomization: city-scoped state flushed on city shutdown.");
     }
@@ -3080,6 +3887,7 @@ public:
     }
 
     bool PostAppInit() override {
+        gRuntimeHooksEnabled = false;
         const uint16_t version = VersionDetection::GetInstance().GetGameVersion();
         if (version != kSupportedGameVersion) {
             LOG_WARN("PowerPoleCustomization: game version {} unsupported (addresses target {}); not patching.",
@@ -3091,6 +3899,8 @@ public:
             LOG_INFO("PowerPoleCustomization: disabled via ini; not patching.");
             return true;
         }
+
+        ValidatePoleStyleResources();
 
         size_t installed = 0;
         installed += InstallCallSitePatch(modelInstanceIdPatch_, "GetModelInstanceID@LoadModel",
@@ -3104,7 +3914,7 @@ public:
                                            &InitConnectionPointsHook);
         installed += InstallCallSitePatch(initConnectionPointsPatches_[2], "InitConnectionPoints@Read",
                                            kInitConnectionPoints_CallSite_Read, kInitConnectionPoints,
-                                           &InitConnectionPointsHook);
+                                           &InitConnectionPointsReadHook);
         installed += InstallCallSitePatch(destructorPatch_, "Destructor@DeletingDtor",
                                            kDestructor_CallSite_DeletingDtor, kDestructor,
                                            &DestructorHook);
@@ -3117,10 +3927,24 @@ public:
             installed += InstallCallSitePatch(updateConnectionPatches_[i], "UpdateConnection@SetDefaultExemplar",
                                                kUpdateConnectionCallSites[i], kUpdateConnection, &UpdateConnectionHook);
         }
+        for (size_t i = 0; i < kRemoveConnectionCallSites.size(); ++i) {
+            installed += InstallCallSitePatch(removeConnectionPatches_[i], "RemoveConnection",
+                                               kRemoveConnectionCallSites[i], kRemoveConnection,
+                                               &RemoveConnectionHook);
+        }
+        installed += InstallCallSitePatch(removeConnectionEntryPatch_, "RemoveConnectionEntry@BreakAll",
+                                           kRemoveConnectionEntry_CallSite_BreakAll, kRemoveConnectionEntry,
+                                           &RemoveConnectionEntryHook);
         for (size_t i = 0; i < kDeterminePolePositionsCallSites.size(); ++i) {
             installed += InstallCallSitePatch(determinePolePositionsPatches_[i], "DeterminePolePositions",
                                                kDeterminePolePositionsCallSites[i], kDeterminePolePositions,
                                                &DeterminePolePositionsHook);
+        }
+        for (size_t i = 0; i < kPlacePolesTransactionCallSites.size(); ++i) {
+            installed += InstallCallSitePatch(placePolesTransactionPatches_[i],
+                                               "PlacePoles@transaction-end",
+                                               kPlacePolesTransactionCallSites[i], kPlacePoles,
+                                               &PlacePolesHook);
         }
         installed += wireWidthLookupPatch_.Install() ? 1 : 0;
 
@@ -3168,28 +3992,64 @@ public:
         installed += keyHookInstalled ? 1 : 0;
         styleUiValidated_ = keyHookInstalled && farInstalled;
 
-        LOG_INFO("PowerPoleCustomization: installed {} of {} patches.", installed,
-                 initConnectionPointsPatches_.size() + kAddConnectionCallSites.size() +
-                 kUpdateConnectionCallSites.size() + kDeterminePolePositionsCallSites.size() +
-                 2 + createFloorPatches_.size() + 4 + 2 + 2 + 1 + 1 + 1 + 1 + 1);
+        const size_t expectedPatches =
+            1 + // model-instance selector
+            initConnectionPointsPatches_.size() +
+            1 + // pole destructor
+            kAddConnectionCallSites.size() +
+            kUpdateConnectionCallSites.size() +
+            kRemoveConnectionCallSites.size() +
+            1 + // BreakAll's inner connection-entry removal
+            kDeterminePolePositionsCallSites.size() +
+            kPlacePolesTransactionCallSites.size() +
+            1 + // per-wire width lookup
+            createFloorPatches_.size() +
+            4 + // floor/wall texture hashes
+            2 + // strand/buoy texture selectors
+            1 + // water-buoy size
+            2 + // regular/FAR pole-style selectors
+            1 + // FAR DrawNetworkLine vtable slot
+            1 + // keepwires zone handler
+            1;  // Tab/Shift-Tab input slot
+        LOG_INFO("PowerPoleCustomization: installed {} of {} patches.", installed, expectedPatches);
+        if (installed != expectedPatches) {
+            // The hooks share side tables and several byte sites form indivisible hash/lookup pairs.
+            // A partially installed set is less safe than disabling this DLL for an unknown binary.
+            LOG_ERROR("PowerPoleCustomization: incomplete patch set; rolling back all installed hooks.");
+            PinModuleIfHooksRemain(UninstallPatches());
+            return true;
+        }
 
         cIGZMessageServer2Ptr pMS2;
-        if (pMS2) {
-            pMS2->AddNotification(this, kSC4MessagePreCityShutdown);
-            messageServer_ = pMS2;
-        } else {
-            LOG_WARN("PowerPoleCustomization: message server unavailable; city-shutdown flush "
-                     "relies on the destructor hook alone.");
+        if (!pMS2 || !pMS2->AddNotification(this, kSC4MessagePostCityInit)) {
+            LOG_ERROR("PowerPoleCustomization: PostCityInit notification is unavailable; rolling "
+                      "back because saved connection metadata could not be restored safely.");
+            PinModuleIfHooksRemain(UninstallPatches());
+            return true;
         }
+        if (!pMS2->AddNotification(this, kSC4MessagePreCityShutdown)) {
+            pMS2->RemoveNotification(this, kSC4MessagePostCityInit);
+            LOG_ERROR("PowerPoleCustomization: PreCityShutdown notification is unavailable; rolling "
+                      "back because the retained view and city-scoped caches cannot cross cities.");
+            PinModuleIfHooksRemain(UninstallPatches());
+            return true;
+        }
+        messageServer_ = pMS2;
+        gRuntimeHooksEnabled = true;
 
         const cISC4AppPtr app;
         if (app) {
             if (auto* const cheats = app->GetCheatCodeManager()) {
                 if (cheats->RegisterCheatCode(kCheatKeepWires, cRZBaseString("keepwires"))) {
-                    cheats->AddNotification2(this, 0);
-                    cheatManager_ = cheats;
-                    LOG_INFO("PowerPoleCustomization: cheat code registered (keepwires) -- toggles "
-                             "suppression of power-line rerouting on zone changes.");
+                    if (cheats->AddNotification2(this, 0)) {
+                        cheatManager_ = cheats;
+                        LOG_INFO("PowerPoleCustomization: cheat code registered (keepwires) -- toggles "
+                                 "suppression of power-line rerouting on zone changes.");
+                    } else {
+                        cheats->UnregisterCheatCode(kCheatKeepWires);
+                        LOG_WARN("PowerPoleCustomization: keepwires notification subscription failed; "
+                                 "the cheat was unregistered.");
+                    }
                 } else {
                     LOG_WARN("PowerPoleCustomization: failed to register cheat code keepwires.");
                 }
@@ -3201,39 +4061,28 @@ public:
     }
 
     bool PostAppShutdown() override {
+        // Fail closed before touching patch bytes: a site whose protection/ownership prevents
+        // uninstall must continue to delegate to vanilla for the remainder of process shutdown.
+        gRuntimeHooksEnabled = false;
+        gKeepWiresOnZoneChange = false;
+        gCityActive.store(false, std::memory_order_release);
         if (cheatManager_) {
             cheatManager_->UnregisterCheatCode(kCheatKeepWires);
             cheatManager_->RemoveNotification2(this, 0);
             cheatManager_.Reset();
         }
         if (messageServer_) {
+            messageServer_->RemoveNotification(this, kSC4MessagePostCityInit);
             messageServer_->RemoveNotification(this, kSC4MessagePreCityShutdown);
             messageServer_ = nullptr;
         }
         TeardownStatusOverlay();
-        onKeyDownPatch_.Uninstall();
-        farDrawNetworkLinePatch_.Uninstall();
-        keepWiresPatch_.Uninstall();
-        modelInstanceIdPatch_.Uninstall();
-        destructorPatch_.Uninstall();
-        for (auto& patch : initConnectionPointsPatches_) patch.Uninstall();
-        for (auto& patch : addConnectionPatches_) patch.Uninstall();
-        for (auto& patch : updateConnectionPatches_) patch.Uninstall();
-        for (auto& patch : determinePolePositionsPatches_) patch.Uninstall();
-        wireWidthLookupPatch_.Uninstall();
-        for (auto& patch : createFloorPatches_) patch.Uninstall();
-        floorTextureHashPatch1_.Uninstall();
-        floorTextureHashPatch2_.Uninstall();
-        wallTextureHashPatch1_.Uninstall();
-        wallTextureHashPatch2_.Uninstall();
-        wireStrandTexturePatch_.Uninstall();
-        wireBuoyTexturePatch_.Uninstall();
-        waterBallSizePatch_.Uninstall();
-        poleStyleLookupPatch1_.Uninstall();
-        poleStyleLookupPatch2_.Uninstall();
+        PinModuleIfHooksRemain(UninstallPatches());
         gPolylineWidthOverrides.clear();
         gConnectionTextureOverrides.clear();
         gWaterBallSizeOverrides.clear();
+        gPendingLoadedPoles.clear();
+        gRegisteredPoleTextures.clear();
         gOverrides.clear();
         if (mpFrameWork) {
             mpFrameWork->RemoveHook(this);
@@ -3242,18 +4091,25 @@ public:
     }
 
     bool DoMessage(cIGZMessage2* pMsg) override {
-        if (pMsg) {
-            auto* const stdMsg = static_cast<cIGZMessage2Standard*>(pMsg);
-            if (stdMsg->GetType() == kSC4MessagePreCityShutdown) {
-                FlushCityScopedState();
-            } else if (stdMsg->GetType() == kCheatCodeMessageType &&
-                       static_cast<uint32_t>(stdMsg->GetData1()) == kCheatKeepWires) {
-                gKeepWiresOnZoneChange = !gKeepWiresOnZoneChange;
-                LOG_INFO("PowerPoleCustomization: keepwires {} -- zone changes {} "
-                         "the power-line remove/reposition/rebuild handler.",
-                         gKeepWiresOnZoneChange ? "ENABLED" : "disabled",
-                         gKeepWiresOnZoneChange ? "will bypass" : "will run");
+        try {
+            if (pMsg) {
+                auto* const stdMsg = static_cast<cIGZMessage2Standard*>(pMsg);
+                if (stdMsg->GetType() == kSC4MessagePostCityInit) {
+                    gCityActive.store(true, std::memory_order_release);
+                    RehydrateLoadedConnections();
+                } else if (stdMsg->GetType() == kSC4MessagePreCityShutdown) {
+                    FlushCityScopedState();
+                } else if (stdMsg->GetType() == kCheatCodeMessageType &&
+                           static_cast<uint32_t>(stdMsg->GetData1()) == kCheatKeepWires) {
+                    gKeepWiresOnZoneChange = !gKeepWiresOnZoneChange;
+                    LOG_INFO("PowerPoleCustomization: keepwires {} -- zone changes {} "
+                             "the power-line remove/reposition/rebuild handler.",
+                             gKeepWiresOnZoneChange ? "ENABLED" : "disabled",
+                             gKeepWiresOnZoneChange ? "will bypass" : "will run");
+                }
             }
+        } catch (...) {
+            LogCurrentHookException("DoMessage");
         }
         return true;
     }
@@ -3261,6 +4117,22 @@ public:
 private:
     static size_t InstallCallSitePatch(TerrainDecal::RelativeCallPatch& patch, const char* name,
                                         const uintptr_t callSite, const uintptr_t expectedTarget, void* hookFn) {
+        const auto* const site = reinterpret_cast<const uint8_t*>(callSite);
+        if (site[0] != 0xe8) {
+            LOG_ERROR("PowerPoleCustomization: {} site 0x{:08X} is not a relative CALL; not patching.",
+                      name, static_cast<uint32_t>(callSite));
+            return 0;
+        }
+        int32_t originalRelative = 0;
+        std::memcpy(&originalRelative, site + 1, sizeof(originalRelative));
+        const uintptr_t originalTarget = static_cast<uintptr_t>(
+            static_cast<intptr_t>(callSite + 5) + originalRelative);
+        if (originalTarget != expectedTarget) {
+            LOG_ERROR("PowerPoleCustomization: {} call site 0x{:08X} targets 0x{:08X}, expected "
+                      "0x{:08X}; not patching.", name, static_cast<uint32_t>(callSite),
+                      static_cast<uint32_t>(originalTarget), static_cast<uint32_t>(expectedTarget));
+            return 0;
+        }
         patch.Configure(name, callSite, hookFn);
         if (!patch.Install()) {
             LOG_ERROR("PowerPoleCustomization: failed to install {} at 0x{:08X}.", name, static_cast<uint32_t>(callSite));
@@ -3276,6 +4148,90 @@ private:
         return 1;
     }
 
+    size_t UninstallPatches() {
+        onKeyDownPatch_.Uninstall();
+        farDrawNetworkLinePatch_.Uninstall();
+        keepWiresPatch_.Uninstall();
+        poleStyleLookupPatch2_.Uninstall();
+        poleStyleLookupPatch1_.Uninstall();
+        waterBallSizePatch_.Uninstall();
+        wireBuoyTexturePatch_.Uninstall();
+        wireStrandTexturePatch_.Uninstall();
+        wallTextureHashPatch2_.Uninstall();
+        wallTextureHashPatch1_.Uninstall();
+        floorTextureHashPatch2_.Uninstall();
+        floorTextureHashPatch1_.Uninstall();
+        for (auto& patch : createFloorPatches_) patch.Uninstall();
+        wireWidthLookupPatch_.Uninstall();
+        for (auto& patch : placePolesTransactionPatches_) patch.Uninstall();
+        for (auto& patch : determinePolePositionsPatches_) patch.Uninstall();
+        removeConnectionEntryPatch_.Uninstall();
+        for (auto& patch : removeConnectionPatches_) patch.Uninstall();
+        for (auto& patch : updateConnectionPatches_) patch.Uninstall();
+        for (auto& patch : addConnectionPatches_) patch.Uninstall();
+        destructorPatch_.Uninstall();
+        for (auto& patch : initConnectionPointsPatches_) patch.Uninstall();
+        modelInstanceIdPatch_.Uninstall();
+        styleUiValidated_ = false;
+
+        // Uninstall methods deliberately retain IsInstalled() when page protection fails or a
+        // later mod has taken ownership of the same site. Never hide that partial teardown: an
+        // apparently clean rollback with a live callback into this DLL is worse than a loud error.
+        size_t remaining = 0;
+        const auto countRemaining = [&remaining](const auto& patch) {
+            remaining += patch.IsInstalled() ? 1u : 0u;
+        };
+        countRemaining(onKeyDownPatch_);
+        countRemaining(farDrawNetworkLinePatch_);
+        countRemaining(keepWiresPatch_);
+        countRemaining(poleStyleLookupPatch2_);
+        countRemaining(poleStyleLookupPatch1_);
+        countRemaining(waterBallSizePatch_);
+        countRemaining(wireBuoyTexturePatch_);
+        countRemaining(wireStrandTexturePatch_);
+        countRemaining(wallTextureHashPatch2_);
+        countRemaining(wallTextureHashPatch1_);
+        countRemaining(floorTextureHashPatch2_);
+        countRemaining(floorTextureHashPatch1_);
+        for (const auto& patch : createFloorPatches_) countRemaining(patch);
+        countRemaining(wireWidthLookupPatch_);
+        for (const auto& patch : placePolesTransactionPatches_) countRemaining(patch);
+        for (const auto& patch : determinePolePositionsPatches_) countRemaining(patch);
+        countRemaining(removeConnectionEntryPatch_);
+        for (const auto& patch : removeConnectionPatches_) countRemaining(patch);
+        for (const auto& patch : updateConnectionPatches_) countRemaining(patch);
+        for (const auto& patch : addConnectionPatches_) countRemaining(patch);
+        countRemaining(destructorPatch_);
+        for (const auto& patch : initConnectionPointsPatches_) countRemaining(patch);
+        countRemaining(modelInstanceIdPatch_);
+        if (remaining != 0) {
+            LOG_ERROR("PowerPoleCustomization: {} hook patches remain installed after teardown; see "
+                      "the preceding ownership/protection errors.", remaining);
+        }
+        return remaining;
+    }
+
+    static void PinModuleIfHooksRemain(const size_t remaining) noexcept {
+        if (remaining == 0) {
+            return;
+        }
+        HMODULE module = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                               reinterpret_cast<LPCWSTR>(&PinModuleIfHooksRemain), &module)) {
+            try {
+                LOG_ERROR("PowerPoleCustomization: pinned this DLL for process lifetime because {} "
+                          "hook patches still reference it.", remaining);
+            } catch (...) {
+            }
+        } else {
+            try {
+                LOG_ERROR("PowerPoleCustomization: failed to pin a DLL still referenced by {} hook "
+                          "patches (Windows error {}).", remaining, GetLastError());
+            } catch (...) {
+            }
+        }
+    }
+
     // Acquires the optional ImGui status overlay. Safe no-op when the power-tool identity vtables
     // weren't byte-confirmed at install (recompiled/other binary), or when the ImGui service
     // (SC4RenderServices / imgui.dll) is absent. The pole features and the Tab key hook keep working
@@ -3287,7 +4243,7 @@ private:
             return;
         }
 
-        // View3D is acquired lazily at render time (EnsureView3D) -- it does not exist yet here.
+        // View3D is acquired lazily at render time (EnsureView3DLocked) -- it does not exist yet here.
         // Registration only needs the ImGui service, which is available at PostAppInit.
         if (mpFrameWork == nullptr ||
             !mpFrameWork->GetSystemService(kImGuiServiceID, GZIID_cIGZImGuiService,
@@ -3295,6 +4251,15 @@ private:
             imguiService_ = nullptr;
             LOG_INFO("PowerPoleCustomization: ImGui service absent; status overlay disabled "
                      "(Tab style switching still works).");
+            return;
+        }
+
+        const uint32_t apiVersion = imguiService_->GetApiVersion();
+        if (apiVersion != kImGuiServiceApiVersion) {
+            LOG_WARN("PowerPoleCustomization: ImGui service API {} is incompatible with required API {}; "
+                     "status overlay disabled.", apiVersion, kImGuiServiceApiVersion);
+            imguiService_->Release();
+            imguiService_ = nullptr;
             return;
         }
 
@@ -3311,7 +4276,7 @@ private:
         }
         overlayRegistered_ = true;
         LOG_INFO("PowerPoleCustomization: status overlay registered (ImGui api {}).",
-                 imguiService_->GetApiVersion());
+                 apiVersion);
     }
 
     void TeardownStatusOverlay() {
@@ -3323,9 +4288,12 @@ private:
             imguiService_->Release();
             imguiService_ = nullptr;
         }
-        if (gView3D != nullptr) {
-            gView3D->Release();
-            gView3D = nullptr;
+        {
+            const std::lock_guard lock(gView3DMutex);
+            if (gView3D != nullptr) {
+                gView3D->Release();
+                gView3D = nullptr;
+            }
         }
     }
 
@@ -3334,7 +4302,10 @@ private:
     TerrainDecal::RelativeCallPatch destructorPatch_{}; // side-table cleanup on pole destruction
     std::array<TerrainDecal::RelativeCallPatch, 4> addConnectionPatches_{};
     std::array<TerrainDecal::RelativeCallPatch, 2> updateConnectionPatches_{};
+    std::array<TerrainDecal::RelativeCallPatch, 6> removeConnectionPatches_{};
+    TerrainDecal::RelativeCallPatch removeConnectionEntryPatch_{};
     std::array<TerrainDecal::RelativeCallPatch, 3> determinePolePositionsPatches_{};
+    std::array<TerrainDecal::RelativeCallPatch, 2> placePolesTransactionPatches_{};
     std::array<TerrainDecal::RelativeCallPatch, 3> createFloorPatches_{};
     Imm32CallPatch floorTextureHashPatch1_{};
     Imm32CallPatch floorTextureHashPatch2_{};
@@ -3371,8 +4342,8 @@ cRZCOMDllDirector* RZGetCOMDllDirector() {
 // Current verification state:
 //   1. CLOSED: all three InitConnectionPoints call sites are hooked, including 0x0064ceaa inside
 //      cSC4PowerPoleOccupant::Init, the new-pole creation path.
-//   2. CLOSED statically, runtime validation pending: public cISCExemplarPropertyHolder access is
-//      confirmed through cSC4PowerPoleOccupant::QueryInterface and replaces the old nullptr stub.
+//   2. CLOSED (validated in-game 2026-07-19): public cISCExemplarPropertyHolder access through
+//      cSC4PowerPoleOccupant::QueryInterface replaces the old nullptr stub.
 //   3. CLOSED: Get0To3Direction confirmed at 0x0061f4c0. ApplyConnectionCustomization computes real
 //      direction and strand counts.
 //   4. CLOSED (superseded): cSC4PowerLineOccupant's vtable was fully mapped and used to register
