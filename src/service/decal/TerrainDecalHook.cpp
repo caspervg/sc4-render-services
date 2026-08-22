@@ -6,6 +6,10 @@
 #include <cstring>
 #include <utility>
 
+#include <d3d.h>
+#include <ddraw.h>
+
+#include "DX7InterfaceHook.h"
 #include "GZServPtrs.h"
 #include "cISC4App.h"
 #include "cISC4City.h"
@@ -137,6 +141,8 @@ namespace TerrainDecal
         currentTexTransformValid_ = false;
         currentTexTransformStage_ = -1;
         shadowRecoveryActive_ = false;
+        shadowRecoveryCaptureActive_ = false;
+        ReleaseRecoveryTarget_();
         renderer_.ClearOverlayUvWindows();
 
         if (sActiveHook_ == this) {
@@ -253,7 +259,9 @@ namespace TerrainDecal
             .addresses = addresses_ ? &*addresses_ : nullptr,
             .terrain = nullptr,
             .terrainView = nullptr,
-            .mode = shadowRecoveryActive_ ? DrawMode::ShadowRecovery : DrawMode::Normal,
+            .mode = shadowRecoveryActive_
+                        ? (shadowRecoveryCaptureActive_ ? DrawMode::ShadowRecoveryCapture : DrawMode::ShadowRecovery)
+                        : DrawMode::Normal,
         };
 
         if (addresses_ && rect && addresses_->overlayRectOffset > 0) {
@@ -372,6 +380,10 @@ namespace TerrainDecal
             return;
         }
 
+        if (CompositeManagedDecalsAfterShadows_(overlayManager, worldToScreenMatrix, drawContext, decalIds)) {
+            return;
+        }
+
         currentTexTransformValid_ = false;
         currentTexTransformStage_ = -1;
 
@@ -393,6 +405,211 @@ namespace TerrainDecal
 
         currentTexTransformValid_ = false;
         currentTexTransformStage_ = -1;
+    }
+
+    bool TerrainDecalHook::EnsureRecoveryTarget_(IDirect3DDevice7* const device,
+                                                 IDirectDrawSurface7* const originalTarget)
+    {
+        if (!device || !originalTarget) {
+            return false;
+        }
+
+        DDSURFACEDESC2 originalDesc{.dwSize = sizeof(DDSURFACEDESC2)};
+        if (FAILED(originalTarget->GetSurfaceDesc(&originalDesc)) ||
+            originalDesc.dwWidth == 0 || originalDesc.dwHeight == 0) {
+            return false;
+        }
+
+        if (recoveryDevice_ == device && recoveryTarget_ && recoveryDepth_ &&
+            recoveryWidth_ == originalDesc.dwWidth && recoveryHeight_ == originalDesc.dwHeight &&
+            recoveryTarget_->IsLost() == DD_OK && recoveryDepth_->IsLost() == DD_OK) {
+            return true;
+        }
+
+        ReleaseRecoveryTarget_();
+        auto* const d3dx = DX7InterfaceHook::GetD3DXInterface();
+        IDirectDraw7* const dd = d3dx ? d3dx->GetDD() : nullptr;
+        IDirectDrawSurface7* const gameDepth = d3dx ? d3dx->GetZBuffer() : nullptr;
+        if (!dd || !gameDepth) {
+            return false;
+        }
+
+        DDSURFACEDESC2 colorDesc{.dwSize = sizeof(DDSURFACEDESC2)};
+        colorDesc.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
+        colorDesc.dwWidth = originalDesc.dwWidth;
+        colorDesc.dwHeight = originalDesc.dwHeight;
+        colorDesc.ddsCaps.dwCaps = DDSCAPS_TEXTURE | DDSCAPS_3DDEVICE | DDSCAPS_VIDEOMEMORY;
+        colorDesc.ddpfPixelFormat.dwSize = sizeof(DDPIXELFORMAT);
+        colorDesc.ddpfPixelFormat.dwFlags = DDPF_RGB | DDPF_ALPHAPIXELS;
+        if (originalDesc.ddpfPixelFormat.dwRGBBitCount <= 16) {
+            colorDesc.ddpfPixelFormat.dwRGBBitCount = 16;
+            colorDesc.ddpfPixelFormat.dwRBitMask = 0x0F00;
+            colorDesc.ddpfPixelFormat.dwGBitMask = 0x00F0;
+            colorDesc.ddpfPixelFormat.dwBBitMask = 0x000F;
+            colorDesc.ddpfPixelFormat.dwRGBAlphaBitMask = 0xF000;
+        }
+        else {
+            colorDesc.ddpfPixelFormat.dwRGBBitCount = 32;
+            colorDesc.ddpfPixelFormat.dwRBitMask = 0x00FF0000;
+            colorDesc.ddpfPixelFormat.dwGBitMask = 0x0000FF00;
+            colorDesc.ddpfPixelFormat.dwBBitMask = 0x000000FF;
+            colorDesc.ddpfPixelFormat.dwRGBAlphaBitMask = 0xFF000000;
+        }
+
+        if (FAILED(dd->CreateSurface(&colorDesc, &recoveryTarget_, nullptr))) {
+            ReleaseRecoveryTarget_();
+            return false;
+        }
+
+        DDSURFACEDESC2 depthDesc{.dwSize = sizeof(DDSURFACEDESC2)};
+        if (FAILED(gameDepth->GetSurfaceDesc(&depthDesc))) {
+            ReleaseRecoveryTarget_();
+            return false;
+        }
+        depthDesc.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
+        depthDesc.dwWidth = originalDesc.dwWidth;
+        depthDesc.dwHeight = originalDesc.dwHeight;
+        depthDesc.ddsCaps.dwCaps = DDSCAPS_ZBUFFER | DDSCAPS_VIDEOMEMORY;
+        if (FAILED(dd->CreateSurface(&depthDesc, &recoveryDepth_, nullptr)) ||
+            FAILED(recoveryTarget_->AddAttachedSurface(recoveryDepth_))) {
+            ReleaseRecoveryTarget_();
+            return false;
+        }
+
+        recoveryDevice_ = device;
+        recoveryDevice_->AddRef();
+        recoveryWidth_ = originalDesc.dwWidth;
+        recoveryHeight_ = originalDesc.dwHeight;
+        LOG_INFO("TerrainDecalHook: created {}x{} shadow recovery render target", recoveryWidth_, recoveryHeight_);
+        return true;
+    }
+
+    void TerrainDecalHook::ReleaseRecoveryTarget_() noexcept
+    {
+        if (recoveryDepth_) {
+            recoveryDepth_->Release();
+            recoveryDepth_ = nullptr;
+        }
+        if (recoveryTarget_) {
+            recoveryTarget_->Release();
+            recoveryTarget_ = nullptr;
+        }
+        if (recoveryDevice_) {
+            recoveryDevice_->Release();
+            recoveryDevice_ = nullptr;
+        }
+        recoveryWidth_ = 0;
+        recoveryHeight_ = 0;
+    }
+
+    bool TerrainDecalHook::CompositeManagedDecalsAfterShadows_(void* const overlayManager,
+                                                               const float* const worldToScreenMatrix,
+                                                               SC4DrawContext* const drawContext,
+                                                               int* const decalIds)
+    {
+        auto* const d3dx = DX7InterfaceHook::GetD3DXInterface();
+        IDirect3DDevice7* const device = d3dx ? d3dx->GetD3DDevice() : nullptr;
+        if (!device) {
+            return false;
+        }
+
+        IDirectDrawSurface7* originalTarget = nullptr;
+        DWORD stateBlock = 0;
+        DWORD replayStateBlock = 0;
+        if (FAILED(device->GetRenderTarget(&originalTarget)) || !originalTarget ||
+            FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)) ||
+            !EnsureRecoveryTarget_(device, originalTarget)) {
+            if (stateBlock) device->DeleteStateBlock(stateBlock);
+            if (originalTarget) originalTarget->Release();
+            return false;
+        }
+
+        bool targetChanged = false;
+        bool captureStarted = false;
+        bool success = false;
+        do {
+            if (FAILED(device->SetRenderTarget(recoveryTarget_, 0))) break;
+            targetChanged = true;
+            if (FAILED(device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0))) break;
+
+            currentTexTransformValid_ = false;
+            currentTexTransformStage_ = -1;
+            shadowRecoveryActive_ = true;
+            shadowRecoveryCaptureActive_ = true;
+            captureStarted = true;
+            reinterpret_cast<DrawOverlayPassFn>(addresses_->drawDecals)(overlayManager,
+                                                                         worldToScreenMatrix,
+                                                                         drawContext,
+                                                                         decalIds);
+            shadowRecoveryCaptureActive_ = false;
+            shadowRecoveryActive_ = false;
+            device->CreateStateBlock(D3DSBT_ALL, &replayStateBlock);
+
+            if (FAILED(device->SetRenderTarget(originalTarget, 0))) break;
+            targetChanged = false;
+
+            D3DVIEWPORT7 viewport{};
+            if (FAILED(device->GetViewport(&viewport))) break;
+
+            struct CompositeVertex { float x, y, z, rhw; DWORD color; float u, v; };
+            const float left = static_cast<float>(viewport.dwX) - 0.5f;
+            const float top = static_cast<float>(viewport.dwY) - 0.5f;
+            const float right = static_cast<float>(viewport.dwX + viewport.dwWidth) - 0.5f;
+            const float bottom = static_cast<float>(viewport.dwY + viewport.dwHeight) - 0.5f;
+            const float u0 = static_cast<float>(viewport.dwX) / static_cast<float>(recoveryWidth_);
+            const float v0 = static_cast<float>(viewport.dwY) / static_cast<float>(recoveryHeight_);
+            const float u1 = static_cast<float>(viewport.dwX + viewport.dwWidth) / static_cast<float>(recoveryWidth_);
+            const float v1 = static_cast<float>(viewport.dwY + viewport.dwHeight) / static_cast<float>(recoveryHeight_);
+            const DWORD color = D3DRGBA(1.0f, 1.0f, 1.0f,
+                                        std::clamp(options_.shadowRecoveryOpacityScale, 0.0f, 1.0f));
+            const CompositeVertex vertices[] = {
+                {left, top, 0.0f, 1.0f, color, u0, v0},
+                {right, top, 0.0f, 1.0f, color, u1, v0},
+                {left, bottom, 0.0f, 1.0f, color, u0, v1},
+                {right, bottom, 0.0f, 1.0f, color, u1, v1},
+            };
+
+            device->SetRenderState(D3DRENDERSTATE_ZENABLE, FALSE);
+            device->SetRenderState(D3DRENDERSTATE_ZWRITEENABLE, FALSE);
+            device->SetRenderState(D3DRENDERSTATE_LIGHTING, FALSE);
+            device->SetRenderState(D3DRENDERSTATE_ALPHATESTENABLE, FALSE);
+            device->SetRenderState(D3DRENDERSTATE_ALPHABLENDENABLE, TRUE);
+            device->SetRenderState(D3DRENDERSTATE_SRCBLEND, D3DBLEND_SRCALPHA);
+            device->SetRenderState(D3DRENDERSTATE_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            device->SetRenderState(D3DRENDERSTATE_CULLMODE, D3DCULL_NONE);
+            device->SetTexture(0, recoveryTarget_);
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+            device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+            success = SUCCEEDED(device->DrawPrimitive(D3DPT_TRIANGLESTRIP,
+                                                       D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1,
+                                                       const_cast<CompositeVertex*>(vertices),
+                                                       4,
+                                                       D3DDP_WAIT));
+        } while (false);
+
+        shadowRecoveryCaptureActive_ = false;
+        shadowRecoveryActive_ = false;
+        if (targetChanged) {
+            device->SetRenderTarget(originalTarget, 0);
+        }
+        device->ApplyStateBlock(replayStateBlock ? replayStateBlock : stateBlock);
+        if (replayStateBlock) device->DeleteStateBlock(replayStateBlock);
+        device->DeleteStateBlock(stateBlock);
+        originalTarget->Release();
+        currentTexTransformValid_ = false;
+        currentTexTransformStage_ = -1;
+        if (!success) {
+            ReleaseRecoveryTarget_();
+        }
+        // Once DrawDecals touched SC4's internal draw-context cache, do not run the
+        // legacy replay in the same frame after restoring only the native D3D state.
+        return success || captureStarted;
     }
 
     void TerrainDecalHook::SetLastError_(std::string message)

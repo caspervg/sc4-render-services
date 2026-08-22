@@ -24,6 +24,7 @@ namespace TerrainDecal
     {
         Normal,
         ShadowRecovery,
+        ShadowRecoveryCapture,
     };
 
     struct RendererOptions

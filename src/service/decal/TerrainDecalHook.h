@@ -13,6 +13,8 @@
 #include "TerrainDecalSymbols.h"
 
 class SC4DrawContext;
+struct IDirect3DDevice7;
+struct IDirectDrawSurface7;
 
 namespace TerrainDecal
 {
@@ -60,6 +62,9 @@ namespace TerrainDecal
         void CallOriginalOverlayPass_(const RelativeCallPatch& patch, void* overlayManager, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds) const;
         void CallOriginalSetTexTransform4_(SC4DrawContext* drawContext, const float* matrix, int stage) const;
         void ReplayManagedDecalsAfterShadows_(void* overlayManager, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds);
+        bool CompositeManagedDecalsAfterShadows_(void* overlayManager, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds);
+        bool EnsureRecoveryTarget_(IDirect3DDevice7* device, IDirectDrawSurface7* originalTarget);
+        void ReleaseRecoveryTarget_() noexcept;
         void SetLastError_(std::string message);
 
     private:
@@ -75,6 +80,12 @@ namespace TerrainDecal
         int currentTexTransformStage_ = -1;
         bool currentTexTransformValid_ = false;
         bool shadowRecoveryActive_ = false;
+        bool shadowRecoveryCaptureActive_ = false;
+        IDirect3DDevice7* recoveryDevice_ = nullptr;
+        IDirectDrawSurface7* recoveryTarget_ = nullptr;
+        IDirectDrawSurface7* recoveryDepth_ = nullptr;
+        uint32_t recoveryWidth_ = 0;
+        uint32_t recoveryHeight_ = 0;
 
         static TerrainDecalHook* sActiveHook_;
     };

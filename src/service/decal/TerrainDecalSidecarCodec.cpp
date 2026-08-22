@@ -4,6 +4,9 @@
 #include "cIGZOStream.h"
 
 namespace {
+    constexpr uint32_t kLegacyRecordSize = sizeof(TerrainDecalSidecar::PersistedTerrainDecal) - sizeof(int32_t);
+    constexpr uint32_t kMaxPayloadBytes = 64u * 1024u * 1024u;
+
     TerrainDecalSnapshot DecodeSnapshot(const TerrainDecalSidecar::PersistedTerrainDecal& persisted) {
         TerrainDecalSnapshot snapshot{};
         snapshot.id = TerrainDecalId{persisted.decalId};
@@ -121,12 +124,13 @@ namespace TerrainDecalSidecar {
             return result;
         }
 
-        const bool hasDepthOffsetField = chunk.recordSize >= sizeof(PersistedTerrainDecal);
-
-        if (chunk.payloadBytes != chunk.recordCount * chunk.recordSize) {
+        if (chunk.recordSize < kLegacyRecordSize || chunk.payloadBytes > kMaxPayloadBytes ||
+            static_cast<uint64_t>(chunk.recordCount) * chunk.recordSize != chunk.payloadBytes) {
             result.error = "terrain decal chunk payload size mismatch";
             return result;
         }
+
+        const bool hasDepthOffsetField = chunk.recordSize >= sizeof(PersistedTerrainDecal);
 
         result.decals.reserve(chunk.recordCount);
         for (uint32_t i = 0; i < chunk.recordCount; ++i) {
@@ -172,6 +176,13 @@ namespace TerrainDecalSidecar {
                 persisted.depthOffset = static_cast<int32_t>(depthOffsetBits);
             }
             // Older records have no depthOffset; PersistedTerrainDecal::depthOffset already defaults to -1.
+
+            const uint32_t consumedBytes = hasDepthOffsetField ? sizeof(PersistedTerrainDecal) : kLegacyRecordSize;
+            if (chunk.recordSize > consumedBytes && !in.Skip(chunk.recordSize - consumedBytes)) {
+                result.error = "truncated terrain decal record";
+                result.decals.clear();
+                return result;
+            }
 
             result.decals.push_back(DecodeSnapshot(persisted));
         }

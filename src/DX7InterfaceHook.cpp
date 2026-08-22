@@ -21,18 +21,6 @@ static std::atomic<HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice7*)> s_OriginalEn
 
 static HRESULT STDMETHODCALLTYPE EndSceneHook(IDirect3DDevice7* device)
 {
-    auto* d3dx = DX7InterfaceHook::s_pD3DX.load(std::memory_order_acquire);
-    auto* d3d = d3dx ? d3dx->GetD3DDevice() : nullptr;
-    auto* dd = d3dx ? d3dx->GetDD() : nullptr;
-
-    if (d3dx && (!d3d || !dd)) {
-        LOG_WARN("EndSceneHook: D3DX interface not ready (d3dx={}, d3d={}, dd={}), clearing",
-            static_cast<void*>(d3dx),
-            static_cast<void*>(d3d),
-            static_cast<void*>(dd));
-        DX7InterfaceHook::s_pD3DX.store(nullptr, std::memory_order_release);
-    }
-
     auto callback = s_FrameCallback.load(std::memory_order_acquire);
     if (callback) {
         callback(device);
@@ -61,17 +49,22 @@ bool DX7InterfaceHook::CaptureInterface(cIGZGDriver* pDriver)
         static_cast<uint8_t*>(driverPtr) + 0x24C);
 
     if (!candidate) {
-        LOG_ERROR("DX7InterfaceHook::CaptureInterface: D3DX pointer null at offset 0x24C");
+        return false;
     }
-    if (candidate && (!candidate->GetD3DDevice() || !candidate->GetDD())) {
-        LOG_WARN("DX7InterfaceHook::CaptureInterface: D3DX interface not ready yet (d3dx={}, d3d={}, dd={})",
-            static_cast<void*>(candidate),
-            static_cast<void*>(candidate->GetD3DDevice()),
-            static_cast<void*>(candidate->GetDD()));
-        candidate = nullptr;
+    if (!candidate->GetD3DDevice() || !candidate->GetDD()) {
+        return false;
     }
 
-    s_pD3DX.store(candidate, std::memory_order_release);
+    auto* current = s_pD3DX.load(std::memory_order_acquire);
+    if (candidate != current) {
+        if (candidate) {
+            candidate->AddRef();
+        }
+        current = s_pD3DX.exchange(candidate, std::memory_order_acq_rel);
+        if (current) {
+            current->Release();
+        }
+    }
     return candidate != nullptr;
 }
 
@@ -312,7 +305,9 @@ void DX7InterfaceHook::ShutdownImGui()
     s_FrameCallback.store(nullptr, std::memory_order_release);
     s_OriginalEndScene.store(nullptr, std::memory_order_release);
     s_HookedDevice.store(nullptr, std::memory_order_release);
-    s_pD3DX.store(nullptr, std::memory_order_release);
+    if (auto* d3dx = s_pD3DX.exchange(nullptr, std::memory_order_acq_rel)) {
+        d3dx->Release();
+    }
 }
 
 // Static member definitions
