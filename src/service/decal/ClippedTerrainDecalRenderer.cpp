@@ -952,7 +952,7 @@ namespace TerrainDecal
     DrawResult ClippedTerrainDecalRenderer::Draw(const DrawRequest& request)
     {
         const bool debugOverridesActive = !overlayUvWindows_.empty();
-        const bool shadowRecovery = request.mode == DrawMode::ShadowRecovery;
+        const bool shadowRecovery = request.mode != DrawMode::Normal;
 
         if (!options_.enableClippedRendering) {
             LOG_WARN("TerrainDecalRenderer: falling through to vanilla because clipped rendering is disabled");
@@ -1034,8 +1034,6 @@ namespace TerrainDecal
                      effectiveClipV);
         }
         if (!forceCustomDraw && !effectiveClipU && !effectiveClipV && !hasUvOverride && !hasModifiers) {
-            LOG_WARN("TerrainDecalRenderer: overlay {} falling through because no clip or override path is active",
-                     overlayId);
             return DrawResult::FallThroughToVanilla;
         }
 
@@ -1111,7 +1109,8 @@ namespace TerrainDecal
             return DrawResult::Handled;
         }
 
-        std::vector<PackedTerrainVertex> outputVertices;
+        thread_local std::vector<PackedTerrainVertex> outputVertices;
+        outputVertices.clear();
         bool loadedAnyTerrainCells = false;
         ClipDebugSample clipDebugSample{};
         const int cellCount = std::max(0, drawRect.xEnd - drawRect.xStart) *
@@ -1233,7 +1232,7 @@ namespace TerrainDecal
 
         float originalOpacity = 1.0f;
         bool opacityScaled = false;
-        if (shadowRecovery && request.overlaySlotBase) {
+        if (request.mode == DrawMode::ShadowRecovery && request.overlaySlotBase) {
             originalOpacity = ReadOverlaySlotOpacity(request.overlaySlotBase);
             if (std::isfinite(originalOpacity)) {
                 const float opacityScale = std::clamp(options_.shadowRecoveryOpacityScale, 0.0f, 1.0f);

@@ -57,71 +57,6 @@ namespace {
         return true;
     }
 
-    struct Dx7ImGuiStateRestore {
-        IDirect3DDevice7* device;
-        bool hasStage0Coord;
-        bool hasStage0Transform;
-        bool hasStage1Coord;
-        bool hasStage1Transform;
-        bool hasAlphaTestEnable;
-        DWORD stage0Coord;
-        DWORD stage0Transform;
-        DWORD stage1Coord;
-        DWORD stage1Transform;
-        DWORD alphaTestEnable;
-
-        explicit Dx7ImGuiStateRestore(IDirect3DDevice7* deviceIn)
-            : device(deviceIn)
-              , hasStage0Coord(false)
-              , hasStage0Transform(false)
-              , hasStage1Coord(false)
-              , hasStage1Transform(false)
-              , hasAlphaTestEnable(false)
-              , stage0Coord(0)
-              , stage0Transform(0)
-              , stage1Coord(0)
-              , stage1Transform(0)
-              , alphaTestEnable(0) {
-            if (!device) {
-                return;
-            }
-            hasStage0Coord = SUCCEEDED(device->GetTextureStageState(
-                0, D3DTSS_TEXCOORDINDEX, &stage0Coord));
-            hasStage0Transform = SUCCEEDED(device->GetTextureStageState(
-                0, D3DTSS_TEXTURETRANSFORMFLAGS, &stage0Transform));
-            hasStage1Coord = SUCCEEDED(device->GetTextureStageState(
-                1, D3DTSS_TEXCOORDINDEX, &stage1Coord));
-            hasStage1Transform = SUCCEEDED(device->GetTextureStageState(
-                1, D3DTSS_TEXTURETRANSFORMFLAGS, &stage1Transform));
-            hasAlphaTestEnable = SUCCEEDED(
-                device->GetRenderState(D3DRENDERSTATE_ALPHATESTENABLE,
-                    &alphaTestEnable));
-        }
-
-        ~Dx7ImGuiStateRestore() {
-            if (!device) {
-                return;
-            }
-            if (hasStage0Coord) {
-                device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, stage0Coord);
-            }
-            if (hasStage0Transform) {
-                device->SetTextureStageState(
-                    0, D3DTSS_TEXTURETRANSFORMFLAGS, stage0Transform);
-            }
-            if (hasStage1Coord) {
-                device->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, stage1Coord);
-            }
-            if (hasStage1Transform) {
-                device->SetTextureStageState(
-                    1, D3DTSS_TEXTURETRANSFORMFLAGS, stage1Transform);
-            }
-            if (hasAlphaTestEnable) {
-                device->SetRenderState(
-                    D3DRENDERSTATE_ALPHATESTENABLE, alphaTestEnable);
-            }
-        }
-    };
 }
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -489,7 +424,6 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
     }
 
     if (deviceLost_) {
-        d3dx->RestoreSurfaces();
         if (!OnDeviceRestored_()) {
             return;
         }
@@ -564,17 +498,6 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
         }
     }
 
-    // Preserve game render state that we override for ImGui's draw pass.
-    Dx7ImGuiStateRestore stateRestore(device);
-
-    // Reset texture coordinate generation/transform state that can be left
-    // dirty by the game and cause garbled font sampling by the ImGui backend.
-    device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
-    device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-    device->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 0);
-    device->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-    device->SetRenderState(D3DRENDERSTATE_ALPHATESTENABLE, FALSE);
-
     ImGui::EndFrame();
     ImGui::Render();
 
@@ -596,7 +519,9 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
 
 bool ImGuiService::EnsureInitialized_() {
     if (imguiInitialized_) {
-        return true;
+        cIGZGraphicSystem2Ptr pGS2;
+        cIGZGDriver* const pDriver = pGS2 ? pGS2->GetGDriver() : nullptr;
+        return pDriver && DX7InterfaceHook::CaptureInterface(pDriver) && IsDeviceReady();
     }
 
     cIGZGraphicSystem2Ptr pGS2;
