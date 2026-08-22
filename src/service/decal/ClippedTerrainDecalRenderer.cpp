@@ -1034,8 +1034,6 @@ namespace TerrainDecal
                      effectiveClipV);
         }
         if (!forceCustomDraw && !effectiveClipU && !effectiveClipV && !hasUvOverride && !hasModifiers) {
-            LOG_WARN("TerrainDecalRenderer: overlay {} falling through because no clip or override path is active",
-                     overlayId);
             return DrawResult::FallThroughToVanilla;
         }
 
@@ -1111,7 +1109,8 @@ namespace TerrainDecal
             return DrawResult::Handled;
         }
 
-        std::vector<PackedTerrainVertex> outputVertices;
+        thread_local std::vector<PackedTerrainVertex> outputVertices;
+        outputVertices.clear();
         bool loadedAnyTerrainCells = false;
         ClipDebugSample clipDebugSample{};
         const int cellCount = std::max(0, drawRect.xEnd - drawRect.xStart) *
