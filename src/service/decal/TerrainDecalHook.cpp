@@ -509,15 +509,18 @@ namespace TerrainDecal
     {
         auto* const d3dx = DX7InterfaceHook::GetD3DXInterface();
         IDirect3DDevice7* const device = d3dx ? d3dx->GetD3DDevice() : nullptr;
-        if (!device) {
+        IDirectDrawSurface7* const gameDepth = d3dx ? d3dx->GetZBuffer() : nullptr;
+        if (!device || !gameDepth) {
             return false;
         }
 
         IDirectDrawSurface7* originalTarget = nullptr;
         DWORD stateBlock = 0;
         DWORD replayStateBlock = 0;
+        D3DVIEWPORT7 viewport{};
         if (FAILED(device->GetRenderTarget(&originalTarget)) || !originalTarget ||
             FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)) ||
+            FAILED(device->GetViewport(&viewport)) ||
             !EnsureRecoveryTarget_(device, originalTarget)) {
             if (stateBlock) device->DeleteStateBlock(stateBlock);
             if (originalTarget) originalTarget->Release();
@@ -528,9 +531,15 @@ namespace TerrainDecal
         bool captureStarted = false;
         bool success = false;
         do {
+            // Preserve scene occlusion in the private target. Drivers that cannot
+            // copy their Z surface fall back to the direct replay path below.
+            if (FAILED(recoveryDepth_->Blt(nullptr, gameDepth, nullptr, DDBLT_WAIT, nullptr))) break;
             if (FAILED(device->SetRenderTarget(recoveryTarget_, 0))) break;
             targetChanged = true;
-            if (FAILED(device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000, 1.0f, 0))) break;
+            // SetRenderTarget may reset the device viewport while SC4's draw-context
+            // cache still believes the city viewport is active.
+            if (FAILED(device->SetViewport(&viewport))) break;
+            if (FAILED(device->Clear(0, nullptr, D3DCLEAR_TARGET, 0x00000000, 1.0f, 0))) break;
 
             currentTexTransformValid_ = false;
             currentTexTransformStage_ = -1;
@@ -543,13 +552,11 @@ namespace TerrainDecal
                                                                          decalIds);
             shadowRecoveryCaptureActive_ = false;
             shadowRecoveryActive_ = false;
-            device->CreateStateBlock(D3DSBT_ALL, &replayStateBlock);
+            if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &replayStateBlock))) break;
 
             if (FAILED(device->SetRenderTarget(originalTarget, 0))) break;
             targetChanged = false;
-
-            D3DVIEWPORT7 viewport{};
-            if (FAILED(device->GetViewport(&viewport))) break;
+            if (FAILED(device->SetViewport(&viewport))) break;
 
             struct CompositeVertex { float x, y, z, rhw; DWORD color; float u, v; };
             const float left = static_cast<float>(viewport.dwX) - 0.5f;
@@ -560,8 +567,8 @@ namespace TerrainDecal
             const float v0 = static_cast<float>(viewport.dwY) / static_cast<float>(recoveryHeight_);
             const float u1 = static_cast<float>(viewport.dwX + viewport.dwWidth) / static_cast<float>(recoveryWidth_);
             const float v1 = static_cast<float>(viewport.dwY + viewport.dwHeight) / static_cast<float>(recoveryHeight_);
-            const DWORD color = D3DRGBA(1.0f, 1.0f, 1.0f,
-                                        std::clamp(options_.shadowRecoveryOpacityScale, 0.0f, 1.0f));
+            const float opacity = std::clamp(options_.shadowRecoveryOpacityScale, 0.0f, 1.0f);
+            const DWORD color = D3DRGBA(opacity, opacity, opacity, opacity);
             const CompositeVertex vertices[] = {
                 {left, top, 0.0f, 1.0f, color, u0, v0},
                 {right, top, 0.0f, 1.0f, color, u1, v0},
@@ -569,23 +576,38 @@ namespace TerrainDecal
                 {right, bottom, 0.0f, 1.0f, color, u1, v1},
             };
 
-            device->SetRenderState(D3DRENDERSTATE_ZENABLE, FALSE);
-            device->SetRenderState(D3DRENDERSTATE_ZWRITEENABLE, FALSE);
-            device->SetRenderState(D3DRENDERSTATE_LIGHTING, FALSE);
-            device->SetRenderState(D3DRENDERSTATE_ALPHATESTENABLE, FALSE);
-            device->SetRenderState(D3DRENDERSTATE_ALPHABLENDENABLE, TRUE);
-            device->SetRenderState(D3DRENDERSTATE_SRCBLEND, D3DBLEND_SRCALPHA);
-            device->SetRenderState(D3DRENDERSTATE_DESTBLEND, D3DBLEND_INVSRCALPHA);
-            device->SetRenderState(D3DRENDERSTATE_CULLMODE, D3DCULL_NONE);
-            device->SetTexture(0, recoveryTarget_);
-            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-            device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
-            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-            device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
-            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-            device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+            // The capture is already alpha-blended into transparent black, so its
+            // RGB is premultiplied. Scale RGB and alpha together and do not apply
+            // source alpha a second time.
+            const bool stateReady =
+                SUCCEEDED(device->SetRenderState(D3DRENDERSTATE_ZENABLE, FALSE)) &&
+                SUCCEEDED(device->SetRenderState(D3DRENDERSTATE_ZWRITEENABLE, FALSE)) &&
+                SUCCEEDED(device->SetRenderState(D3DRENDERSTATE_LIGHTING, FALSE)) &&
+                SUCCEEDED(device->SetRenderState(D3DRENDERSTATE_FOGENABLE, FALSE)) &&
+                SUCCEEDED(device->SetRenderState(D3DRENDERSTATE_ALPHATESTENABLE, FALSE)) &&
+                SUCCEEDED(device->SetRenderState(D3DRENDERSTATE_ALPHABLENDENABLE, TRUE)) &&
+                SUCCEEDED(device->SetRenderState(D3DRENDERSTATE_SRCBLEND, D3DBLEND_ONE)) &&
+                SUCCEEDED(device->SetRenderState(D3DRENDERSTATE_DESTBLEND, D3DBLEND_INVSRCALPHA)) &&
+                SUCCEEDED(device->SetRenderState(D3DRENDERSTATE_CULLMODE, D3DCULL_NONE)) &&
+                SUCCEEDED(device->SetTexture(0, recoveryTarget_)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_MINFILTER, D3DTFN_LINEAR)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_MAGFILTER, D3DTFG_LINEAR)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_MIPFILTER, D3DTFP_POINT)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0)) &&
+                SUCCEEDED(device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE)) &&
+                SUCCEEDED(device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE)) &&
+                SUCCEEDED(device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE)) &&
+                SUCCEEDED(device->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 0)) &&
+                SUCCEEDED(device->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE));
+            if (!stateReady) break;
             success = SUCCEEDED(device->DrawPrimitive(D3DPT_TRIANGLESTRIP,
                                                        D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1,
                                                        const_cast<CompositeVertex*>(vertices),
@@ -597,8 +619,14 @@ namespace TerrainDecal
         shadowRecoveryActive_ = false;
         if (targetChanged) {
             device->SetRenderTarget(originalTarget, 0);
+            device->SetViewport(&viewport);
         }
-        device->ApplyStateBlock(replayStateBlock ? replayStateBlock : stateBlock);
+        if (replayStateBlock) {
+            device->ApplyStateBlock(replayStateBlock);
+        }
+        else if (!captureStarted) {
+            device->ApplyStateBlock(stateBlock);
+        }
         if (replayStateBlock) device->DeleteStateBlock(replayStateBlock);
         device->DeleteStateBlock(stateBlock);
         originalTarget->Release();
