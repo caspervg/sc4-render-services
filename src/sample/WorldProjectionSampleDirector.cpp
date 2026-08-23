@@ -30,7 +30,7 @@
 #include <limits>
 #include <cstdio>
 
-#include "DX7InterfaceHook.h"
+#include "GraphicsInterfaceHook.h"
 #include "ImGuiService.h"
 
 namespace {

@@ -19,7 +19,7 @@
 #include <cinttypes>
 #include <cstdio>
 
-#include "DX7InterfaceHook.h"
+#include "GraphicsInterfaceHook.h"
 
 namespace {
     constexpr auto kOverlaySampleDirectorID = 0xB4A6E2F1;

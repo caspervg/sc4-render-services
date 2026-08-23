@@ -378,3 +378,8 @@ fonts/
 docs/doxygen/
 dist/*.exe
 imgui.lib
+
+# LLM stuff
+.codex
+.agents
+.claude

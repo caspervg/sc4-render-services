@@ -95,17 +95,20 @@ set(IMGUI_BACKENDS
         ${IMGUI_DIR}/imgui_impl_win32.cpp
         ${IMGUI_DIR}/imgui_impl_dx7.h
         ${IMGUI_DIR}/imgui_impl_dx7.cpp
+        ${SC4RS_ROOT}/vendor/imgui/backends/imgui_impl_dx11.h
+        ${SC4RS_ROOT}/vendor/imgui/backends/imgui_impl_dx11.cpp
 )
 
 add_library(imgui SHARED ${IMGUI_CORE_SOURCES} ${IMGUI_BACKENDS})
 
 target_include_directories(imgui PUBLIC
         ${IMGUI_DIR}
+        ${SC4RS_ROOT}/vendor/imgui/backends
 )
 target_compile_definitions(imgui PRIVATE IMGUI_DLL_EXPORT)
 
 if(WIN32)
-    target_link_libraries(imgui PRIVATE user32 gdi32 ddraw dxguid)
+    target_link_libraries(imgui PRIVATE user32 gdi32 ddraw dxguid d3d11)
 endif()
 
 # Preserve existing link name in this project while using the vendor CMake target.
@@ -168,7 +171,8 @@ set(CUSTOM_SERVICES_SOURCES
         ${SC4RS_ROOT}/src/utils/VersionDetection.cpp
         ${SC4RS_ROOT}/src/utils/Logger.cpp
         ${SC4RS_ROOT}/src/utils/Settings.cpp
-        ${SC4RS_ROOT}/src/DX7InterfaceHook.cpp
+        ${SC4RS_ROOT}/src/GraphicsInterfaceHook.cpp
+        ${SC4RS_ROOT}/src/SCGLDX11Hook.cpp
 )
 
 add_library(SC4RenderServices SHARED
@@ -323,7 +327,7 @@ set_target_properties(SC4ImGuiTextureSample PROPERTIES
 # World Projection sample DLL
 set(WORLD_PROJECTION_SAMPLE_SOURCES
         ${SC4RS_ROOT}/src/sample/WorldProjectionSampleDirector.cpp
-        ${SC4RS_ROOT}/src/DX7InterfaceHook.cpp
+        ${SC4RS_ROOT}/src/GraphicsInterfaceHook.cpp
         ${SC4RS_ROOT}/src/utils/Logger.cpp
 )
 
@@ -525,6 +529,32 @@ set_target_properties(SC4CameraViewInputSample PROPERTIES
 )
 
 
+# Smooth Scroll sample DLL (standalone; Steam/Digital Deluxe 1.1.641 only)
+set(SMOOTH_SCROLL_SAMPLE_SOURCES
+        ${SC4RS_ROOT}/src/sample/SmoothScrollSampleDirector.cpp
+        ${SC4RS_ROOT}/src/utils/Logger.cpp
+        ${SC4RS_ROOT}/src/utils/VersionDetection.cpp
+)
+
+add_library(SC4SmoothScrollSample SHARED ${SMOOTH_SCROLL_SAMPLE_SOURCES} ${SC4_COMMON_DIRECTOR_DEF})
+
+target_include_directories(SC4SmoothScrollSample PRIVATE
+        ${SC4RS_ROOT}/src
+)
+
+target_link_libraries(SC4SmoothScrollSample PRIVATE
+        gzcom2
+        spdlog
+        Version
+)
+
+set_target_properties(SC4SmoothScrollSample PROPERTIES
+        OUTPUT_NAME "SC4SmoothScrollSample"
+        SUFFIX ".dll"
+        PREFIX ""
+)
+
+
 # Date Jumper sample DLL (Ctrl+F9 to fast-forward to the next seasonal date)
 set(DATE_JUMPER_SAMPLE_SOURCES
         ${SC4RS_ROOT}/src/sample/date-jumper/DateJumperDirector.cpp
@@ -550,7 +580,7 @@ set_target_properties(SC4DateJumperSample PROPERTIES
 
 
 add_custom_target(SC4RenderServicesAllTargets
-        DEPENDS imgui SC4RenderServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample SC4RoadDecalSample SC4TerrainDecalSample SC4CameraViewInputSample SC4DateJumperSample
+        DEPENDS imgui SC4RenderServices SC4ImGuiSample SC4ImGuiSampleCity SC4ImGuiSampleDemo SC4ImGuiTextureSample SC4WorldProjectionSample SC4S3DCameraDebugSample SC4OverlayManagerSample SC4DrawServiceSample SC4RoadDecalSample SC4TerrainDecalSample SC4CameraViewInputSample SC4SmoothScrollSample SC4DateJumperSample
 )
 
 # Automatic deployment to SC4 directories
@@ -672,6 +702,15 @@ if(WIN32 AND NOT DEFINED ENV{CI})
                 COMMENT "Deploying SC4CameraViewInputSample.dll to Plugins folder"
         )
 
+        add_custom_command(TARGET SC4SmoothScrollSample POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${SC4_PLUGINS_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:SC4SmoothScrollSample>
+                "${SC4RS_ROOT}/src/sample/SC4SmoothScroll.ini"
+                "${SC4_PLUGINS_DIR}/"
+                COMMENT "Deploying SC4SmoothScrollSample.dll and settings to Plugins folder"
+        )
+
         add_custom_command(TARGET SC4DateJumperSample POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${SC4_PLUGINS_DIR}"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -692,6 +731,7 @@ if(WIN32 AND NOT DEFINED ENV{CI})
         message(STATUS "  - SC4RoadDecalSample.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4TerrainDecalSample.dll -> ${SC4_PLUGINS_DIR}/")
         message(STATUS "  - SC4CameraViewInputSample.dll -> ${SC4_PLUGINS_DIR}/")
+        message(STATUS "  - SC4SmoothScrollSample.dll -> ${SC4_PLUGINS_DIR}/")
     else()
         message(WARNING "SC4 installation not found. Manual deployment required.")
     endif()

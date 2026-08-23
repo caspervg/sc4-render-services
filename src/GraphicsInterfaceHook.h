@@ -2,6 +2,7 @@
 #include <atomic>
 #include <string>
 #include <Windows.h>
+#include <d3d11.h>
 #include "cIGZGDriver.h"
 #include "cISGLDX7D3DX.h"
 
@@ -15,13 +16,15 @@ struct ImGuiInitSettings
     float uiScale = 1.0f;
 };
 
-class DX7InterfaceHook
+class GraphicsInterfaceHook
 {
 public:
     using FrameCallback = void (*)(IDirect3DDevice7* device);
 
     static bool CaptureInterface(cIGZGDriver* pDriver);
     static bool InitializeImGui(HWND hwnd, const ImGuiInitSettings& settings = {});
+    static bool InitializeImGuiD3D11(HWND hwnd, ID3D11Device* device, ID3D11DeviceContext* context,
+                                     const ImGuiInitSettings& settings = {});
     static bool InstallSceneHooks();
     static void SetFrameCallback(FrameCallback callback);
     static void ShutdownImGui();

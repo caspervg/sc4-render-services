@@ -10,3 +10,6 @@
 [submodule "vendor/mINI"]
 	path = vendor/mINI
 	url = https://github.com/metayeti/mINI.git
+[submodule "vendor/imgui"]
+	path = vendor/imgui
+	url = https://github.com/ocornut/imgui.git

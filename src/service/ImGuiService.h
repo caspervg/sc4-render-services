@@ -13,7 +13,8 @@
 #include <Windows.h>
 
 #include "cRZBaseSystemService.h"
-#include "DX7InterfaceHook.h"
+#include "GraphicsInterfaceHook.h"
+#include "SCGLD3D11Service.h"
 #include "public/cIGZImGuiService.h"
 
 // Forward declaration
@@ -57,6 +58,9 @@ public:
     bool RegisterFont(uint32_t fontId, const void* compressedFontData, int compressedFontDataSize, float sizePixels) override;
     bool UnregisterFont(uint32_t fontId) override;
     [[nodiscard]] void* GetFont(uint32_t fontId) const override;
+    bool AcquireD3D11Interfaces(ID3D11Device** outDevice, ID3D11DeviceContext** outContext,
+                                IDXGISwapChain** outSwapChain,
+                                ID3D11RenderTargetView** outRenderTarget) override;
 
     template <typename Fn>
     bool QueueRenderLambda(Fn&& fn) {
@@ -97,6 +101,7 @@ private:
         uint32_t creationGeneration;
         std::vector<uint8_t> sourceData;       // RGBA32 pixel data for recreation
         IDirectDrawSurface7* surface;          // Can be nullptr if device lost
+        ID3D11ShaderResourceView* d3d11View;
         bool needsRecreation;
         bool pendingDestroy;
         bool useSystemMemory;
@@ -107,6 +112,7 @@ private:
             , height(0)
             , creationGeneration(0)
             , surface(nullptr)
+            , d3d11View(nullptr)
             , needsRecreation(false)
             , pendingDestroy(false)
             , useSystemMemory(false) {}
@@ -130,7 +136,10 @@ private:
     }
 
     static void RenderFrameThunk_(IDirect3DDevice7* device);
+    static void RenderFrameD3D11Thunk_(SCGLD3D11FrameContext const* frame);
     void RenderFrame_(IDirect3DDevice7* device);
+    void RenderFrameD3D11_(SCGLD3D11FrameContext const* frame);
+    void RenderFrameContents_();
     bool EnsureInitialized_();
     void InitializePanels_();
     void ProcessPendingFontRegistrations_();
@@ -143,6 +152,7 @@ private:
     // Texture management helpers
     bool RebuildFontAtlas_();
     bool CreateSurfaceForTexture_(ManagedTexture& tex);
+    bool CreateD3D11Texture_(ManagedTexture& tex);
     void OnDeviceLost_();
     bool OnDeviceRestored_();
     void InvalidateAllTextures_();
@@ -176,4 +186,10 @@ private:
     std::atomic<bool> deviceLost_;
     std::atomic<uint32_t> deviceGeneration_;
     uint32_t nextTextureId_;
+    enum class GraphicsBackend { None, DX7, D3D11 } backend_{GraphicsBackend::None};
+    ID3D11Device* d3d11Device_{};
+    ID3D11DeviceContext* d3d11Context_{};
+    IDXGISwapChain* d3d11SwapChain_{};
+    ID3D11RenderTargetView* d3d11RenderTarget_{};
+    bool d3d11BackendInitialized_{};
 };

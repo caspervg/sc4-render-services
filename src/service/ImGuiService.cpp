@@ -12,11 +12,13 @@
 #include "cIGZGraphicSystem2.h"
 #include "cRZAutoRefCount.h"
 #include "cRZCOMDllDirector.h"
-#include "DX7InterfaceHook.h"
+#include "GraphicsInterfaceHook.h"
 #include "GZServPtrs.h"
 #include "imgui_impl_dx7.h"
+#include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "public/ImGuiServiceIds.h"
+#include "SCGLDX11Hook.h"
 #include "utils/Logger.h"
 #include "utils/VersionDetection.h"
 
@@ -173,20 +175,41 @@ bool ImGuiService::Shutdown() {
                 texture.surface->Release();
                 texture.surface = nullptr;
             }
+            if (texture.d3d11View) {
+                texture.d3d11View->Release();
+                texture.d3d11View = nullptr;
+            }
         }
         textures_.clear();
         pendingTextureReleaseIds_.clear();
     }
 
     RemoveWndProcHook_();
-    DX7InterfaceHook::SetFrameCallback(nullptr);
-    DX7InterfaceHook::ShutdownImGui();
+    if (backend_ == GraphicsBackend::D3D11) {
+        SCGLDX11Hook::SetFrameCallback(nullptr);
+        SCGLDX11Hook::Shutdown();
+        if (d3d11BackendInitialized_) ImGui_ImplDX11_Shutdown();
+        if (ImGui::GetCurrentContext()) {
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
+        }
+        if (d3d11Device_) d3d11Device_->Release();
+        d3d11Device_ = nullptr;
+        d3d11Context_ = nullptr;
+        d3d11SwapChain_ = nullptr;
+        d3d11RenderTarget_ = nullptr;
+        d3d11BackendInitialized_ = false;
+    } else {
+        GraphicsInterfaceHook::SetFrameCallback(nullptr);
+        GraphicsInterfaceHook::ShutdownImGui();
+    }
 
     imguiInitialized_ = false;
     hookInstalled_ = false;
     deviceLost_ = false;
     lastKnownDevice_ = nullptr;
     lastKnownDDraw_ = nullptr;
+    backend_ = GraphicsBackend::None;
     g_renderThreadId.store(0, std::memory_order_release);
     deviceGeneration_.fetch_add(1, std::memory_order_release);
     SetServiceRunning(false);
@@ -320,7 +343,7 @@ bool ImGuiService::AcquireD3DInterfaces(IDirect3DDevice7** outD3D, IDirectDraw7*
         return false;
     }
 
-    auto* d3dx = DX7InterfaceHook::GetD3DXInterface();
+    auto* d3dx = GraphicsInterfaceHook::GetD3DXInterface();
     if (!d3dx) {
         return false;
     }
@@ -338,11 +361,36 @@ bool ImGuiService::AcquireD3DInterfaces(IDirect3DDevice7** outD3D, IDirectDraw7*
     return true;
 }
 
+bool ImGuiService::AcquireD3D11Interfaces(ID3D11Device** outDevice,
+                                           ID3D11DeviceContext** outContext,
+                                           IDXGISwapChain** outSwapChain,
+                                           ID3D11RenderTargetView** outRenderTarget) {
+    if (!outDevice || !outContext || !outSwapChain || !outRenderTarget) return false;
+    *outDevice = nullptr;
+    *outContext = nullptr;
+    *outSwapChain = nullptr;
+    *outRenderTarget = nullptr;
+    if (!IsRenderThreadCallAllowed_("ImGuiService::AcquireD3D11Interfaces", false) ||
+        backend_ != GraphicsBackend::D3D11 || !d3d11Device_ || !d3d11Context_ ||
+        !d3d11SwapChain_ || !d3d11RenderTarget_) return false;
+
+    d3d11Device_->AddRef();
+    d3d11Context_->AddRef();
+    d3d11SwapChain_->AddRef();
+    d3d11RenderTarget_->AddRef();
+    *outDevice = d3d11Device_;
+    *outContext = d3d11Context_;
+    *outSwapChain = d3d11SwapChain_;
+    *outRenderTarget = d3d11RenderTarget_;
+    return true;
+}
+
 bool ImGuiService::IsDeviceReady() const {
     if (!imguiInitialized_) {
         return false;
     }
-    auto* d3dx = DX7InterfaceHook::GetD3DXInterface();
+    if (backend_ == GraphicsBackend::D3D11) return d3d11BackendInitialized_ && d3d11Device_;
+    auto* d3dx = GraphicsInterfaceHook::GetD3DXInterface();
     return d3dx && d3dx->GetD3DDevice() && d3dx->GetDD();
 }
 
@@ -355,6 +403,103 @@ void ImGuiService::RenderFrameThunk_(IDirect3DDevice7* device) {
     if (instance) {
         instance->RenderFrame_(device);
     }
+}
+
+void ImGuiService::RenderFrameD3D11Thunk_(SCGLD3D11FrameContext const* frame) {
+    auto* instance = g_instance.load(std::memory_order_acquire);
+    if (instance) instance->RenderFrameD3D11_(frame);
+}
+
+void ImGuiService::RenderFrameD3D11_(SCGLD3D11FrameContext const* frame) {
+    if (!initialized_ || frame == nullptr || frame->structSize < sizeof(*frame) || frame->apiVersion != 1) return;
+    if (frame->event == SCGL_D3D11_EVENT_BEFORE_DEVICE_DESTROY) {
+        if (backend_ == GraphicsBackend::D3D11 && d3d11BackendInitialized_) {
+            OnDeviceLost_();
+            ImGui_ImplDX11_Shutdown();
+            d3d11BackendInitialized_ = false;
+            imguiInitialized_ = false;
+        }
+        if (d3d11Device_) d3d11Device_->Release();
+        d3d11Device_ = nullptr;
+        d3d11Context_ = nullptr;
+        d3d11SwapChain_ = nullptr;
+        d3d11RenderTarget_ = nullptr;
+        return;
+    }
+    if (frame->event != SCGL_D3D11_EVENT_RENDER || !frame->device || !frame->context || !frame->window) return;
+
+    DWORD const threadId = GetCurrentThreadId();
+    g_renderThreadId.store(threadId, std::memory_order_release);
+    backend_ = GraphicsBackend::D3D11;
+    if (!d3d11BackendInitialized_) {
+        bool const firstInitialization = ImGui::GetCurrentContext() == nullptr;
+        bool initialized = firstInitialization
+            ? GraphicsInterfaceHook::InitializeImGuiD3D11(frame->window, frame->device, frame->context, initSettings_)
+            : ImGui_ImplDX11_Init(frame->device, frame->context);
+        if (!initialized) {
+            LOG_ERROR("ImGuiService: failed to initialize the official ImGui DX11 backend");
+            return;
+        }
+        d3d11BackendInitialized_ = true;
+        imguiInitialized_ = true;
+        if (d3d11Device_ != frame->device) {
+            if (d3d11Device_) d3d11Device_->Release();
+            d3d11Device_ = frame->device;
+            d3d11Device_->AddRef();
+        }
+        if (firstInitialization && !InstallWndProcHook_(frame->window)) {
+            LOG_WARN("ImGuiService: failed to install WndProc hook for DX11");
+        }
+        if (deviceLost_) OnDeviceRestored_();
+        deviceGeneration_.store(frame->deviceGeneration, std::memory_order_release);
+        LOG_INFO("ImGuiService: ImGui DX11 backend ready (generation={})", frame->deviceGeneration);
+    }
+
+    d3d11Context_ = frame->context;
+    d3d11SwapChain_ = frame->swapChain;
+    d3d11RenderTarget_ = frame->renderTargetView;
+    ProcessPendingTextureReleases_();
+    InitializePanels_();
+    ProcessPendingFontRegistrations_();
+    ImGui_ImplWin32_NewFrame();
+    ImGui_ImplDX11_NewFrame();
+    ImGui::NewFrame();
+    RenderFrameContents_();
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    d3d11Context_ = nullptr;
+    d3d11SwapChain_ = nullptr;
+    d3d11RenderTarget_ = nullptr;
+}
+
+void ImGuiService::RenderFrameContents_() {
+    std::vector<ImGuiPanelDesc> panelsToUpdate;
+    std::vector<ImGuiPanelDesc> panelsToRender;
+    {
+        std::lock_guard panelLock(panelsMutex_);
+        for (auto const& panel : panels_) {
+            if (!panel.desc.visible) continue;
+            if (panel.desc.on_update) panelsToUpdate.push_back(panel.desc);
+            if (panel.desc.on_render) panelsToRender.push_back(panel.desc);
+        }
+    }
+    for (auto const& desc : panelsToUpdate) desc.on_update(desc.data);
+    for (auto const& desc : panelsToRender) {
+        ImFont* font = desc.fontId == 0 ? nullptr : static_cast<ImFont*>(GetFont(desc.fontId));
+        if (font) ImGui::PushFont(font, 0.0f);
+        desc.on_render(desc.data);
+        if (font) ImGui::PopFont();
+    }
+    std::vector<RenderQueueItem> renderQueue;
+    {
+        std::lock_guard queueLock(renderQueueMutex_);
+        renderQueue.swap(renderQueue_);
+    }
+    for (auto& item : renderQueue) {
+        item.callback(item.data);
+        if (item.cleanup) item.cleanup(item.data);
+    }
+    ImGui::EndFrame();
+    ImGui::Render();
 }
 
 void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
@@ -381,7 +526,7 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
         }
     }
 
-    auto* d3dx = DX7InterfaceHook::GetD3DXInterface();
+    auto* d3dx = GraphicsInterfaceHook::GetD3DXInterface();
     if (!d3dx || device != d3dx->GetD3DDevice()) {
         return;
     }
@@ -420,7 +565,7 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
             return;
         }
 
-        DX7InterfaceHook::InstallSceneHooks();
+        GraphicsInterfaceHook::InstallSceneHooks();
     }
 
     if (deviceLost_) {
@@ -518,12 +663,6 @@ void ImGuiService::RenderFrame_(IDirect3DDevice7* device) {
 }
 
 bool ImGuiService::EnsureInitialized_() {
-    if (imguiInitialized_) {
-        cIGZGraphicSystem2Ptr pGS2;
-        cIGZGDriver* const pDriver = pGS2 ? pGS2->GetGDriver() : nullptr;
-        return pDriver && DX7InterfaceHook::CaptureInterface(pDriver) && IsDeviceReady();
-    }
-
     cIGZGraphicSystem2Ptr pGS2;
     if (!pGS2) {
         return false;
@@ -538,6 +677,20 @@ bool ImGuiService::EnsureInitialized_() {
         return false;
     }
 
+    if (pDriver->GetGZCLSID() == 0xc4554841) {
+        backend_ = GraphicsBackend::D3D11;
+        SCGLDX11Hook::SetFrameCallback(&ImGuiService::RenderFrameD3D11Thunk_);
+        if (!SCGLDX11Hook::CaptureInterface(pDriver)) {
+            if (!warnedNoDriver_) LOG_WARN("ImGuiService: SCGL D3D11 frame service is not ready");
+            warnedNoDriver_ = true;
+            return false;
+        }
+        warnedNoDriver_ = false;
+        return imguiInitialized_;
+    }
+
+    if (imguiInitialized_) return GraphicsInterfaceHook::CaptureInterface(pDriver) && IsDeviceReady();
+
     if (pDriver->GetGZCLSID() != kSCGDriverDirectX) {
         if (!warnedNoDriver_) {
             LOG_WARN("ImGuiService: not a DirectX driver, skipping initialization");
@@ -546,11 +699,11 @@ bool ImGuiService::EnsureInitialized_() {
         return false;
     }
 
-    if (!DX7InterfaceHook::CaptureInterface(pDriver)) {
+    if (!GraphicsInterfaceHook::CaptureInterface(pDriver)) {
         LOG_ERROR("ImGuiService: failed to capture D3DX interface");
         return false;
     }
-    auto* d3dx = DX7InterfaceHook::GetD3DXInterface();
+    auto* d3dx = GraphicsInterfaceHook::GetD3DXInterface();
     if (!d3dx || !d3dx->GetD3DDevice() || !d3dx->GetDD()) {
         LOG_WARN("ImGuiService: D3DX interface not ready yet (d3dx={}, d3d={}, dd={})",
                  static_cast<void*>(d3dx),
@@ -576,7 +729,7 @@ bool ImGuiService::EnsureInitialized_() {
         return false;
     }
 
-    if (!DX7InterfaceHook::InitializeImGui(hwnd, initSettings_)) {
+    if (!GraphicsInterfaceHook::InitializeImGui(hwnd, initSettings_)) {
         LOG_ERROR("ImGuiService: failed to initialize ImGui backends");
         return false;
     }
@@ -589,8 +742,8 @@ bool ImGuiService::EnsureInitialized_() {
     if (!InstallWndProcHook_(hwnd)) {
         LOG_WARN("ImGuiService: failed to install WndProc hook");
     }
-    DX7InterfaceHook::SetFrameCallback(&ImGuiService::RenderFrameThunk_);
-    DX7InterfaceHook::InstallSceneHooks();
+    GraphicsInterfaceHook::SetFrameCallback(&ImGuiService::RenderFrameThunk_);
+    GraphicsInterfaceHook::InstallSceneHooks();
     LOG_INFO("ImGuiService: ImGui initialized and scene hooks installed");
     return true;
 }
@@ -806,12 +959,14 @@ void* ImGuiService::GetTextureID(const ImGuiTextureHandle handle) {
     }
 
     // Recreate surface if needed
-    if (tex.needsRecreation || !tex.surface) {
+    if (tex.needsRecreation || (backend_ == GraphicsBackend::D3D11 ? !tex.d3d11View : !tex.surface)) {
         if (!CreateSurfaceForTexture_(tex)) {
             LOG_WARN("ImGuiService::GetTextureID: failed to recreate surface (id={})", tex.id);
             return nullptr;
         }
     }
+
+    if (backend_ == GraphicsBackend::D3D11) return static_cast<void*>(tex.d3d11View);
 
     // Validate surface is not lost
     // IsLost() returns DD_OK (S_OK) if surface is valid, DDERR_SURFACELOST if lost; other return values
@@ -889,6 +1044,10 @@ void ImGuiService::ProcessPendingTextureReleases_() {
         if (it->second.surface) {
             it->second.surface->Release();
             it->second.surface = nullptr;
+        }
+        if (it->second.d3d11View) {
+            it->second.d3d11View->Release();
+            it->second.d3d11View = nullptr;
         }
         textures_.erase(it);
         LOG_INFO("ImGuiService::ProcessPendingTextureReleases_: released texture (id={})", textureId);
@@ -1110,9 +1269,12 @@ bool ImGuiService::RebuildFontAtlas_() {
         return false;
     }
 
-    ImGui_ImplDX7_InvalidateDeviceObjects();
-    if (!ImGui_ImplDX7_CreateDeviceObjects()) {
-        return false;
+    if (backend_ == GraphicsBackend::D3D11) {
+        ImGui_ImplDX11_InvalidateDeviceObjects();
+        if (!ImGui_ImplDX11_CreateDeviceObjects()) return false;
+    } else {
+        ImGui_ImplDX7_InvalidateDeviceObjects();
+        if (!ImGui_ImplDX7_CreateDeviceObjects()) return false;
     }
 
     LOG_INFO("ImGuiService::RebuildFontAtlas_: rebuilt font atlas texture");
@@ -1120,6 +1282,7 @@ bool ImGuiService::RebuildFontAtlas_() {
 }
 
 bool ImGuiService::CreateSurfaceForTexture_(ManagedTexture& tex) {
+    if (backend_ == GraphicsBackend::D3D11) return CreateD3D11Texture_(tex);
     if (!IsDeviceReady()) {
         return false;
     }
@@ -1232,6 +1395,38 @@ bool ImGuiService::CreateSurfaceForTexture_(ManagedTexture& tex) {
     return true;
 }
 
+bool ImGuiService::CreateD3D11Texture_(ManagedTexture& tex) {
+    if (!d3d11Device_ || tex.sourceData.empty()) return false;
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width = tex.width;
+    description.Height = tex.height;
+    description.MipLevels = 1;
+    description.ArraySize = 1;
+    description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.SampleDesc.Count = 1;
+    description.Usage = D3D11_USAGE_IMMUTABLE;
+    description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA initialData{ tex.sourceData.data(), tex.width * 4, 0 };
+    ID3D11Texture2D* texture = nullptr;
+    HRESULT result = d3d11Device_->CreateTexture2D(&description, &initialData, &texture);
+    if (FAILED(result)) {
+        LOG_ERROR("ImGuiService::CreateD3D11Texture_: CreateTexture2D failed (hr=0x{:08X}, id={})", result, tex.id);
+        return false;
+    }
+    ID3D11ShaderResourceView* view = nullptr;
+    result = d3d11Device_->CreateShaderResourceView(texture, nullptr, &view);
+    texture->Release();
+    if (FAILED(result)) {
+        LOG_ERROR("ImGuiService::CreateD3D11Texture_: CreateShaderResourceView failed (hr=0x{:08X}, id={})", result, tex.id);
+        return false;
+    }
+    if (tex.d3d11View) tex.d3d11View->Release();
+    tex.d3d11View = view;
+    tex.needsRecreation = false;
+    tex.creationGeneration = deviceGeneration_.load(std::memory_order_acquire);
+    return true;
+}
+
 void ImGuiService::OnDeviceLost_() {
     deviceLost_ = true;
 
@@ -1250,7 +1445,8 @@ void ImGuiService::OnDeviceLost_() {
         desc.on_device_lost(desc.data);
     }
 
-    ImGui_ImplDX7_InvalidateDeviceObjects();
+    if (backend_ == GraphicsBackend::D3D11) ImGui_ImplDX11_InvalidateDeviceObjects();
+    else ImGui_ImplDX7_InvalidateDeviceObjects();
 
     InvalidateAllTextures_();
 
@@ -1258,7 +1454,10 @@ void ImGuiService::OnDeviceLost_() {
 }
 
 bool ImGuiService::OnDeviceRestored_() {
-    if (!ImGui_ImplDX7_CreateDeviceObjects()) {
+    bool const created = backend_ == GraphicsBackend::D3D11
+        ? ImGui_ImplDX11_CreateDeviceObjects()
+        : ImGui_ImplDX7_CreateDeviceObjects();
+    if (!created) {
         LOG_WARN("ImGuiService::OnDeviceRestored_: failed to recreate backend device objects");
         return false;
     }
@@ -1292,6 +1491,10 @@ void ImGuiService::InvalidateAllTextures_() {
         if (tex.surface) {
             tex.surface->Release();
             tex.surface = nullptr;
+        }
+        if (tex.d3d11View) {
+            tex.d3d11View->Release();
+            tex.d3d11View = nullptr;
         }
         tex.needsRecreation = true;
     }

@@ -9,7 +9,7 @@
 #include <d3d.h>
 #include <ddraw.h>
 
-#include "DX7InterfaceHook.h"
+#include "GraphicsInterfaceHook.h"
 #include "GZServPtrs.h"
 #include "cISC4App.h"
 #include "cISC4City.h"
@@ -427,7 +427,7 @@ namespace TerrainDecal
         }
 
         ReleaseRecoveryTarget_();
-        auto* const d3dx = DX7InterfaceHook::GetD3DXInterface();
+        auto* const d3dx = GraphicsInterfaceHook::GetD3DXInterface();
         IDirectDraw7* const dd = d3dx ? d3dx->GetDD() : nullptr;
         IDirectDrawSurface7* const gameDepth = d3dx ? d3dx->GetZBuffer() : nullptr;
         if (!dd || !gameDepth) {
@@ -507,7 +507,7 @@ namespace TerrainDecal
                                                                SC4DrawContext* const drawContext,
                                                                int* const decalIds)
     {
-        auto* const d3dx = DX7InterfaceHook::GetD3DXInterface();
+        auto* const d3dx = GraphicsInterfaceHook::GetD3DXInterface();
         IDirect3DDevice7* const device = d3dx ? d3dx->GetD3DDevice() : nullptr;
         IDirectDrawSurface7* const gameDepth = d3dx ? d3dx->GetZBuffer() : nullptr;
         if (!device || !gameDepth) {
