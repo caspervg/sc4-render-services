@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SC4UI.h"
+#include "cIGZWin.h"
 #include "cISC43DRender.h"
 #include "cS3DVector2.h"
 #include "cS3DVector3.h"
@@ -10,11 +11,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <Windows.h>
 
 struct SC4Float4
 {
@@ -479,7 +475,7 @@ namespace SC4CameraControl
             return false;
         }
 
-        cameraControl->cameraDistance = std::max(1.0f, value);
+        cameraControl->cameraDistance = (std::max)(1.0f, value);
         return Refresh(*cameraControl, kUpdateReasonGeneric);
     }
 
@@ -501,8 +497,8 @@ namespace SC4CameraControl
             return false;
         }
 
-        cameraControl->citySizeX = std::max(1.0f, x);
-        cameraControl->citySizeZ = std::max(1.0f, z);
+        cameraControl->citySizeX = (std::max)(1.0f, x);
+        cameraControl->citySizeZ = (std::max)(1.0f, z);
         return Refresh(*cameraControl);
     }
 
@@ -542,8 +538,8 @@ namespace SC4CameraControl
             return false;
         }
 
-        const uint32_t safeWidth = static_cast<uint32_t>(std::max(1, width));
-        const uint32_t safeHeight = static_cast<uint32_t>(std::max(1, height));
+        const uint32_t safeWidth = static_cast<uint32_t>((std::max)(1, width));
+        const uint32_t safeHeight = static_cast<uint32_t>((std::max)(1, height));
         return renderer->SetViewportSize(safeWidth, safeHeight);
     }
 }
