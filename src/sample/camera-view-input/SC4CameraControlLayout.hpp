@@ -4,6 +4,7 @@
 #include "cISC43DRender.h"
 #include "cS3DVector2.h"
 #include "cS3DVector3.h"
+#include "SC4Vector.h"
 
 #include <algorithm>
 #include <atomic>
@@ -103,9 +104,7 @@ struct SC4CameraControlLayout
     uint8_t scrollBoundsEnabled;                // 0x148
     uint8_t pad149[3];                          // 0x149
 
-    cS3DVector2* scrollBoundsBegin;             // 0x14C
-    cS3DVector2* scrollBoundsEnd;               // 0x150
-    cS3DVector2* scrollBoundsCapacityEnd;       // 0x154
+    SC4Vector<cS3DVector2> scrollBounds;        // 0x14C
 
     float citySizeX;                            // 0x158
     float citySizeZ;                            // 0x15C
@@ -120,7 +119,7 @@ static_assert(offsetof(SC4CameraControlLayout, rotation) == 0x10C);
 static_assert(offsetof(SC4CameraControlLayout, yaw) == 0x118);
 static_assert(offsetof(SC4CameraControlLayout, pitch) == 0x11C);
 static_assert(offsetof(SC4CameraControlLayout, cameraOffset) == 0x13C);
-static_assert(offsetof(SC4CameraControlLayout, scrollBoundsBegin) == 0x14C);
+static_assert(offsetof(SC4CameraControlLayout, scrollBounds) == 0x14C);
 static_assert(offsetof(SC4CameraControlLayout, citySizeX) == 0x158);
 static_assert(sizeof(SC4CameraControlLayout) == 0x160);
 
@@ -267,12 +266,7 @@ namespace SC4CameraControl
 
     inline size_t GetScrollBoundsPointCount(const SC4CameraControlLayout& cameraControl)
     {
-        if (!cameraControl.scrollBoundsBegin || !cameraControl.scrollBoundsEnd ||
-            cameraControl.scrollBoundsEnd < cameraControl.scrollBoundsBegin) {
-            return 0;
-        }
-
-        return static_cast<size_t>(cameraControl.scrollBoundsEnd - cameraControl.scrollBoundsBegin);
+        return cameraControl.scrollBounds.size();
     }
 
     inline bool Refresh(SC4CameraControlLayout& cameraControl, const uint32_t reason = kUpdateReasonGeneric)
