@@ -26,7 +26,7 @@ the shadow pass the service draws the decals again, faintly, so they stay visibl
 |---|---|
 | Built-in DirectX | All decals are drawn into an offscreen image, which is blended over the scene once. |
 | SCD3D11 | Stencil: each pixel gets one layer, from the topmost decal there. |
-| scvk | Each decal is drawn again on its own, until scvk implements stencil. |
+| scvk | Stencil from scvk 0.4.0. Older versions draw each decal again on its own. |
 
 Drawing every decal again on its own makes overlapping decals come out a little darker than
 the offscreen image does. The stencil method avoids that: a first pass marks each pixel with

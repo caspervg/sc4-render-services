@@ -267,9 +267,9 @@ Plan for decals:
   this: it ends by resetting texture wrap, filtering and both texture transforms.
 - **Stencil support** comes from `cIGZGDriver::GetVideoModeInfo(sGDMode&)`,
   `supportsStencilBuffer` at `+0x21`, cached per driver object. SCD3D11 reports whether its
-  device has `D24S8`. scvk always reports true while its stencil functions are empty and its
-  `ColorMask` works, so there the claim pass draws nothing and the draw pass is the plain
-  replay. Once scvk implements stencil it gets the full method with no change here. The mode
+  device has `D24S8`. scvk has always reported true. Before 0.4.0 its stencil functions were
+  empty and its `ColorMask` worked, so there the claim pass drew nothing and the draw pass was
+  the plain replay. From 0.4.0 it gets the full method with no change here. The mode
   is read into a padded buffer because the game's own record may be longer than the header's.
 - The stencil is cleared with `ClearStencil(0)` + `Clear(0x2000)` before the claim pass, and
   stencil test is disabled again afterwards. The built-in DX7 driver keeps the composite and
