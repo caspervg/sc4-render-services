@@ -33,15 +33,34 @@ namespace
     constexpr uint32_t kSC4MessageSave = 0x26C63344;
     constexpr uint32_t kInvalidOverlayId = 0xFFFFFFFFu;
 
-    // Paints share the decals' overlay manager, so the two can be layered by draw order.
-    constexpr auto kPaintOverlayManager = cISTETerrainView::tOverlayManagerType::DynamicLand;
+    // Drawn in the static pass, so SCD3D11's live shadows land on paint. DynamicLand draws after them.
+    constexpr auto kPaintOverlayManager = cISTETerrainView::tOverlayManagerType::StaticLand;
     // A paint shape larger than this is refused.
     constexpr uint64_t kMaxPaintPoints = 1u << 20;
 
-    // AddDecal returns the slot index with the top bit set; draw calls see the bare index.
-    [[nodiscard]] uint32_t NormalizeOverlayIdKey(const uint32_t overlayId) noexcept
+    // AddDecal returns 0x80000000 | an index into the decal table (vector at +0xAC, 0x30 per
+    // entry); the entry's +0x2C is the overlay slot draw calls see (RemoveOverlay 0x007388C0).
+    // Only equal to the index on a manager with no shadows in it.
+    [[nodiscard]] uint32_t OverlaySlotKey(const void* const overlayManager, const uint32_t overlayId) noexcept
     {
-        return overlayId & 0x7FFFFFFFu;
+        constexpr uint32_t kDecalBit = 0x80000000u;
+        constexpr std::ptrdiff_t kDecalTableOffset = 0xAC;
+        constexpr std::ptrdiff_t kDecalStride = 0x30;
+        constexpr std::ptrdiff_t kDecalSlotOffset = 0x2C;
+        if ((overlayId & kDecalBit) == 0 || !overlayManager) {
+            return overlayId;
+        }
+        const auto* const manager = static_cast<const std::byte*>(overlayManager);
+        const std::byte* const* const table = reinterpret_cast<const std::byte* const*>(manager + kDecalTableOffset);
+        const std::byte* const begin = table[0];
+        const std::byte* const end = table[1];
+        const std::ptrdiff_t entry = static_cast<std::ptrdiff_t>(overlayId & ~kDecalBit) * kDecalStride;
+        if (!begin || entry + kDecalStride > end - begin) {
+            return overlayId & ~kDecalBit;
+        }
+        int32_t slot = 0;
+        std::memcpy(&slot, begin + entry + kDecalSlotOffset, sizeof(slot));
+        return slot >= 0 ? static_cast<uint32_t>(slot) : overlayId & ~kDecalBit;
     }
 
     [[nodiscard]] bool IsValidOverlayId(const uint32_t overlayId) noexcept
@@ -382,7 +401,7 @@ bool TerrainDecalService::CreateRuntimeDecal_(const TerrainDecalId id, const Ter
         return false;
     }
 
-    overlayIndex_[OverlayKey{overlayManager, NormalizeOverlayIdKey(overlayId)}] =
+    overlayIndex_[OverlayKey{overlayManager, OverlaySlotKey(overlayManager, overlayId)}] =
         OverlayTarget{ManagedOverlay::Kind::Decal, id.value, 0};
     return true;
 }
@@ -411,13 +430,13 @@ bool TerrainDecalService::ApplyStateToRuntime_(TerrainDecalRecord& record, const
     }
 
     const uint32_t oldOverlayId = *record.runtime.overlayId;
+    overlayIndex_.erase(OverlayKey{oldOverlayManager, OverlaySlotKey(oldOverlayManager, oldOverlayId)});
     oldOverlayManager->RemoveOverlay(oldOverlayId);
-    overlayIndex_.erase(OverlayKey{oldOverlayManager, NormalizeOverlayIdKey(oldOverlayId)});
 
     record.state = state;
     record.runtime.overlayId = replacementOverlayId;
     record.runtime.overlayManager = newOverlayManager;
-    overlayIndex_[OverlayKey{newOverlayManager, NormalizeOverlayIdKey(replacementOverlayId)}] =
+    overlayIndex_[OverlayKey{newOverlayManager, OverlaySlotKey(newOverlayManager, replacementOverlayId)}] =
         OverlayTarget{ManagedOverlay::Kind::Decal, record.id.value, 0};
     return true;
 }
@@ -431,8 +450,9 @@ bool TerrainDecalService::RemoveRuntimeDecal_(const TerrainDecalId id, const boo
 
     if (record->runtime.overlayId.has_value()) {
         auto* const overlayManager = static_cast<cISTEOverlayManager*>(const_cast<void*>(record->runtime.overlayManager));
-        overlayIndex_.erase(OverlayKey{overlayManager, NormalizeOverlayIdKey(*record->runtime.overlayId)});
+        // Otherwise the city is closing: the index is cleared and the manager may be gone.
         if (removeRuntimeOverlay && overlayManager) {
+            overlayIndex_.erase(OverlayKey{overlayManager, OverlaySlotKey(overlayManager, *record->runtime.overlayId)});
             overlayManager->RemoveOverlay(*record->runtime.overlayId);
         }
     }
@@ -668,7 +688,7 @@ bool TerrainDecalService::RealizePaint_(PaintRecord& record, const bool newTextu
             return false;
         }
         record.overlayIds.push_back(overlayId);
-        overlayIndex_[OverlayKey{overlayManager, NormalizeOverlayIdKey(overlayId)}] =
+        overlayIndex_[OverlayKey{overlayManager, OverlaySlotKey(overlayManager, overlayId)}] =
             OverlayTarget{ManagedOverlay::Kind::Paint, record.data.id.value, i};
     }
     return true;
@@ -678,8 +698,8 @@ void TerrainDecalService::UnrealizePaint_(PaintRecord& record, const bool remove
 {
     auto* const overlayManager = static_cast<cISTEOverlayManager*>(const_cast<void*>(record.overlayManager));
     for (const uint32_t overlayId : record.overlayIds) {
-        overlayIndex_.erase(OverlayKey{overlayManager, NormalizeOverlayIdKey(overlayId)});
         if (removeOverlays && overlayManager) {
+            overlayIndex_.erase(OverlayKey{overlayManager, OverlaySlotKey(overlayManager, overlayId)});
             overlayManager->RemoveOverlay(overlayId);
         }
     }
@@ -693,7 +713,7 @@ bool TerrainDecalService::ResolveOverlay(const void* const overlayManager,
                                          const uint32_t overlayId,
                                          ManagedOverlay& out)
 {
-    const auto it = overlayIndex_.find(OverlayKey{overlayManager, NormalizeOverlayIdKey(overlayId)});
+    const auto it = overlayIndex_.find(OverlayKey{overlayManager, overlayId});
     if (it == overlayIndex_.end()) {
         return false;
     }
@@ -726,7 +746,7 @@ bool TerrainDecalService::ResolveOverlay(const void* const overlayManager,
 
 std::pair<int32_t, uint32_t> TerrainDecalService::OverlayDrawOrder(const void* const overlayManager, const uint32_t overlayId)
 {
-    const auto it = overlayIndex_.find(OverlayKey{overlayManager, NormalizeOverlayIdKey(overlayId)});
+    const auto it = overlayIndex_.find(OverlayKey{overlayManager, overlayId});
     if (it == overlayIndex_.end()) {
         return {0, 0};
     }
