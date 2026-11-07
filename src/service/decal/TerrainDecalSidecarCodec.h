@@ -23,7 +23,7 @@ namespace TerrainDecalSidecar
 
     constexpr uint32_t kMagic = FourCC('T', 'D', 'C', 'S');
     constexpr uint16_t kVersionMajor = 1;
-    constexpr uint16_t kVersionMinor = 1;
+    constexpr uint16_t kVersionMinor = 2;
     constexpr uint32_t kChunkTagTerrainDecals = FourCC('T', 'D', 'E', 'C');
 
     constexpr uint32_t kSidecarType = 0xE5C2B9A8u;
@@ -75,9 +75,10 @@ namespace TerrainDecalSidecar
         float v2 = 1.0f;
         uint32_t uvMode = 0;
         int32_t depthOffset = -1;
+        int32_t drawOrder = 0;
     };
 
-    static_assert(sizeof(PersistedTerrainDecal) == 108, "Unexpected persisted terrain decal size.");
+    static_assert(sizeof(PersistedTerrainDecal) == 112, "Unexpected persisted terrain decal size.");
 
     enum PersistedTerrainDecalFlags : uint32_t {
         kEnabled = 1u << 0,

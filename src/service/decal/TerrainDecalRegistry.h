@@ -8,12 +8,15 @@
 
 struct TerrainDecalRuntimeAttachment {
     std::optional<uint32_t> overlayId;
+    const void* overlayManager = nullptr;
 };
 
 struct TerrainDecalRecord {
     TerrainDecalId id{};
     TerrainDecalState state{};
     TerrainDecalRuntimeAttachment runtime{};
+    // Orders decals and paints with the same draw order: the order they were made in.
+    uint32_t sequence = 0;
 };
 
 class TerrainDecalRegistry {

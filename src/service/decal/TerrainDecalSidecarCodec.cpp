@@ -1,10 +1,14 @@
 #include "TerrainDecalSidecarCodec.h"
 
+#include <cstddef>
+
 #include "cIGZIStream.h"
 #include "cIGZOStream.h"
 
 namespace {
-    constexpr uint32_t kLegacyRecordSize = sizeof(TerrainDecalSidecar::PersistedTerrainDecal) - sizeof(int32_t);
+    // Minor 0 records end before depthOffset, minor 1 records before drawOrder.
+    constexpr uint32_t kLegacyRecordSize = offsetof(TerrainDecalSidecar::PersistedTerrainDecal, depthOffset);
+    constexpr uint32_t kDepthOffsetRecordSize = offsetof(TerrainDecalSidecar::PersistedTerrainDecal, drawOrder);
     constexpr uint32_t kMaxPayloadBytes = 64u * 1024u * 1024u;
 
     TerrainDecalSnapshot DecodeSnapshot(const TerrainDecalSidecar::PersistedTerrainDecal& persisted) {
@@ -40,6 +44,7 @@ namespace {
                         : TerrainDecalUvMode::StretchSubrect,
         };
         snapshot.state.depthOffset = persisted.depthOffset;
+        snapshot.state.drawOrder = persisted.drawOrder;
         return snapshot;
     }
 
@@ -77,6 +82,7 @@ namespace {
         persisted.v2 = snapshot.state.uvWindow.v2;
         persisted.uvMode = static_cast<uint32_t>(snapshot.state.uvWindow.mode);
         persisted.depthOffset = snapshot.state.depthOffset;
+        persisted.drawOrder = snapshot.state.drawOrder;
         return persisted;
     }
 }
@@ -130,7 +136,8 @@ namespace TerrainDecalSidecar {
             return result;
         }
 
-        const bool hasDepthOffsetField = chunk.recordSize >= sizeof(PersistedTerrainDecal);
+        const bool hasDepthOffsetField = chunk.recordSize >= kDepthOffsetRecordSize;
+        const bool hasDrawOrderField = chunk.recordSize >= sizeof(PersistedTerrainDecal);
 
         result.decals.reserve(chunk.recordCount);
         for (uint32_t i = 0; i < chunk.recordCount; ++i) {
@@ -175,9 +182,16 @@ namespace TerrainDecalSidecar {
                 }
                 persisted.depthOffset = static_cast<int32_t>(depthOffsetBits);
             }
-            // Older records have no depthOffset; PersistedTerrainDecal::depthOffset already defaults to -1.
+            if (hasDrawOrderField && !in.GetSint32(persisted.drawOrder)) {
+                result.error = "truncated terrain decal record";
+                result.decals.clear();
+                return result;
+            }
+            // Older records lack the later fields; their defaults are depthOffset -1 and drawOrder 0.
 
-            const uint32_t consumedBytes = hasDepthOffsetField ? sizeof(PersistedTerrainDecal) : kLegacyRecordSize;
+            const uint32_t consumedBytes = hasDrawOrderField     ? sizeof(PersistedTerrainDecal)
+                                         : hasDepthOffsetField ? kDepthOffsetRecordSize
+                                                               : kLegacyRecordSize;
             if (chunk.recordSize > consumedBytes && !in.Skip(chunk.recordSize - consumedBytes)) {
                 result.error = "truncated terrain decal record";
                 result.decals.clear();
@@ -243,7 +257,8 @@ namespace TerrainDecalSidecar {
                 !out.SetFloat32(persisted.u2) ||
                 !out.SetFloat32(persisted.v2) ||
                 !out.SetUint32(persisted.uvMode) ||
-                !out.SetUint32(static_cast<uint32_t>(persisted.depthOffset))) {
+                !out.SetUint32(static_cast<uint32_t>(persisted.depthOffset)) ||
+                !out.SetSint32(persisted.drawOrder)) {
                 return false;
             }
         }

@@ -235,6 +235,10 @@ Capabilities:
 - Persist managed decals into the city save and recreate them on load.
 - Target static or dynamic land/water overlay managers.
 - Apply optional UV sub-rectangle overrides for atlas-style textures.
+- Layer decals and terrain paints by draw order.
+- Paint areas of any shape with a texture or a colour and a soft edge, through
+  `cIGZTerrainPaintService` (`GZIID_cIGZTerrainPaintService`, same service ID).
+  See `docs/terrain-paint.md`.
 
 Important behavior:
 - Struct-based terrain decal calls take an explicit struct size so the single
