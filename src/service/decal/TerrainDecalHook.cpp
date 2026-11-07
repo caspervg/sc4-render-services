@@ -49,7 +49,8 @@ namespace TerrainDecal
         // cIGZGDriver values.
         constexpr uint32_t kDriverStateAlphaTest = 0;
         constexpr uint32_t kDriverStateStencilTest = 2;
-        constexpr uint32_t kDriverClearStencil = 0x2000;
+        // Bit 0x80 belongs to SCD3D11's live shadows.
+        constexpr uint32_t kRecoveryStencilMask = 0x7F;
         constexpr uint32_t kDriverTestEqual = 2;
         constexpr uint32_t kDriverTestGreater = 4;
         constexpr uint32_t kDriverTestAlways = 7;
@@ -327,13 +328,12 @@ namespace TerrainDecal
             return;
         }
 
-        // Numbers 1 to 255, 0 is the cleared value. Decals 255 apart share a number, which
-        // only matters where they overlap.
-        const int number = static_cast<int>(self->stencilDecalNumber_ % 255u) + 1;
+        // Numbers 1 to 127. Decals 127 apart share a number, which only matters where they overlap.
+        const int number = static_cast<int>(self->stencilDecalNumber_ % kRecoveryStencilMask) + 1;
 
         if (self->stencilPass_ == StencilPass::Draw) {
             if (before) {
-                driver->StencilFunc(kDriverTestEqual, number, 0xFF);
+                driver->StencilFunc(kDriverTestEqual, number, kRecoveryStencilMask);
                 driver->StencilOp(kDriverStencilKeep, kDriverStencilKeep, kDriverStencilKeep);
             }
             return;
@@ -350,7 +350,7 @@ namespace TerrainDecal
             driver->DepthMask(false);
             driver->AlphaFunc(kDriverTestGreater, 0.0f);
             driver->Enable(kDriverStateAlphaTest);
-            driver->StencilFunc(kDriverTestAlways, number, 0xFF);
+            driver->StencilFunc(kDriverTestAlways, number, kRecoveryStencilMask);
             driver->StencilOp(kDriverStencilKeep, kDriverStencilKeep, kDriverStencilReplace);
             return;
         }
@@ -549,10 +549,9 @@ namespace TerrainDecal
         shadowRecoveryActive_ = true;
         const auto drawDecals = reinterpret_cast<DrawOverlayPassFn>(addresses_->drawDecals);
         if (useStencil) {
-            // The game never uses the stencil buffer, so it is ours to clear and use here.
-            driver->ClearStencil(0);
-            driver->Clear(kDriverClearStencil);
-            driver->StencilMask(0xFF);
+            // No clear: the claim pass renumbers every pixel a decal covers, and a clear would
+            // wipe the driver's bits.
+            driver->StencilMask(kRecoveryStencilMask);
             driver->Enable(kDriverStateStencilTest);
 
             for (const StencilPass pass : {StencilPass::Claim, StencilPass::Draw}) {
@@ -566,6 +565,7 @@ namespace TerrainDecal
 
             driver->StencilFunc(kDriverTestAlways, 0, 0xFF);
             driver->StencilOp(kDriverStencilKeep, kDriverStencilKeep, kDriverStencilKeep);
+            driver->StencilMask(0xFF);
             driver->Disable(kDriverStateStencilTest);
         }
         else {

@@ -15,7 +15,8 @@ A paint is a **shape** and a **style**:
 
 The service drapes the paint over the terrain and follows later terrain changes. It draws the
 paint like a decal, in the game's decal pass under the shadows, including the shadow recovery
-pass. It also stores the paint in the city save.
+pass. Paints live on the `StaticLand` overlay manager, so SCD3D11's live shadows fall on them.
+It also stores the paint in the city save.
 
 ## Getting the interface
 
@@ -77,7 +78,8 @@ Style calls take the struct size, so the style can grow by appending fields in a
 Decals have a `drawOrder` too (`TerrainDecalState::drawOrder`). Paints and decals made through the
 service sort together, so a texture decal can sit on top of a paint and the other way round. Two
 conditions apply:
-- They must share an overlay manager. Paints use `DynamicLand`, the decal default.
+- They must share an overlay manager. Paints use `StaticLand`; decals on `DynamicLand` always
+  draw over them.
 - The custom renderer must be on.
 
 ## How it is drawn
