@@ -49,6 +49,10 @@ struct TerrainDecalState {
     // Vanilla SC4 decals use 2; shadows use 3. Set to 4+ to render above shadows.
     // The built-in post-shadow recovery pass redraws managed decals at 4 separately.
     int depthOffset = -1;
+    // Decals and terrain paints draw in ascending order, so a higher value lands on top.
+    // The game's own decals count as 0; equal values keep the game's order.
+    // Requires the custom clipped renderer.
+    int32_t drawOrder = 0;
 };
 
 struct TerrainDecalSnapshot {
@@ -58,6 +62,10 @@ struct TerrainDecalSnapshot {
 
 static constexpr size_t kTerrainDecalStateSize = sizeof(TerrainDecalState);
 static constexpr size_t kTerrainDecalSnapshotSize = sizeof(TerrainDecalSnapshot);
+
+// Sizes before drawOrder was added. The service still accepts callers built against them.
+static constexpr size_t kTerrainDecalStateSizeV1 = offsetof(TerrainDecalState, drawOrder);
+static constexpr size_t kTerrainDecalSnapshotSizeV1 = offsetof(TerrainDecalSnapshot, state) + kTerrainDecalStateSizeV1;
 
 // ReSharper disable once CppPolymorphicClassWithNonVirtualPublicDestructor
 class cIGZTerrainDecalService : public cIGZUnknown {

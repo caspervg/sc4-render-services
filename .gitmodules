@@ -10,3 +10,9 @@
 [submodule "vendor/imgui"]
 	path = vendor/imgui
 	url = https://github.com/ocornut/imgui.git
+[submodule "vendor/Clipper2"]
+	path = vendor/Clipper2
+	url = https://github.com/AngusJohnson/Clipper2.git
+[submodule "vendor/earcut"]
+	path = vendor/earcut
+	url = https://github.com/mapbox/earcut.hpp.git

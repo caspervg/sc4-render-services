@@ -120,6 +120,9 @@ Important fields:
   with `rotationTurns` this reaches every mirrored orientation. Requires the
   custom clipped renderer.
 - `hasUvWindow` + `uvWindow`: optional atlas/subrect override.
+- `drawOrder`: decals and terrain paints draw in ascending order, so a higher
+  value lands on top. Game decals count as 0. Requires the custom clipped
+  renderer. See `docs/terrain-paint.md`.
 
 Minimal example:
 
@@ -207,6 +210,11 @@ state.uvWindow.v2 = 0.5f;
 state.uvWindow.mode = TerrainDecalUvMode::StretchSubrect;
 ```
 
+## Terrain Paint
+
+The same service paints areas of any shape with a texture or a colour, with soft
+edges. Query `GZIID_cIGZTerrainPaintService`; see `docs/terrain-paint.md`.
+
 ## Current Constraints and Caveats
 
 - The service only works on SimCity 4 `1.1.641`.
@@ -214,6 +222,8 @@ state.uvWindow.mode = TerrainDecalUvMode::StretchSubrect;
   overlay manager.
 - `baseSize` must be greater than zero.
 - UV window bounds must satisfy `u1 <= u2` and `v1 <= v2`.
+- `CreateDecal` and friends take the struct size. Callers built before
+  `drawOrder` existed pass the older size and get draw order 0.
 - `flags` are preserved in snapshots and save data; the mirror bit
   (`kTerrainDecalFlagMirror`) is consumed by the custom renderer, but
   `TerrainDecalState::flags` is not pushed into the game overlay manager

@@ -10,12 +10,8 @@
 #include <ddraw.h>
 
 #include "DX7InterfaceHook.h"
-#include "GZServPtrs.h"
+#include "SC4DrawContextAccess.h"
 #include "cIGZGDriver.h"
-#include "cISC4App.h"
-#include "cISC4City.h"
-#include "cISTETerrain.h"
-#include "cISTETerrainView.h"
 #include "sGDMode.h"
 #include "utils/Logger.h"
 #include "utils/VersionDetection.h"
@@ -37,10 +33,6 @@ namespace TerrainDecal
                    static_cast<const std::byte*>(overlayManager)[kOverlayManagerWaterFlagOffset] != std::byte{0};
         }
 
-        // SC4DrawContext fields (docs/world-draw-design.md).
-        constexpr std::ptrdiff_t kContextDriverOffset = 0x30;
-        constexpr std::ptrdiff_t kContextRendererOffset = 0x38;
-        constexpr std::ptrdiff_t kContextRenderStateOffset = 0x80;
         // Renderer -> options -> a flag that keeps alpha testing off whatever the state asks
         // for. SC4DrawContext::SetRenderState (0x007D4530) checks it the same way.
         constexpr std::ptrdiff_t kRendererOptionsOffset = 0x0C;
@@ -77,22 +69,11 @@ namespace TerrainDecal
             kRecoveryZeroOpacity = 4,
         };
 
-        template <typename T>
-        [[nodiscard]] T ReadField(const void* const base, const std::ptrdiff_t offset) noexcept
-        {
-            T value{};
-            std::memcpy(&value, static_cast<const std::byte*>(base) + offset, sizeof(T));
-            return value;
-        }
-
-        [[nodiscard]] cIGZGDriver* ContextDriver(SC4DrawContext* const drawContext) noexcept
-        {
-            return drawContext ? ReadField<cIGZGDriver*>(drawContext, kContextDriverOffset) : nullptr;
-        }
+        using DrawContextAccess::ReadField;
 
         [[nodiscard]] bool AlphaTestForcedOff(SC4DrawContext* const drawContext) noexcept
         {
-            const auto* const renderer = ReadField<const std::byte*>(drawContext, kContextRendererOffset);
+            const auto* const renderer = ReadField<const std::byte*>(drawContext, DrawContextAccess::kRendererOffset);
             const auto* const options = renderer ? ReadField<const std::byte*>(renderer, kRendererOptionsOffset) : nullptr;
             return options && options[kOptionsAlphaTestOffOffset] != std::byte{0};
         }
@@ -124,12 +105,15 @@ namespace TerrainDecal
         Uninstall();
     }
 
+    std::array<RelativeCallPatch*, 5> TerrainDecalHook::Patches_() noexcept
+    {
+        return {&drawDecalsCallSitePatch_, &callSitePatch_, &setTexTransformCallSitePatch_,
+                &drawShadowsCallSitePatch_, &drawShadowsRoughCallSitePatch_};
+    }
+
     bool TerrainDecalHook::Install()
     {
-        if (callSitePatch_.IsInstalled() &&
-            setTexTransformCallSitePatch_.IsInstalled() &&
-            drawShadowsCallSitePatch_.IsInstalled() &&
-            drawShadowsRoughCallSitePatch_.IsInstalled()) {
+        if (IsInstalled()) {
             return true;
         }
 
@@ -153,6 +137,9 @@ namespace TerrainDecal
         }
 
         sActiveHook_ = this;
+        drawDecalsCallSitePatch_.Configure("cSTEOverlayManager::DrawOverlays->DrawDecals call site",
+                                           addresses_->drawDecalsCallSite,
+                                           reinterpret_cast<void*>(&DrawDecalsCallThunk));
         callSitePatch_.Configure("cSTEOverlayManager::DrawDecals->DrawRect call site",
                                  addresses_->drawRectCallSite,
                                  reinterpret_cast<void*>(&DrawRectCallThunk));
@@ -166,35 +153,17 @@ namespace TerrainDecal
                                                  addresses_->drawShadowsRoughCallSite,
                                                  reinterpret_cast<void*>(&DrawShadowsRoughCallThunk));
 
-        if (!callSitePatch_.Install()) {
-            sActiveHook_ = nullptr;
-            SetLastError_("failed to install draw-rect call-site patch");
-            return false;
-        }
-        if (!setTexTransformCallSitePatch_.Install()) {
-            callSitePatch_.Uninstall();
-            sActiveHook_ = nullptr;
-            SetLastError_("failed to install set-tex-transform call-site patch");
-            return false;
-        }
-        if (!drawShadowsCallSitePatch_.Install()) {
-            setTexTransformCallSitePatch_.Uninstall();
-            callSitePatch_.Uninstall();
-            sActiveHook_ = nullptr;
-            SetLastError_("failed to install draw-shadows call-site patch");
-            return false;
-        }
-        if (!drawShadowsRoughCallSitePatch_.Install()) {
-            drawShadowsCallSitePatch_.Uninstall();
-            setTexTransformCallSitePatch_.Uninstall();
-            callSitePatch_.Uninstall();
-            sActiveHook_ = nullptr;
-            SetLastError_("failed to install draw-shadows-rough call-site patch");
-            return false;
+        for (RelativeCallPatch* const patch : Patches_()) {
+            if (!patch->Install()) {
+                Uninstall();
+                SetLastError_("failed to install a call-site patch, see the log");
+                return false;
+            }
         }
 
         lastError_.clear();
-        LOG_INFO("TerrainDecalHook: installed at 0x{:08X} / 0x{:08X}; shadow replay at 0x{:08X} / 0x{:08X} for {}",
+        LOG_INFO("TerrainDecalHook: installed at 0x{:08X} (order), 0x{:08X} / 0x{:08X} (draw); shadow replay at 0x{:08X} / 0x{:08X} for {}",
+                 static_cast<uint32_t>(addresses_->drawDecalsCallSite),
                  static_cast<uint32_t>(addresses_->drawRectCallSite),
                  static_cast<uint32_t>(addresses_->setTexTransform4CallSite),
                  static_cast<uint32_t>(addresses_->drawShadowsCallSite),
@@ -205,16 +174,15 @@ namespace TerrainDecal
 
     void TerrainDecalHook::Uninstall()
     {
-        drawShadowsRoughCallSitePatch_.Uninstall();
-        drawShadowsCallSitePatch_.Uninstall();
-        setTexTransformCallSitePatch_.Uninstall();
-        callSitePatch_.Uninstall();
+        auto patches = Patches_();
+        for (auto it = patches.rbegin(); it != patches.rend(); ++it) {
+            (*it)->Uninstall();
+        }
         currentTexTransformValid_ = false;
         currentTexTransformStage_ = -1;
         shadowRecoveryActive_ = false;
         shadowRecoveryCaptureActive_ = false;
         ReleaseRecoveryTarget_();
-        renderer_.ClearOverlayUvWindows();
 
         if (sActiveHook_ == this) {
             sActiveHook_ = nullptr;
@@ -223,7 +191,8 @@ namespace TerrainDecal
 
     bool TerrainDecalHook::IsInstalled() const noexcept
     {
-        return callSitePatch_.IsInstalled() &&
+        return drawDecalsCallSitePatch_.IsInstalled() &&
+               callSitePatch_.IsInstalled() &&
                setTexTransformCallSitePatch_.IsInstalled() &&
                drawShadowsCallSitePatch_.IsInstalled() &&
                drawShadowsRoughCallSitePatch_.IsInstalled();
@@ -234,29 +203,60 @@ namespace TerrainDecal
         return lastError_;
     }
 
-    void TerrainDecalHook::SetOverlayUvWindow(const uint32_t overlayId, const TerrainDecalUvWindow& uvWindow)
+    void TerrainDecalHook::SetOverlaySource(ManagedOverlaySource* const source) noexcept
     {
-        renderer_.SetOverlayUvWindow(overlayId, uvWindow);
+        overlaySource_ = source;
+        renderer_.SetOverlaySource(source);
     }
 
-    bool TerrainDecalHook::RemoveOverlayUvWindow(const uint32_t overlayId) noexcept
+    void __fastcall TerrainDecalHook::DrawDecalsCallThunk(void* overlayManager,
+                                                         void*,
+                                                         const float* worldToScreenMatrix,
+                                                         SC4DrawContext* drawContext,
+                                                         int* decalIds)
     {
-        return renderer_.RemoveOverlayUvWindow(overlayId);
+        if (!sActiveHook_) {
+            return;
+        }
+
+        ++sActiveHook_->overlayPass_;
+        sActiveHook_->SortByDrawOrder_(overlayManager, decalIds);
+        sActiveHook_->CallOriginalOverlayPass_(sActiveHook_->drawDecalsCallSitePatch_,
+                                               overlayManager,
+                                               worldToScreenMatrix,
+                                               drawContext,
+                                               decalIds);
     }
 
-    void TerrainDecalHook::ClearOverlayUvWindows() noexcept
+    void TerrainDecalHook::SortByDrawOrder_(const void* const overlayManager, int* const decalIds) const
     {
-        renderer_.ClearOverlayUvWindows();
-    }
+        // decalIds is the std::vector<uint32_t> of overlay slots SDSFindOverlaysToDraw picked,
+        // in slot order. The shadow passes get the same vector, so they follow this order too.
+        auto* const range = reinterpret_cast<uint32_t* const*>(decalIds);
+        if (!overlaySource_ || !range || !range[0] || range[1] - range[0] < 2) {
+            return;
+        }
 
-    bool TerrainDecalHook::TryGetOverlayUvWindow(const uint32_t overlayId, TerrainDecalUvWindow& uvWindow) const noexcept
-    {
-        return renderer_.TryGetOverlayUvWindow(overlayId, uvWindow);
-    }
+        struct Keyed
+        {
+            std::pair<int32_t, uint32_t> order;
+            uint32_t overlayId;
+        };
+        thread_local std::vector<Keyed> keyed;
+        keyed.clear();
+        for (const uint32_t* id = range[0]; id != range[1]; ++id) {
+            keyed.push_back(Keyed{overlaySource_->OverlayDrawOrder(overlayManager, *id), *id});
+        }
 
-    void TerrainDecalHook::SetOverlayOverridesResolver(const OverlayOverridesResolver resolver, void* const userData) noexcept
-    {
-        renderer_.SetOverlayOverridesResolver(resolver, userData);
+        const auto byOrder = [](const Keyed& a, const Keyed& b) { return a.order < b.order; };
+        if (std::is_sorted(keyed.begin(), keyed.end(), byOrder)) {
+            return;
+        }
+        std::stable_sort(keyed.begin(), keyed.end(), byOrder);
+        uint32_t* out = range[0];
+        for (const Keyed& entry : keyed) {
+            *out++ = entry.overlayId;
+        }
     }
 
     void __fastcall TerrainDecalHook::DrawRectCallThunk(void* overlayManager,
@@ -322,7 +322,7 @@ namespace TerrainDecal
                                                       const bool before)
     {
         const auto* const self = static_cast<TerrainDecalHook*>(userData);
-        cIGZGDriver* const driver = ContextDriver(drawContext);
+        cIGZGDriver* const driver = DrawContextAccess::Driver(drawContext);
         if (!self || !driver) {
             return;
         }
@@ -356,7 +356,7 @@ namespace TerrainDecal
         }
 
         // Put back what the draw context's state cache says is set, so the cache stays true.
-        const auto state = ReadField<uint32_t>(drawContext, kContextRenderStateOffset);
+        const auto state = ReadField<uint32_t>(drawContext, DrawContextAccess::kRenderStateOffset);
         driver->ColorMask((state & kPackedColorWrite) != 0);
         driver->DepthMask((state & kPackedDepthWrite) != 0);
         driver->AlphaFunc((state >> kPackedAlphaFuncShift) & 7u,
@@ -394,17 +394,14 @@ namespace TerrainDecal
             .overlaySlotBase = nullptr,
             .activeTexTransform = currentTexTransformValid_ ? currentTexTransform_.data() : nullptr,
             .activeTexTransformStage = currentTexTransformValid_ ? currentTexTransformStage_ : -1,
-            .overlayRectOffset = 0,
             .addresses = addresses_ ? &*addresses_ : nullptr,
-            .terrain = nullptr,
-            .terrainView = nullptr,
             .mode = shadowRecoveryActive_
                         ? (shadowRecoveryCaptureActive_ ? DrawMode::ShadowRecoveryCapture : DrawMode::ShadowRecovery)
                         : DrawMode::Normal,
+            .pass = overlayPass_,
         };
 
         if (addresses_ && rect && addresses_->overlayRectOffset > 0) {
-            request.overlayRectOffset = addresses_->overlayRectOffset;
             request.overlaySlotBase = reinterpret_cast<const std::byte*>(rect) - addresses_->overlayRectOffset;
         }
 
@@ -416,11 +413,6 @@ namespace TerrainDecal
             }
             return;
         }
-
-        const cISC4AppPtr app;
-        cISC4City* city = app ? app->GetCity() : nullptr;
-        request.terrain = city ? city->GetTerrain() : nullptr;
-        request.terrainView = request.terrain ? request.terrain->GetView() : nullptr;
 
         if (shadowRecoveryActive_ && stencilPass_ != StencilPass::None) {
             // Both passes see the same decals in the same order, so the numbers match up.
@@ -452,6 +444,8 @@ namespace TerrainDecal
     {
         CallOriginalOverlayPass_(patch, overlayManager, worldToScreenMatrix, drawContext, decalIds);
         ReplayManagedDecalsAfterShadows_(overlayManager, worldToScreenMatrix, drawContext, decalIds);
+        // What the decal pass laid is not to be drawn again by a later pass.
+        ++overlayPass_;
     }
 
     void TerrainDecalHook::HandleSetTexTransform4Call_(SC4DrawContext* drawContext, const float* matrix, const int stage)
@@ -538,7 +532,7 @@ namespace TerrainDecal
             return;
         }
 
-        cIGZGDriver* const driver = ContextDriver(drawContext);
+        cIGZGDriver* const driver = DrawContextAccess::Driver(drawContext);
         const bool useStencil = options_.shadowRecoveryUseStencil && DriverHasStencil_(driver);
         LogRecoveryMethod_(useStencil ? kRecoveryStencil : kRecoveryReplay);
 

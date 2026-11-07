@@ -43,23 +43,24 @@ namespace TerrainDecal
         [[nodiscard]] bool IsInstalled() const noexcept;
         [[nodiscard]] std::string_view GetLastError() const noexcept;
 
-        void SetOverlayUvWindow(uint32_t overlayId, const TerrainDecalUvWindow& uvWindow);
-        [[nodiscard]] bool RemoveOverlayUvWindow(uint32_t overlayId) noexcept;
-        void ClearOverlayUvWindows() noexcept;
-        [[nodiscard]] bool TryGetOverlayUvWindow(uint32_t overlayId, TerrainDecalUvWindow& uvWindow) const noexcept;
-        void SetOverlayOverridesResolver(OverlayOverridesResolver resolver, void* userData) noexcept;
+        // The service whose overlays get custom drawing and a draw order.
+        void SetOverlaySource(ManagedOverlaySource* source) noexcept;
 
     private:
+        [[nodiscard]] std::array<RelativeCallPatch*, 5> Patches_() noexcept;
+
         using DrawRectFn = void(__thiscall*)(void*, SC4DrawContext*, const cRZRect*);
         using DrawOverlayPassFn = void(__thiscall*)(void*, const float*, SC4DrawContext*, int*);
         using SetTexTransform4Fn = void(__thiscall*)(SC4DrawContext*, const float*, int);
 
+        static void __fastcall DrawDecalsCallThunk(void* overlayManager, void*, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds);
         static void __fastcall DrawRectCallThunk(void* overlayManager, void*, SC4DrawContext* drawContext, const cRZRect* rect);
         static void __fastcall DrawShadowsCallThunk(void* overlayManager, void*, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds);
         static void __fastcall DrawShadowsRoughCallThunk(void* overlayManager, void*, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds);
         static void __fastcall SetTexTransform4CallThunk(SC4DrawContext* drawContext, void*, const float* matrix, int stage);
         static void AroundStencilRecoveryDraw_(void* userData, SC4DrawContext* drawContext, bool before);
 
+        void SortByDrawOrder_(const void* overlayManager, int* decalIds) const;
         void HandleDrawRectCall_(void* overlayManager, SC4DrawContext* drawContext, const cRZRect* rect);
         void HandleDrawShadowsCall_(const RelativeCallPatch& patch, void* overlayManager, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds);
         void HandleSetTexTransform4Call_(SC4DrawContext* drawContext, const float* matrix, int stage);
@@ -77,6 +78,8 @@ namespace TerrainDecal
     private:
         Options options_;
         std::optional<HookAddresses> addresses_;
+        ManagedOverlaySource* overlaySource_ = nullptr;
+        RelativeCallPatch drawDecalsCallSitePatch_;
         RelativeCallPatch callSitePatch_;
         RelativeCallPatch drawShadowsCallSitePatch_;
         RelativeCallPatch drawShadowsRoughCallSitePatch_;
@@ -88,6 +91,8 @@ namespace TerrainDecal
         bool currentTexTransformValid_ = false;
         bool shadowRecoveryActive_ = false;
         bool shadowRecoveryCaptureActive_ = false;
+        // Numbers the decal passes; the shadow passes after one keep its number.
+        uint32_t overlayPass_ = 0;
 
         // Stencil shadow recovery: the claim pass marks each pixel with the topmost decal's
         // number, the draw pass then draws each decal only where it holds the mark.

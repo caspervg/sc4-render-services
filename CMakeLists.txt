@@ -187,6 +187,35 @@ if(WIN32)
     set(SC4_RENDER_SERVICES_VERSION_RESOURCE ${CMAKE_CURRENT_BINARY_DIR}/SC4RenderServicesVersion.rc)
 endif()
 
+# Polygon clipping and offsetting (Clipper2) and triangulation (earcut), for terrain paint.
+set(CLIPPER2_DIR ${SC4RS_ROOT}/vendor/Clipper2/CPP/Clipper2Lib)
+if (NOT EXISTS "${CLIPPER2_DIR}/include/clipper2/clipper.h" OR NOT EXISTS "${SC4RS_ROOT}/vendor/earcut/include/mapbox/earcut.hpp")
+    message(
+        FATAL_ERROR
+        "Missing vendor/Clipper2 or vendor/earcut. Initialize submodules with: "
+        "'git submodule update --init --recursive'."
+    )
+endif ()
+
+# The terrain paint geometry has no game dependencies, so the tests can build it on its own.
+add_library(sc4rs_terrain_paint STATIC
+        ${SC4RS_ROOT}/src/service/decal/TerrainPaintMesh.cpp
+        ${CLIPPER2_DIR}/src/clipper.engine.cpp
+        ${CLIPPER2_DIR}/src/clipper.offset.cpp
+        ${CLIPPER2_DIR}/src/clipper.rectclip.cpp
+)
+target_include_directories(sc4rs_terrain_paint PUBLIC
+        ${SC4RS_ROOT}/src
+        ${CLIPPER2_DIR}/include
+        ${SC4RS_ROOT}/vendor/earcut/include
+)
+
+option(SC4RS_BUILD_TESTS "Build the offline tests" ${SC4RS_IS_TOP_LEVEL})
+if(SC4RS_BUILD_TESTS)
+    add_executable(TerrainPaintMeshTests ${SC4RS_ROOT}/tests/TerrainPaintMeshTests.cpp)
+    target_link_libraries(TerrainPaintMeshTests PRIVATE sc4rs_terrain_paint)
+endif()
+
 # Combined ImGui + S3D Camera services DLL (641-gated)
 set(CUSTOM_SERVICES_SOURCES
         ${SC4RS_ROOT}/src/service/ImGuiService.cpp
@@ -198,6 +227,7 @@ set(CUSTOM_SERVICES_SOURCES
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalRegistry.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalService.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalSidecarCodec.cpp
+        ${SC4RS_ROOT}/src/service/decal/TerrainPaintCodec.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalSymbols.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalHook.cpp
         ${SC4RS_ROOT}/src/service/RenderServicesDirector.cpp
@@ -230,6 +260,7 @@ target_link_libraries(SC4RenderServices PRIVATE
         imgui
         gzcom2
         spdlog
+        sc4rs_terrain_paint
 )
 target_compile_definitions(SC4RenderServices PRIVATE
         IMGUI_DLL_EXPORT
