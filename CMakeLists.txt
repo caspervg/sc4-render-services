@@ -214,11 +214,20 @@ option(SC4RS_BUILD_TESTS "Build the offline tests" ${SC4RS_IS_TOP_LEVEL})
 if(SC4RS_BUILD_TESTS)
     add_executable(TerrainPaintMeshTests ${SC4RS_ROOT}/tests/TerrainPaintMeshTests.cpp)
     target_link_libraries(TerrainPaintMeshTests PRIVATE sc4rs_terrain_paint)
+
+    add_executable(ImGuiThemesTests
+            ${SC4RS_ROOT}/tests/ImGuiThemesTests.cpp
+            ${SC4RS_ROOT}/src/service/ImGuiThemes.cpp
+            ${IMGUI_CORE_SOURCES}
+    )
+    target_include_directories(ImGuiThemesTests PRIVATE ${SC4RS_ROOT}/src)
+    target_link_libraries(ImGuiThemesTests PRIVATE imgui)
 endif()
 
 # Combined ImGui + S3D Camera services DLL (641-gated)
 set(CUSTOM_SERVICES_SOURCES
         ${SC4RS_ROOT}/src/service/ImGuiService.cpp
+        ${SC4RS_ROOT}/src/service/ImGuiThemes.cpp
         ${SC4RS_ROOT}/src/service/S3DCameraService.cpp
         ${SC4RS_ROOT}/src/service/DrawService.cpp
         ${SC4RS_ROOT}/src/service/WorldDrawService.cpp

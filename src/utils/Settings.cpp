@@ -2,6 +2,7 @@
 #include "Logger.h"
 
 #include "mini/ini.h"
+#include "service/ImGuiThemes.h"
 
 #include <algorithm>
 #include <cctype>
@@ -234,7 +235,7 @@ void Settings::Load(const std::filesystem::path& settingsFilePath) {
         // Theme
         if (section.has("Theme")) {
             const std::string text = ToLower(section.get("Theme"));
-            if (text == "dark" || text == "light" || text == "classic") {
+            if (IsImGuiTheme(text)) {
                 theme_ = text;
             } else {
                 LOG_ERROR("Invalid Theme value '{}' in {}. Using default dark.", section.get("Theme"), settingsFilePath.string());
