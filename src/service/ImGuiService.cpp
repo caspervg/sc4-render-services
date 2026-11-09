@@ -20,6 +20,7 @@
 #include "GZServPtrs.h"
 #include "imgui_impl_gzgdriver.h"
 #include "imgui_impl_win32.h"
+#include "ImGuiThemes.h"
 #include "public/ImGuiServiceIds.h"
 #include "SC4UI.h"
 #include "utils/Fonts.h"
@@ -681,13 +682,7 @@ bool ImGuiService::CreateContext_(const HWND hwnd) {
     io.IniFilename = s_layoutFile.empty() ? nullptr : s_layoutFile.c_str();
 
     // Apply theme
-    if (settings.theme == "light") {
-        ImGui::StyleColorsLight();
-    } else if (settings.theme == "classic") {
-        ImGui::StyleColorsClassic();
-    } else {
-        ImGui::StyleColorsDark();
-    }
+    ApplyImGuiTheme(settings.theme, ImGui::GetStyle());
 
     // Apply UI scale
     if (settings.uiScale != 1.0f) {
