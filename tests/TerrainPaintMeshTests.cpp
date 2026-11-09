@@ -40,13 +40,13 @@ namespace
 
     // Painted area of the whole mesh, and a check that every triangle sits in its half of the
     // cell and winds the same way as the renderer's terrain triangles.
-    double MeshArea(const Mesh& mesh)
+    double MeshArea(const Mesh& mesh, const bool flipped = false)
     {
         double area = 0.0;
         const auto& cells = mesh.Cells();
         for (int32_t cz = cells.minZ; cz <= cells.maxZ; ++cz) {
             for (int32_t cx = cells.minX; cx <= cells.maxX; ++cx) {
-                const CellMesh& cell = mesh.Cell(cx, cz);
+                const CellMesh& cell = mesh.Cell(cx, cz, flipped);
                 CHECK(cell.lower.size() % 3 == 0 && cell.upper.size() % 3 == 0);
                 for (const bool lower : {true, false}) {
                     const auto& v = lower ? cell.lower : cell.upper;
@@ -59,7 +59,12 @@ namespace
                             const float lx = v[k].x - cx * 16.0f;
                             const float lz = v[k].z - cz * 16.0f;
                             CHECK(lx >= -1e-3f && lx <= 16.001f && lz >= -1e-3f && lz <= 16.001f);
-                            CHECK(lower ? lz >= lx - 1e-3f : lz <= lx + 1e-3f);
+                            if (flipped) {
+                                CHECK(lower ? lx + lz <= 16.001f : lx + lz >= 15.999f);
+                            }
+                            else {
+                                CHECK(lower ? lz >= lx - 1e-3f : lz <= lx + 1e-3f);
+                            }
                             CHECK(v[k].alpha >= 0.0f && v[k].alpha <= 1.0f);
                         }
                     }
@@ -72,6 +77,17 @@ namespace
 
 int main()
 {
+    {
+        // Flipped cells are cut along the other diagonal, full or partly painted.
+        const std::vector<Ring> full{Rect(0, 0, 32, 32)};
+        const Mesh fullMesh(full, 0.0f);
+        CHECK(fullMesh.Cell(0, 0, true).lower.size() == 3 && fullMesh.Cell(0, 0, true).upper.size() == 3);
+        CHECK(Near(MeshArea(fullMesh, true), 1024.0, 1e-2));
+
+        const std::vector<Ring> partial{Rect(-5, 3, 27.5f, 40)};
+        const Mesh softMesh(partial, 2.0f);
+        CHECK(Near(MeshArea(softMesh, true), MeshArea(softMesh, false), 0.1));
+    }
     {
         // Two by two cells, exactly on the grid: four full cells.
         const std::vector<Ring> rings{Rect(0, 0, 32, 32)};

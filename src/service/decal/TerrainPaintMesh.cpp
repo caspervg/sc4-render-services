@@ -307,26 +307,29 @@ namespace TerrainPaint
         }
     }
 
-    const CellMesh& Mesh::Cell(const int32_t cellX, const int32_t cellZ) const
+    const CellMesh& Mesh::Cell(const int32_t cellX, const int32_t cellZ, const bool flipped) const
     {
         static const CellMesh kEmpty{};
         if (area_.empty() || cellX < cells_.minX || cellX > cells_.maxX || cellZ < cells_.minZ || cellZ > cells_.maxZ) {
             return kEmpty;
         }
 
+        const size_t split = flipped ? 1 : 0;
+        auto& cache = cellCache_[split];
         const uint64_t key = Key_(cellX, cellZ);
-        if (const auto it = cellCache_.find(key); it != cellCache_.end()) {
+        if (const auto it = cache.find(key); it != cache.end()) {
             return it->second.mesh;
         }
 
         std::vector<double> signature = Signature_(cellX, cellZ);
         if (previous_) {
-            if (const auto it = previous_->cellCache_.find(key);
-                it != previous_->cellCache_.end() && it->second.signature == signature) {
-                return cellCache_.emplace(key, std::move(it->second)).first->second.mesh;
+            auto& previousCache = previous_->cellCache_[split];
+            if (const auto it = previousCache.find(key);
+                it != previousCache.end() && it->second.signature == signature) {
+                return cache.emplace(key, std::move(it->second)).first->second.mesh;
             }
         }
-        return cellCache_.emplace(key, CachedCell{std::move(signature), BuildCell_(cellX, cellZ)}).first->second.mesh;
+        return cache.emplace(key, CachedCell{std::move(signature), BuildCell_(cellX, cellZ, flipped)}).first->second.mesh;
     }
 
     void Mesh::ReuseCellsFrom(std::unique_ptr<Mesh> previous)
@@ -380,15 +383,21 @@ namespace TerrainPaint
         return signature;
     }
 
-    CellMesh Mesh::BuildCell_(const int32_t cellX, const int32_t cellZ) const
+    CellMesh Mesh::BuildCell_(const int32_t cellX, const int32_t cellZ, const bool flipped) const
     {
         const double x0 = static_cast<double>(cellX) * kCellSize;
         const double z0 = static_cast<double>(cellZ) * kCellSize;
         const double x1 = x0 + kCellSize;
         const double z1 = z0 + kCellSize;
         const RectD cellRect(x0, z0, x1, z1);
-        const PathsD lowerTriangle{PathD{{x0, z0}, {x0, z1}, {x1, z1}}};
-        const PathsD upperTriangle{PathD{{x0, z0}, {x1, z1}, {x1, z0}}};
+        const PointD c00(x0, z0);
+        const PointD c01(x0, z1);
+        const PointD c11(x1, z1);
+        const PointD c10(x1, z0);
+        const PathD lowerCorners = flipped ? PathD{c00, c01, c10} : PathD{c00, c01, c11};
+        const PathD upperCorners = flipped ? PathD{c10, c01, c11} : PathD{c00, c11, c10};
+        const PathsD lowerTriangle{lowerCorners};
+        const PathsD upperTriangle{upperCorners};
 
         const PathsD worn = WearPatches_(cellRect, cellX, cellZ);
         CellMesh mesh;
@@ -403,11 +412,14 @@ namespace TerrainPaint
 
             if (core && std::abs(std::abs(Area(inCell)) - kCellArea) < 1.0e-3) {
                 // The whole cell is solid paint: the two terrain triangles as they are.
-                const auto v = [](const double x, const double z) {
-                    return MeshVertex{static_cast<float>(x), static_cast<float>(z), 1.0f};
+                const auto append = [](std::vector<MeshVertex>& out, const PathD& corners) {
+                    const auto v = [&](const size_t i) {
+                        return MeshVertex{static_cast<float>(corners[i].x), static_cast<float>(corners[i].y), 1.0f};
+                    };
+                    AppendTriangle(out, v(0), v(1), v(2));
                 };
-                AppendTriangle(mesh.lower, v(x0, z0), v(x0, z1), v(x1, z1));
-                AppendTriangle(mesh.upper, v(x0, z0), v(x1, z1), v(x1, z0));
+                append(mesh.lower, lowerCorners);
+                append(mesh.upper, upperCorners);
                 continue;
             }
 

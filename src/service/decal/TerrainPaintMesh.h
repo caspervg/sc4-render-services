@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -42,9 +43,10 @@ namespace TerrainPaint
     };
 
     // A terrain cell is drawn as two triangles over its corners c00 (x0, z0), c01 (x0, z1),
-    // c11 (x1, z1) and c10 (x1, z0): lower = c00 c01 c11 and upper = c00 c11 c10, the split the
-    // decal renderer uses. Each half of the painted area is kept apart so its vertices can take
-    // their height from the right terrain triangle.
+    // c11 (x1, z1) and c10 (x1, z0): lower = c00 c01 c11 and upper = c00 c11 c10, or in a flipped
+    // cell lower = c00 c01 c10 and upper = c10 c01 c11, as the game splits them. Each half of the
+    // painted area is kept apart so its vertices can take their height from the right terrain
+    // triangle.
     struct CellMesh
     {
         // Three vertices per triangle.
@@ -93,8 +95,8 @@ namespace TerrainPaint
         [[nodiscard]] bool HasUvMap() const noexcept { return !uvMap_.empty(); }
         [[nodiscard]] const CellRange& Cells() const noexcept { return cells_; }
 
-        // Empty when the cell is outside the area.
-        [[nodiscard]] const CellMesh& Cell(int32_t cellX, int32_t cellZ) const;
+        // Empty when the cell is outside the area. flipped: split along the cell's other diagonal.
+        [[nodiscard]] const CellMesh& Cell(int32_t cellX, int32_t cellZ, bool flipped = false) const;
 
     private:
         struct Edge
@@ -102,7 +104,7 @@ namespace TerrainPaint
             double ax, az, bx, bz;
         };
 
-        [[nodiscard]] CellMesh BuildCell_(int32_t cellX, int32_t cellZ) const;
+        [[nodiscard]] CellMesh BuildCell_(int32_t cellX, int32_t cellZ, bool flipped) const;
         [[nodiscard]] float AlphaAt_(double x, double z) const;
         // The area in a cell as nested regions from the outline inwards, each with whether it is
         // the solid core: the soft-edge bands, then the core. Without a soft edge, only the core.
@@ -130,7 +132,8 @@ namespace TerrainPaint
             std::vector<double> signature;
             CellMesh mesh;
         };
-        mutable std::unordered_map<uint64_t, CachedCell> cellCache_;
+        // Normal cells, then flipped ones.
+        mutable std::array<std::unordered_map<uint64_t, CachedCell>, 2> cellCache_;
         std::unique_ptr<Mesh> previous_;
     };
 }

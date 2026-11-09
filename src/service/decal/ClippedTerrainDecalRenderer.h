@@ -100,7 +100,8 @@ namespace TerrainDecal
     // paint, cut into cells and placed on the cells' terrain triangles by weights, so a frame only
     // has to read the terrain under it. Built a row of cells at a time, when the row is first on
     // screen. Heights and colours are read every frame, so it never goes stale when the terrain
-    // changes; it is dropped whenever the paint changes.
+    // changes; a row is placed again when one of its cells changes diagonal, and it is all
+    // dropped whenever the paint changes.
     struct PaintDrawCache
     {
         struct PlacedVertex
@@ -122,6 +123,7 @@ namespace TerrainDecal
             uint32_t first;       // into Row::vertices
             uint32_t lowerCount;  // then upperCount vertices on the upper triangle
             uint32_t upperCount;
+            bool flipped;         // the cell's diagonal when it was placed
         };
 
         struct Row

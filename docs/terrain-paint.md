@@ -88,7 +88,8 @@ Each paint has one game overlay per texture. The overlay covers the paint's 16 m
 game culls it and orders it like any other decal. When the game asks for the overlay's terrain,
 the renderer does not draw the overlay's square. It draws the paint instead:
 - The area is cut per terrain cell, and split along the same diagonal as the terrain's two
-  triangles, using [Clipper2](https://github.com/AngusJohnson/Clipper2).
+  triangles, using [Clipper2](https://github.com/AngusJohnson/Clipper2). Cells that the game or a
+  mod such as the DJEM fix flips are split along their other diagonal.
 - The pieces are triangulated with [earcut](https://github.com/mapbox/earcut.hpp).
 - Each vertex takes its height and colour from the terrain.
 - The soft edge is the vertex alpha: the distance to the outline divided by the feather width.

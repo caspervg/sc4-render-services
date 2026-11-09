@@ -46,6 +46,9 @@ namespace TerrainDecal
         std::ptrdiff_t overlayTerrainViewOffset = 0;
         std::ptrdiff_t terrainViewDrawRowStartOffset = 0;
         std::ptrdiff_t terrainViewDrawRowEndOffset = 0;
+        // The view's terrain, and the terrain's per-vertex records.
+        std::ptrdiff_t terrainViewTerrainOffset = 0;
+        std::ptrdiff_t terrainVertexRecordsOffset = 0;
         // Overlay manager flags that make DrawRect draw the whole rect, not just the frustum.
         std::ptrdiff_t overlayWholeRectFlagOffsetA = 0;
         std::ptrdiff_t overlayWholeRectFlagOffsetB = 0;

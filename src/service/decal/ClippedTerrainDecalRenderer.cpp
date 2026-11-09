@@ -392,25 +392,40 @@ namespace
         polygon = std::move(output);
     }
 
-    void ClipAndEmitQuad(const std::array<ClipVertex, 4>& quad,
+    // A terrain cell's two triangles as corners of LoadTerrainCellVertices, as
+    // SetTriangleIndicesForCell (0x00752AF0) builds them. A flipped cell is split along its other
+    // diagonal: the game's cliff code and mods such as the DJEM fix flip cells.
+    [[nodiscard]] const std::array<size_t, 6>& CellTriangles(const bool flipped) noexcept
+    {
+        static constexpr std::array<size_t, 6> kNormal{0, 1, 2, 0, 2, 3};
+        static constexpr std::array<size_t, 6> kFlipped{0, 1, 3, 3, 1, 2};
+        return flipped ? kFlipped : kNormal;
+    }
+
+    // Clips each terrain triangle on its own: a fan over the clipped quad would crease the cell
+    // along a line the terrain does not have.
+    void ClipAndEmitCell(const std::array<ClipVertex, 4>& quad,
+                         const std::array<size_t, 6>& triangles,
                          const bool clipU,
                          const bool clipV,
                          const ClipBounds& bounds,
                          std::vector<PackedTerrainVertex>& output)
     {
-        std::vector<ClipVertex> polygon(quad.begin(), quad.end());
-        if (clipU) {
-            ClipPolygonAgainstPlane(polygon, true, true, bounds.minU);
-            ClipPolygonAgainstPlane(polygon, true, false, bounds.maxU);
-        }
-        if (clipV) {
-            ClipPolygonAgainstPlane(polygon, false, true, bounds.minV);
-            ClipPolygonAgainstPlane(polygon, false, false, bounds.maxV);
-        }
-        for (size_t i = 1; i + 1 < polygon.size(); ++i) {
-            output.push_back(polygon[0].vertex);
-            output.push_back(polygon[i].vertex);
-            output.push_back(polygon[i + 1].vertex);
+        for (size_t t = 0; t < triangles.size(); t += 3) {
+            std::vector<ClipVertex> polygon{quad[triangles[t]], quad[triangles[t + 1]], quad[triangles[t + 2]]};
+            if (clipU) {
+                ClipPolygonAgainstPlane(polygon, true, true, bounds.minU);
+                ClipPolygonAgainstPlane(polygon, true, false, bounds.maxU);
+            }
+            if (clipV) {
+                ClipPolygonAgainstPlane(polygon, false, true, bounds.minV);
+                ClipPolygonAgainstPlane(polygon, false, false, bounds.maxV);
+            }
+            for (size_t i = 1; i + 1 < polygon.size(); ++i) {
+                output.push_back(polygon[0].vertex);
+                output.push_back(polygon[i].vertex);
+                output.push_back(polygon[i + 1].vertex);
+            }
         }
     }
 
@@ -523,6 +538,44 @@ namespace
         int rowEnd_ = 0;
     };
 
+    // Which terrain cells are split along their other diagonal, read from the records the way
+    // SetTriangleIndicesForCell (0x00752AF0) does. One load per cell asked about. Without the
+    // records every cell counts as not flipped.
+    class TerrainCellFlips
+    {
+    public:
+        TerrainCellFlips(const HookAddresses& addresses, const void* const overlayManager, const TerrainGridDimensions& dimensions)
+            : dimensions_(dimensions)
+        {
+            if (!overlayManager || addresses.overlayTerrainViewOffset <= 0 || addresses.terrainViewTerrainOffset <= 0 ||
+                addresses.terrainVertexRecordsOffset <= 0) {
+                return;
+            }
+            const auto* const view = DrawContextAccess::ReadField<const std::byte*>(overlayManager, addresses.overlayTerrainViewOffset);
+            const auto* const terrain = view ? DrawContextAccess::ReadField<const std::byte*>(view, addresses.terrainViewTerrainOffset) : nullptr;
+            records_ = terrain ? DrawContextAccess::ReadField<const std::byte*>(terrain, addresses.terrainVertexRecordsOffset) : nullptr;
+        }
+
+        [[nodiscard]] bool IsFlipped(const int cellX, const int cellZ) const noexcept
+        {
+            if (!records_ || cellX < 0 || cellZ < 0 || cellX >= dimensions_.cellCountX || cellZ >= dimensions_.cellCountZ) {
+                return false;
+            }
+            const auto index = static_cast<size_t>(cellZ * dimensions_.vertexCountX + cellX);
+            uint16_t flags = 0;
+            std::memcpy(&flags, records_ + index * kRecordSize + kRecordFlagsOffset, sizeof(flags));
+            return (flags & kFlippedFlags) != 0;
+        }
+
+    private:
+        static constexpr size_t kRecordSize = 0x24;
+        static constexpr size_t kRecordFlagsOffset = 0x22;
+        static constexpr uint16_t kFlippedFlags = 0x3000;  // internal 0x1000, external 0x2000
+
+        TerrainGridDimensions dimensions_;
+        const std::byte* records_ = nullptr;
+    };
+
     // The four corners of a terrain cell: (x, z), (x, z + 1), (x + 1, z + 1), (x + 1, z).
     [[nodiscard]] bool LoadTerrainCellVertices(const HookAddresses& addresses,
                                                const TerrainGridDimensions& dimensions,
@@ -613,7 +666,12 @@ namespace
 
     // The overlay's cells [x0, x1) of one cell row, placed on their terrain triangles. A long
     // shape is placed only as far as it has been on screen.
-    void BuildPaintRow(const PaintOverlay& paint, const int cellZ, const int x0, const int x1, PaintDrawCache::Row& row)
+    void BuildPaintRow(const PaintOverlay& paint,
+                       const TerrainCellFlips& flips,
+                       const int cellZ,
+                       const int x0,
+                       const int x1,
+                       PaintDrawCache::Row& row)
     {
         const TerrainPaint::CellRange& range = paint.mesh->Cells();
         std::array<float, kTerrainPaintMaxTextures> weights{};
@@ -631,24 +689,27 @@ namespace
                 TerrainPaint::PickTexture(weightSpan, paint.style->variationSeed, cellX, cellZ) != paint.textureIndex) {
                 continue;
             }
-            const TerrainPaint::CellMesh& cell = paint.mesh->Cell(cellX, cellZ);
+            const bool flipped = flips.IsFlipped(cellX, cellZ);
+            const TerrainPaint::CellMesh& cell = paint.mesh->Cell(cellX, cellZ, flipped);
             if (cell.Empty()) {
                 continue;
             }
             const float left = static_cast<float>(cellX) * kSize;
             const float top = static_cast<float>(cellZ) * kSize;
-            const GridCorner c00{left, top};
-            const GridCorner c01{left, top + kSize};
-            const GridCorner c11{left + kSize, top + kSize};
-            const GridCorner c10{left + kSize, top};
+            const std::array<GridCorner, 4> corners{GridCorner{left, top},
+                                                    GridCorner{left, top + kSize},
+                                                    GridCorner{left + kSize, top + kSize},
+                                                    GridCorner{left + kSize, top}};
             row.cells.push_back(PaintDrawCache::CellSpan{
                 .cellX = cellX,
                 .first = static_cast<uint32_t>(row.vertices.size()),
                 .lowerCount = static_cast<uint32_t>(cell.lower.size()),
                 .upperCount = static_cast<uint32_t>(cell.upper.size()),
+                .flipped = flipped,
             });
-            PlaceVertices(cell.lower, c00, c01, c11, row.vertices);
-            PlaceVertices(cell.upper, c00, c11, c10, row.vertices);
+            const std::array<size_t, 6>& t = CellTriangles(flipped);
+            PlaceVertices(cell.lower, corners[t[0]], corners[t[1]], corners[t[2]], row.vertices);
+            PlaceVertices(cell.upper, corners[t[3]], corners[t[4]], corners[t[5]], row.vertices);
         }
         row.built = true;
         row.builtX0 = x0;
@@ -695,6 +756,7 @@ namespace
     void LayPaint(const HookAddresses& addresses,
                   const TerrainGridDimensions& dimensions,
                   const DrawFrustum& frustum,
+                  const TerrainCellFlips& flips,
                   const TerrainDrawRect& drawRect,
                   const PaintOverlay& paint,
                   const float alphaScale,
@@ -716,24 +778,35 @@ namespace
                 continue;
             }
             PaintDrawCache::Row& row = cache.rows[static_cast<size_t>(cellZ - range.minZ)];
-            if (!row.built || x0 < row.builtX0 || x1 > row.builtX1) {
+            const auto firstVisible = [&] {
+                return std::ranges::lower_bound(row.cells, x0, {}, &PaintDrawCache::CellSpan::cellX);
+            };
+            const auto diagonalChanged = [&] {
+                for (auto span = firstVisible(); span != row.cells.end() && span->cellX < x1; ++span) {
+                    if (span->flipped != flips.IsFlipped(span->cellX, cellZ)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            if (!row.built || x0 < row.builtX0 || x1 > row.builtX1 || diagonalChanged()) {
                 // The cells' cuts are kept by the mesh: placing them again is cheap.
-                BuildPaintRow(paint, cellZ, row.built ? std::min(x0, row.builtX0) : x0,
+                BuildPaintRow(paint, flips, cellZ, row.built ? std::min(x0, row.builtX0) : x0,
                               row.built ? std::max(x1, row.builtX1) : x1, row);
             }
 
             const std::span<const PaintDrawCache::PlacedVertex> vertices(row.vertices);
-            auto span = std::ranges::lower_bound(row.cells, x0, {}, &PaintDrawCache::CellSpan::cellX);
-            for (; span != row.cells.end() && span->cellX < x1; ++span) {
+            for (auto span = firstVisible(); span != row.cells.end() && span->cellX < x1; ++span) {
                 std::array<PackedTerrainVertex, 4> corners{};
                 if (!LoadTerrainCellVertices(addresses, dimensions, span->cellX, cellZ, corners)) {
                     continue;
                 }
                 const bool vertexUv = paint.mesh->HasUvMap();
+                const std::array<size_t, 6>& t = CellTriangles(span->flipped);
                 LiftVertices(vertices.subspan(span->first, span->lowerCount),
-                             corners[0], corners[1], corners[2], alphaScale, vertexUv, output);
+                             corners[t[0]], corners[t[1]], corners[t[2]], alphaScale, vertexUv, output);
                 LiftVertices(vertices.subspan(span->first + span->lowerCount, span->upperCount),
-                             corners[0], corners[2], corners[3], alphaScale, vertexUv, output);
+                             corners[t[3]], corners[t[4]], corners[t[5]], alphaScale, vertexUv, output);
             }
         }
     }
@@ -872,6 +945,7 @@ namespace TerrainDecal
         };
 
         const DrawFrustum frustum(addresses, request.overlayManager, dimensions);
+        const TerrainCellFlips flips(addresses, request.overlayManager, dimensions);
 
         if (isManaged && managed.kind == ManagedOverlay::Kind::Paint) {
             const PaintOverlay& paint = managed.paint;
@@ -883,7 +957,7 @@ namespace TerrainDecal
             // The shadow passes draw again what the decal pass before them laid.
             if (!(shadowRecovery && cache.lastDrawnValid && cache.lastDrawnPass == request.pass)) {
                 cache.lastDrawn.clear();
-                LayPaint(addresses, dimensions, frustum, drawRect, paint,
+                LayPaint(addresses, dimensions, frustum, flips, drawRect, paint,
                          std::clamp(paint.style->opacity, 0.0f, 1.0f), cache.lastDrawn);
                 cache.lastDrawnPass = request.pass;
                 cache.lastDrawnValid = true;
@@ -975,13 +1049,14 @@ namespace TerrainDecal
                     continue;
                 }
 
+                const std::array<size_t, 6>& triangles = CellTriangles(flips.IsFlipped(cellX, cellZ));
                 if (std::all_of(quad.begin(), quad.end(), [&](const ClipVertex& v) { return IsInside(v, clipU, clipV, bounds); })) {
-                    for (const size_t i : {0u, 1u, 2u, 0u, 2u, 3u}) {
+                    for (const size_t i : triangles) {
                         output.push_back(quad[i].vertex);
                     }
                 }
                 else {
-                    ClipAndEmitQuad(quad, clipU, clipV, bounds, output);
+                    ClipAndEmitCell(quad, triangles, clipU, clipV, bounds, output);
                 }
             }
         }
