@@ -45,6 +45,8 @@ namespace TerrainDecal
                 .overlayTerrainViewOffset = 0x8C,
                 .terrainViewDrawRowStartOffset = 0x98,
                 .terrainViewDrawRowEndOffset = 0x9C,
+                .terrainViewTerrainOffset = 0x20,
+                .terrainVertexRecordsOffset = 0x6C,
                 .overlayWholeRectFlagOffsetA = 0x15,
                 .overlayWholeRectFlagOffsetB = 0x16,
                 .overlayRectOffset = 0x0C,
