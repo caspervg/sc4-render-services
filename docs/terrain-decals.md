@@ -119,6 +119,12 @@ Important fields:
   place (`u' = 1 - u`, the SC4 lot-texture orientation convention). Combined
   with `rotationTurns` this reaches every mirrored orientation. Requires the
   custom clipped renderer.
+- `flags` bit `kTerrainDecalFlagUnderLots` (`0x40000000`): draws the decal right
+  after the terrain, before lots and networks, so their textures cover it.
+  Shadows fall on it and shadow recovery leaves it alone. Only for decals on
+  `StaticLand`, and it needs the draw service (`EnableDrawService=true`).
+  Without it the decal draws with the others. This is the decal side of the
+  paint layer `UnderLots`, see `docs/terrain-paint.md`.
 - `hasUvWindow` + `uvWindow`: optional atlas/subrect override.
 - `drawOrder`: decals and terrain paints draw in ascending order, so a higher
   value lands on top. Game decals count as 0. Requires the custom clipped
@@ -225,9 +231,11 @@ edges. Query `GZIID_cIGZTerrainPaintService`; see `docs/terrain-paint.md`.
 - `CreateDecal` and friends take the struct size. Callers built before
   `drawOrder` existed pass the older size and get draw order 0.
 - `flags` are preserved in snapshots and save data; the mirror bit
-  (`kTerrainDecalFlagMirror`) is consumed by the custom renderer, but
+  (`kTerrainDecalFlagMirror`) is consumed by the custom renderer and the
+  under-lots bit (`kTerrainDecalFlagUnderLots`) by the service, but
   `TerrainDecalState::flags` is not pushed into the game overlay manager
-  during create/update.
+  during create/update. An older service keeps the under-lots bit in the save
+  and draws the decal with the others.
 - The service owns decal persistence only for decals created through this API.
   Existing unmanaged overlays are not automatically imported into the registry.
 

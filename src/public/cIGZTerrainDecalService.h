@@ -34,6 +34,12 @@ struct TerrainDecalUvWindow {
 // Requires the custom clipped renderer (EnableCustomTerrainDecalRenderer).
 static constexpr uint32_t kTerrainDecalFlagMirror = 0x80000000u;
 
+// Service-defined bit in TerrainDecalState::flags: the decal is drawn right after the terrain,
+// before lots and networks, so their textures cover it, as with TerrainPaintLayer::UnderLots.
+// Shadows fall on it and shadow recovery leaves it alone. Only for decals on StaticLand. It needs
+// the draw service (EnableDrawService=true). Without it the decal draws with the others.
+static constexpr uint32_t kTerrainDecalFlagUnderLots = 0x40000000u;
+
 struct TerrainDecalState {
     cGZPersistResourceKey textureKey{};
     cISTETerrainView::tOverlayManagerType overlayType = cISTETerrainView::tOverlayManagerType::DynamicLand;
