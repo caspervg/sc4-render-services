@@ -33,8 +33,20 @@ namespace
     constexpr uint32_t kSC4MessageSave = 0x26C63344;
     constexpr uint32_t kInvalidOverlayId = 0xFFFFFFFFu;
 
-    // Drawn in the static pass, so SCD3D11's live shadows land on paint. DynamicLand draws after them.
-    constexpr auto kPaintOverlayManager = cISTETerrainView::tOverlayManagerType::StaticLand;
+    // StaticLand is drawn in the static pass, so SCD3D11's live shadows land on paint there.
+    // DynamicLand draws after them. Paints under lots live on StaticLand too, but are drawn in a
+    // pass of their own.
+    [[nodiscard]] cISTETerrainView::tOverlayManagerType PaintOverlayManager(const TerrainPaintLayer layer) noexcept
+    {
+        return layer == TerrainPaintLayer::OverShadows ? cISTETerrainView::tOverlayManagerType::DynamicLand
+                                                       : cISTETerrainView::tOverlayManagerType::StaticLand;
+    }
+
+    [[nodiscard]] bool DecalUnderLots(const TerrainDecalState& state) noexcept
+    {
+        return (state.flags & kTerrainDecalFlagUnderLots) != 0 &&
+               state.overlayType == cISTETerrainView::tOverlayManagerType::StaticLand;
+    }
     // A paint shape larger than this is refused.
     constexpr uint64_t kMaxPaintPoints = 1u << 20;
 
@@ -124,6 +136,11 @@ namespace
         }
         if (!IsFinite(style.wear) || !IsFinite(style.wearPatchMeters)) {
             error = "wear must be finite";
+            return false;
+        }
+        if (style.layer != TerrainPaintLayer::OverLots && style.layer != TerrainPaintLayer::UnderLots &&
+            style.layer != TerrainPaintLayer::OverShadows) {
+            error = "layer is invalid";
             return false;
         }
         style.opacity = std::clamp(style.opacity, 0.0f, 1.0f);
@@ -401,8 +418,8 @@ bool TerrainDecalService::CreateRuntimeDecal_(const TerrainDecalId id, const Ter
         return false;
     }
 
-    overlayIndex_[OverlayKey{overlayManager, OverlaySlotKey(overlayManager, overlayId)}] =
-        OverlayTarget{ManagedOverlay::Kind::Decal, id.value, 0};
+    IndexOverlay_(overlayManager, overlayId,
+                  OverlayTarget{ManagedOverlay::Kind::Decal, id.value, 0, DecalUnderLots(state)});
     return true;
 }
 
@@ -430,14 +447,14 @@ bool TerrainDecalService::ApplyStateToRuntime_(TerrainDecalRecord& record, const
     }
 
     const uint32_t oldOverlayId = *record.runtime.overlayId;
-    overlayIndex_.erase(OverlayKey{oldOverlayManager, OverlaySlotKey(oldOverlayManager, oldOverlayId)});
+    UnindexOverlay_(oldOverlayManager, oldOverlayId);
     oldOverlayManager->RemoveOverlay(oldOverlayId);
 
     record.state = state;
     record.runtime.overlayId = replacementOverlayId;
     record.runtime.overlayManager = newOverlayManager;
-    overlayIndex_[OverlayKey{newOverlayManager, OverlaySlotKey(newOverlayManager, replacementOverlayId)}] =
-        OverlayTarget{ManagedOverlay::Kind::Decal, record.id.value, 0};
+    IndexOverlay_(newOverlayManager, replacementOverlayId,
+                  OverlayTarget{ManagedOverlay::Kind::Decal, record.id.value, 0, DecalUnderLots(state)});
     return true;
 }
 
@@ -452,7 +469,7 @@ bool TerrainDecalService::RemoveRuntimeDecal_(const TerrainDecalId id, const boo
         auto* const overlayManager = static_cast<cISTEOverlayManager*>(const_cast<void*>(record->runtime.overlayManager));
         // Otherwise the city is closing: the index is cleared and the manager may be gone.
         if (removeRuntimeOverlay && overlayManager) {
-            overlayIndex_.erase(OverlayKey{overlayManager, OverlaySlotKey(overlayManager, *record->runtime.overlayId)});
+            UnindexOverlay_(overlayManager, *record->runtime.overlayId);
             overlayManager->RemoveOverlay(*record->runtime.overlayId);
         }
     }
@@ -477,7 +494,7 @@ bool TerrainDecalService::CreatePaint(const TerrainPaintShape& shape,
                                       const uint32_t styleSize,
                                       TerrainPaintId* const outId)
 {
-    if (!style || !outId || styleSize < kTerrainPaintStyleSize) {
+    if (!style || !outId || styleSize < kTerrainPaintStyleSizeV1) {
         return false;
     }
     if (!PaintsAvailable_()) {
@@ -574,7 +591,7 @@ bool TerrainDecalService::SetPaintShape(const TerrainPaintId id, const TerrainPa
 bool TerrainDecalService::SetPaintStyle(const TerrainPaintId id, const TerrainPaintStyle* const style, const uint32_t styleSize)
 {
     const auto it = paints_.find(id.value);
-    if (it == paints_.end() || !style || styleSize < kTerrainPaintStyleSize) {
+    if (it == paints_.end() || !style || styleSize < kTerrainPaintStyleSizeV1) {
         return false;
     }
 
@@ -597,6 +614,9 @@ bool TerrainDecalService::SetPaintStyle(const TerrainPaintId id, const TerrainPa
         const cGZPersistResourceKey& b = current.textures[i].key;
         newTextures = a.type != b.type || a.group != b.group || a.instance != b.instance;
     }
+    // Overlays made again in another layer also make the game draw the static view again
+    // where they lie.
+    newTextures = newTextures || validated.layer != current.layer;
     record.data.style = validated;
     record.uvFromGround = UvFromGround(validated);
     if (featherChanged) {
@@ -612,7 +632,7 @@ bool TerrainDecalService::SetPaintStyle(const TerrainPaintId id, const TerrainPa
 bool TerrainDecalService::GetPaintStyle(const TerrainPaintId id, TerrainPaintStyle* const outStyle, const uint32_t styleSize) const
 {
     const auto it = paints_.find(id.value);
-    if (it == paints_.end() || !outStyle || styleSize < kTerrainPaintStyleSize) {
+    if (it == paints_.end() || !outStyle || styleSize < kTerrainPaintStyleSizeV1) {
         return false;
     }
     CopyToCaller(it->second.data.style, outStyle, styleSize);
@@ -642,7 +662,8 @@ bool TerrainDecalService::RealizePaint_(PaintRecord& record, const bool newTextu
     if (!TryGetCurrentCity_(city)) {
         return false;
     }
-    cISTEOverlayManager* const overlayManager = ResolveOverlayManager_(city, kPaintOverlayManager);
+    const auto overlayType = PaintOverlayManager(record.data.style.layer);
+    cISTEOverlayManager* const overlayManager = ResolveOverlayManager_(city, overlayType);
     if (!overlayManager) {
         return false;
     }
@@ -656,7 +677,7 @@ bool TerrainDecalService::RealizePaint_(PaintRecord& record, const bool newTextu
     const float z1 = static_cast<float>(cells.maxZ + 1) * TerrainPaint::kCellSize;
 
     TerrainDecalState overlayState{};
-    overlayState.overlayType = kPaintOverlayManager;
+    overlayState.overlayType = overlayType;
     overlayState.decalInfo.center = cS3DVector2((x0 + x1) * 0.5f, (z0 + z1) * 0.5f);
     overlayState.decalInfo.baseSize = std::max(x1 - x0, z1 - z0);
     overlayState.decalInfo.rotationTurns = 0.0f;
@@ -688,8 +709,9 @@ bool TerrainDecalService::RealizePaint_(PaintRecord& record, const bool newTextu
             return false;
         }
         record.overlayIds.push_back(overlayId);
-        overlayIndex_[OverlayKey{overlayManager, OverlaySlotKey(overlayManager, overlayId)}] =
-            OverlayTarget{ManagedOverlay::Kind::Paint, record.data.id.value, i};
+        IndexOverlay_(overlayManager, overlayId,
+                      OverlayTarget{ManagedOverlay::Kind::Paint, record.data.id.value, i,
+                                    record.data.style.layer == TerrainPaintLayer::UnderLots});
     }
     return true;
 }
@@ -699,7 +721,7 @@ void TerrainDecalService::UnrealizePaint_(PaintRecord& record, const bool remove
     auto* const overlayManager = static_cast<cISTEOverlayManager*>(const_cast<void*>(record.overlayManager));
     for (const uint32_t overlayId : record.overlayIds) {
         if (removeOverlays && overlayManager) {
-            overlayIndex_.erase(OverlayKey{overlayManager, OverlaySlotKey(overlayManager, overlayId)});
+            UnindexOverlay_(overlayManager, overlayId);
             overlayManager->RemoveOverlay(overlayId);
         }
     }
@@ -760,6 +782,71 @@ std::pair<int32_t, uint32_t> TerrainDecalService::OverlayDrawOrder(const void* c
                                   : std::pair{0, 0u};
 }
 
+bool TerrainDecalService::OverlayUnderLots(const void* const overlayManager, const uint32_t overlayId)
+{
+    const auto it = overlayIndex_.find(OverlayKey{overlayManager, overlayId});
+    return it != overlayIndex_.end() && it->second.underLots;
+}
+
+bool TerrainDecalService::HasOverlaysUnderLots(const void* const overlayManager)
+{
+    const auto it = underLotsCounts_.find(overlayManager);
+    return it != underLotsCounts_.end() && it->second > 0;
+}
+
+void TerrainDecalService::IndexOverlay_(const void* const overlayManager, const uint32_t overlayId,
+                                        const OverlayTarget& target)
+{
+    UnindexOverlay_(overlayManager, overlayId);
+    overlayIndex_[OverlayKey{overlayManager, OverlaySlotKey(overlayManager, overlayId)}] = target;
+    if (target.underLots) {
+        ++underLotsCounts_[overlayManager];
+    }
+}
+
+void TerrainDecalService::UnindexOverlay_(const void* const overlayManager, const uint32_t overlayId)
+{
+    const auto it = overlayIndex_.find(OverlayKey{overlayManager, OverlaySlotKey(overlayManager, overlayId)});
+    if (it == overlayIndex_.end()) {
+        return;
+    }
+    if (it->second.underLots) {
+        const auto count = underLotsCounts_.find(overlayManager);
+        if (count != underLotsCounts_.end() && --count->second == 0) {
+            underLotsCounts_.erase(count);
+        }
+    }
+    overlayIndex_.erase(it);
+}
+
+// --- Drawing under lots -------------------------------------------------------------------------
+
+void TerrainDecalService::OnPreStaticPass_(const DrawServicePass pass, const bool begin, void* const userData)
+{
+    // At the end of the pass the terrain is drawn and the lots and networks are not yet.
+    if (pass == DrawServicePass::PreStatic && !begin && userData) {
+        static_cast<TerrainDecalService*>(userData)->DrawUnderLots_();
+    }
+}
+
+void TerrainDecalService::DrawUnderLots_()
+{
+    if (!cityLoaded_ || !renderHook_ || !drawService_ || underLotsCounts_.empty()) {
+        return;
+    }
+    cISC4City* city = nullptr;
+    if (!TryGetCurrentCity_(city)) {
+        return;
+    }
+    cISTEOverlayManager* const overlayManager =
+        ResolveOverlayManager_(city, cISTETerrainView::tOverlayManagerType::StaticLand);
+    const SC4DrawContextHandle drawContext = drawService_->WrapActiveRendererDrawContext();
+    if (!overlayManager || !drawContext.ptr) {
+        return;
+    }
+    renderHook_->DrawUnderLots(overlayManager, static_cast<SC4DrawContext*>(drawContext.ptr));
+}
+
 // --- Lifetime, save and load --------------------------------------------------------------------
 
 bool TerrainDecalService::OnTick(const uint32_t unknown1)
@@ -797,6 +884,11 @@ void TerrainDecalService::SetShadowRecoveryUseStencil(const bool shadowRecoveryU
     shadowRecoveryUseStencil_ = shadowRecoveryUseStencil;
 }
 
+void TerrainDecalService::SetDrawService(cIGZDrawService* const drawService) noexcept
+{
+    drawService_ = drawService;
+}
+
 bool TerrainDecalService::Init()
 {
     if (versionTag_ != 641) {
@@ -818,6 +910,16 @@ bool TerrainDecalService::Init()
     }
     else {
         renderHook_->SetOverlaySource(this);
+        if (drawService_ &&
+            drawService_->RegisterDrawPassCallback(DrawServicePass::PreStatic, &OnPreStaticPass_, this,
+                                                   &preStaticCallbackToken_)) {
+            renderHook_->SetUnderLotsPassAvailable(true);
+        }
+        else {
+            preStaticCallbackToken_ = 0;
+            LOG_WARN("TerrainDecalService: without the draw service, paints and decals under lots are drawn "
+                     "with the others");
+        }
     }
 
     return true;
@@ -825,10 +927,16 @@ bool TerrainDecalService::Init()
 
 bool TerrainDecalService::Shutdown()
 {
+    if (drawService_ && preStaticCallbackToken_ != 0) {
+        drawService_->UnregisterDrawPassCallback(preStaticCallbackToken_);
+    }
+    preStaticCallbackToken_ = 0;
+
     ClearRuntimeState_(false);
     pendingLoadedDecals_.clear();
 
     if (renderHook_) {
+        renderHook_->SetUnderLotsPassAvailable(false);
         renderHook_->SetOverlaySource(nullptr);
         renderHook_->Uninstall();
         renderHook_.reset();
@@ -883,6 +991,7 @@ void TerrainDecalService::ClearRuntimeState_(const bool removeRuntimeObjects)
     nextPaintId_ = 1;
     nextSequence_ = 1;
     overlayIndex_.clear();
+    underLotsCounts_.clear();
 }
 
 void TerrainDecalService::OnPostCityInit_(cIGZMessage2Standard* msg)
@@ -1117,7 +1226,8 @@ void TerrainDecalService::LoadPaints_(std::vector<TerrainPaintCodec::PaintSnapsh
 void TerrainDecalService::RealizeLoadedPaints_()
 {
     cISC4City* city = nullptr;
-    if (unrealizedPaints_.empty() || !TryGetCurrentCity_(city) || !ResolveOverlayManager_(city, kPaintOverlayManager)) {
+    if (unrealizedPaints_.empty() || !TryGetCurrentCity_(city) ||
+        !ResolveOverlayManager_(city, cISTETerrainView::tOverlayManagerType::StaticLand)) {
         return;
     }
 

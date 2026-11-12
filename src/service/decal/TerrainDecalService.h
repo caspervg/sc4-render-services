@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "cRZBaseSystemService.h"
+#include "public/cIGZDrawService.h"
 #include "public/cIGZTerrainDecalService.h"
 #include "public/cIGZTerrainPaintService.h"
 #include "public/TerrainDecalServiceIds.h"
@@ -62,6 +63,9 @@ public:
     void SetCustomDefaultDepthOffset(int customDefaultDepthOffset) noexcept;
     void SetShadowRecoveryOpacityScale(float shadowRecoveryOpacityScale) noexcept;
     void SetShadowRecoveryUseStencil(bool shadowRecoveryUseStencil) noexcept;
+    // Draws paints and decals under lots at the end of its PreStatic pass. Set it before Init.
+    // Without it they are drawn with the others.
+    void SetDrawService(cIGZDrawService* drawService) noexcept;
     bool Init() override;
     bool Shutdown();
     bool HandleMessage(cIGZMessage2* message);
@@ -94,11 +98,21 @@ private:
         TerrainDecal::ManagedOverlay::Kind kind = TerrainDecal::ManagedOverlay::Kind::Decal;
         uint32_t recordId = 0;
         uint32_t textureIndex = 0;
+        bool underLots = false;
     };
 
     // ManagedOverlaySource
     bool ResolveOverlay(const void* overlayManager, uint32_t overlayId, TerrainDecal::ManagedOverlay& out) override;
     std::pair<int32_t, uint32_t> OverlayDrawOrder(const void* overlayManager, uint32_t overlayId) override;
+    bool OverlayUnderLots(const void* overlayManager, uint32_t overlayId) override;
+    bool HasOverlaysUnderLots(const void* overlayManager) override;
+
+    // overlayIndex_ entries, keeping the count of overlays under lots per manager.
+    void IndexOverlay_(const void* overlayManager, uint32_t overlayId, const OverlayTarget& target);
+    void UnindexOverlay_(const void* overlayManager, uint32_t overlayId);
+
+    static void OnPreStaticPass_(DrawServicePass pass, bool begin, void* userData);
+    void DrawUnderLots_();
 
     bool CreateRuntimeDecal_(TerrainDecalId id, const TerrainDecalState& state, uint32_t sequence);
     bool ApplyStateToRuntime_(TerrainDecalRecord& record, const TerrainDecalState& state);
@@ -136,6 +150,9 @@ private:
     uint32_t nextPaintId_ = 1;
     uint32_t nextSequence_ = 1;
     std::unordered_map<OverlayKey, OverlayTarget, OverlayKeyHash> overlayIndex_{};
+    std::unordered_map<const void*, uint32_t> underLotsCounts_{};
+    cIGZDrawService* drawService_ = nullptr;
+    uint32_t preStaticCallbackToken_ = 0;
     std::unique_ptr<TerrainDecal::TerrainDecalHook> renderHook_{};
     std::vector<TerrainDecalSnapshot> pendingLoadedDecals_{};
     // Loaded paints whose overlays wait for the city.

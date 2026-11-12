@@ -11,12 +11,13 @@ A paint is a **shape** and a **style**:
 - The shape is one or more polygon rings in the ground plane (x and z in metres). The area is
   everything inside an odd number of rings, so a ring inside another one is a hole.
 - The style says how the area looks: up to eight textures, their size, turn and offset, a colour,
-  an opacity, a soft edge, and the draw order.
+  an opacity, a soft edge, the layer and the draw order.
 
-The service drapes the paint over the terrain and follows later terrain changes. It draws the
-paint like a decal, in the game's decal pass under the shadows, including the shadow recovery
-pass. Paints live on the `StaticLand` overlay manager, so SCD3D11's live shadows fall on them.
-It also stores the paint in the city save.
+The service drapes the paint over the terrain and follows later terrain changes. By default it
+draws the paint like a decal, in the game's decal pass over lots and networks and under the
+shadows, including the shadow recovery pass. Paints live on the `StaticLand` overlay manager, so
+SCD3D11's live shadows fall on them. The layer can put a paint under lots and networks instead, or
+over the shadows (see [Layers](#layers)). The service also stores the paint in the city save.
 
 ## Getting the interface
 
@@ -72,14 +73,48 @@ Style calls take the struct size, so the style can grow by appending fields in a
 | `depthOffset` | As for decals; -1 uses the service default. |
 | `enabled` | Hidden while false. It is still saved. |
 | `flags` | `kTerrainPaintFlagTransient`: the paint is not saved. Use it for previews. |
+| `layer` | Where the paint sits among what the game draws flat on the ground. See [Layers](#layers). |
+
+Style calls accept the size the style had before `layer` (`kTerrainPaintStyleSizeV1`). Paints
+made that way are `OverLots`.
+
+## Layers
+
+The game draws a frame in passes. The ones that matter for paint are, in order:
+
+1. The terrain.
+2. The static models: lot textures, networks, buildings and props.
+3. The `StaticLand` overlays: the game's decals and the shadows of buildings.
+4. The cars and other moving things, then the `DynamicLand` overlays.
+
+The overlays do not write depth, so whatever is drawn later covers what is under it. Buildings,
+props and cars hide a paint in every layer, the way they hide the ground.
+
+| `layer` | Drawn | Result |
+|---|---|---|
+| `OverLots` (default) | With the `StaticLand` overlays (3) | Over lot and network textures, under shadows |
+| `UnderLots` | Right after the terrain (between 1 and 2) | Under lot and network textures, like part of the ground. Shadows fall on it |
+| `OverShadows` | With the `DynamicLand` overlays (4) | Over lot and network textures and over shadows. SCD3D11's live shadows do not fall on it |
+
+`UnderLots` paints stay on the `StaticLand` overlay manager, so the game culls them and redraws
+the static view when they change, as for any decal. The service draws them in a pass of its own: at
+the end of the renderer's `PreStatic` pass it runs the manager's `DrawOverlays` (`0x00738A50`)
+again, with the decal pass limited to them and the shadow passes left out. The usual decal pass then
+leaves them out, and so does shadow recovery. This needs the draw service
+(`EnableDrawService=true`), whose `PreStatic` hook also covers the partial redraws of the static
+view. Without it, `UnderLots` paints are drawn as `OverLots`.
+
+Decals can go under lots too, with the `kTerrainDecalFlagUnderLots` flag
+(`docs/terrain-decals.md`).
 
 ## Draw order
 
 Decals have a `drawOrder` too (`TerrainDecalState::drawOrder`). Paints and decals made through the
 service sort together, so a texture decal can sit on top of a paint and the other way round. Two
 conditions apply:
-- They must share an overlay manager. Paints use `StaticLand`; decals on `DynamicLand` always
-  draw over them.
+- They must be in the same layer. Draw order sorts within a layer: an `OverLots` paint is above an
+  `UnderLots` paint whatever their draw orders, and decals on `DynamicLand` always draw over
+  `OverLots` paints.
 - The custom renderer must be on.
 
 ## How it is drawn
@@ -142,6 +177,19 @@ record alone.
 
 The record format is defined by `src/service/decal/TerrainPaintCodec.h`. Every paint carries its
 byte length, so a later minor version can add fields that an older reader skips.
+
+| Minor version | Added at the end of each paint |
+|---|---|
+| 1 | The UV map |
+| 2 | Wear |
+| 3 | The layer |
+
+- Cities saved before the layer load with every paint `OverLots`, as they looked before.
+- An older service loads a city saved with layers and draws every paint `OverLots`. It drops the
+  layers when it saves the city.
+- A layer this service does not know, from a newer one, loads as `OverLots`.
+
+`tests/TerrainPaintCodecTests.cpp` checks these cases.
 
 ## Limits
 

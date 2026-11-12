@@ -215,6 +215,13 @@ if(SC4RS_BUILD_TESTS)
     add_executable(TerrainPaintMeshTests ${SC4RS_ROOT}/tests/TerrainPaintMeshTests.cpp)
     target_link_libraries(TerrainPaintMeshTests PRIVATE sc4rs_terrain_paint)
 
+    add_executable(TerrainPaintCodecTests
+            ${SC4RS_ROOT}/tests/TerrainPaintCodecTests.cpp
+            ${SC4RS_ROOT}/src/service/decal/TerrainPaintCodec.cpp
+    )
+    target_include_directories(TerrainPaintCodecTests PRIVATE ${SC4RS_ROOT}/src)
+    target_link_libraries(TerrainPaintCodecTests PRIVATE gzcom2)
+
     add_executable(ImGuiThemesTests
             ${SC4RS_ROOT}/tests/ImGuiThemesTests.cpp
             ${SC4RS_ROOT}/src/service/ImGuiThemes.cpp

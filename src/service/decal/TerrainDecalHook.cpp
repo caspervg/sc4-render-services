@@ -221,12 +221,63 @@ namespace TerrainDecal
         }
 
         ++sActiveHook_->overlayPass_;
+        sActiveHook_->FilterByLayer_(overlayManager, decalIds);
         sActiveHook_->SortByDrawOrder_(overlayManager, decalIds);
         sActiveHook_->CallOriginalOverlayPass_(sActiveHook_->drawDecalsCallSitePatch_,
                                                overlayManager,
                                                worldToScreenMatrix,
                                                drawContext,
                                                decalIds);
+    }
+
+    void TerrainDecalHook::SetUnderLotsPassAvailable(const bool available) noexcept
+    {
+        underLotsPassAvailable_ = available;
+    }
+
+    void TerrainDecalHook::DrawUnderLots(void* const overlayManager, SC4DrawContext* const drawContext)
+    {
+        if (!IsInstalled() || !addresses_ || !addresses_->drawOverlays || !overlayManager || !drawContext ||
+            !overlaySource_ || underLotsPassActive_ || !overlaySource_->HasOverlaysUnderLots(overlayManager)) {
+            return;
+        }
+
+        // The game's own overlay pass for the manager, so culling, texture setup and the custom
+        // renderer all work as usual. The decal pass keeps only the overlays under lots, and the
+        // shadow passes are left out: the game draws shadows after the static models.
+        underLotsPassActive_ = true;
+        reinterpret_cast<DrawOverlaysFn>(addresses_->drawOverlays)(overlayManager, drawContext);
+        underLotsPassActive_ = false;
+
+        // What this pass laid is not to be drawn again by a later pass.
+        ++overlayPass_;
+        currentTexTransformValid_ = false;
+        currentTexTransformStage_ = -1;
+    }
+
+    void TerrainDecalHook::FilterByLayer_(const void* const overlayManager, int* const decalIds) const
+    {
+        // Overlays under lots go to their own pass only while there is one.
+        if (!overlaySource_ || !(underLotsPassActive_ || underLotsPassAvailable_)) {
+            return;
+        }
+        if (!underLotsPassActive_ && !overlaySource_->HasOverlaysUnderLots(overlayManager)) {
+            return;
+        }
+
+        // decalIds is the game's std::vector<uint32_t> of overlay slots, refilled for every
+        // overlay pass. Its elements are plain integers, so moving its end in drops the rest.
+        auto* const range = reinterpret_cast<uint32_t**>(decalIds);
+        if (!range || !range[0]) {
+            return;
+        }
+        uint32_t* out = range[0];
+        for (const uint32_t* id = range[0]; id != range[1]; ++id) {
+            if (overlaySource_->OverlayUnderLots(overlayManager, *id) == underLotsPassActive_) {
+                *out++ = *id;
+            }
+        }
+        range[1] = out;
     }
 
     void TerrainDecalHook::SortByDrawOrder_(const void* const overlayManager, int* const decalIds) const
@@ -442,6 +493,10 @@ namespace TerrainDecal
                                                   SC4DrawContext* drawContext,
                                                   int* decalIds)
     {
+        if (underLotsPassActive_) {
+            // Shadows are drawn in the manager's own pass, over what lies under lots.
+            return;
+        }
         CallOriginalOverlayPass_(patch, overlayManager, worldToScreenMatrix, drawContext, decalIds);
         ReplayManagedDecalsAfterShadows_(overlayManager, worldToScreenMatrix, drawContext, decalIds);
         // What the decal pass laid is not to be drawn again by a later pass.
