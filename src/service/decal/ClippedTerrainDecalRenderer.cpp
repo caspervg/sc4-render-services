@@ -36,6 +36,8 @@ namespace
     constexpr std::ptrdiff_t kSlotRectOffset = 0x0C;
     constexpr std::ptrdiff_t kSlotMatrixOffset = 0x1C;
     constexpr std::ptrdiff_t kSlotOpacityOffset = 0x9C;
+    // cS3DTextureBinding*: +0 the driver texture name of each frame, +4 the frame count.
+    constexpr std::ptrdiff_t kSlotTextureBindingOffset = 0xAC;
 
     // Overlay flags as cSTEOverlayManager::DrawDecals (0x00736790) reads them.
     constexpr uint32_t kOverlayFlagWrapU = 0x02;
@@ -49,6 +51,7 @@ namespace
     using SetTransparencyFn = void(__thiscall*)(SC4DrawContext*, float);
     using SetTexTransform4Fn = void(__thiscall*)(SC4DrawContext*, const float*, int);
     using ClearTexTransformFn = void(__thiscall*)(SC4DrawContext*, int);
+    using SetTextureFn = void(__thiscall*)(SC4DrawContext*, uint32_t, int);
 
     struct TerrainDrawRect
     {
@@ -124,6 +127,32 @@ namespace
         bool vertexUv = false;
         uint32_t slotFlags = 0;
     };
+
+    // The frames of a paint overlay's texture its cells pick from. frames <= 1 draws as a single
+    // texture, with what DrawDecals bound.
+    struct FrameTextures
+    {
+        uint32_t frames = 0;
+        const uint32_t* names = nullptr;
+        uint32_t count = 0;
+    };
+
+    [[nodiscard]] FrameTextures ReadFrameTextures(const HookAddresses& addresses,
+                                                  const PaintOverlay& paint,
+                                                  const std::byte* const slotBase) noexcept
+    {
+        const uint32_t mask = paint.textureIndex < kTerrainPaintMaxTextures
+                                  ? paint.style->textureFrameMasks[paint.textureIndex]
+                                  : 0u;
+        if (mask <= 1u || !addresses.setTexture) {
+            return {};
+        }
+        const auto* const binding = DrawContextAccess::ReadField<const std::byte*>(slotBase, kSlotTextureBindingOffset);
+        const auto* const names = binding ? DrawContextAccess::ReadField<const uint32_t*>(binding, 0) : nullptr;
+        const uint32_t count = names ? DrawContextAccess::ReadField<uint32_t>(binding, 4) : 0u;
+        const uint32_t frames = mask & (count >= 32u ? ~0u : (1u << count) - 1u);
+        return frames > 1u ? FrameTextures{frames, names, count} : FrameTextures{};
+    }
 
     // Logs a category of problem once per overlay instead of every frame.
     [[nodiscard]] bool FirstTime(const uint32_t overlayId, const std::string_view category)
@@ -668,6 +697,7 @@ namespace
     // shape is placed only as far as it has been on screen.
     void BuildPaintRow(const PaintOverlay& paint,
                        const TerrainCellFlips& flips,
+                       const uint32_t frames,
                        const int cellZ,
                        const int x0,
                        const int x1,
@@ -706,6 +736,8 @@ namespace
                 .lowerCount = static_cast<uint32_t>(cell.lower.size()),
                 .upperCount = static_cast<uint32_t>(cell.upper.size()),
                 .flipped = flipped,
+                .frame = static_cast<uint8_t>(
+                    TerrainPaint::PickFrame(frames, paint.style->variationSeed, cellX, cellZ, paint.textureIndex)),
             });
             const std::array<size_t, 6>& t = CellTriangles(flipped);
             PlaceVertices(cell.lower, corners[t[0]], corners[t[1]], corners[t[2]], row.vertices);
@@ -752,18 +784,25 @@ namespace
         }
     }
 
-    // The paint overlay's triangles on the visible part of the terrain.
+    // The paint overlay's triangles on the visible part of the terrain: of the cells that picked
+    // frame, or of all cells when frame is negative.
     void LayPaint(const HookAddresses& addresses,
                   const TerrainGridDimensions& dimensions,
                   const DrawFrustum& frustum,
                   const TerrainCellFlips& flips,
                   const TerrainDrawRect& drawRect,
                   const PaintOverlay& paint,
+                  const uint32_t frames,
+                  const int frame,
                   const float alphaScale,
                   std::vector<PackedTerrainVertex>& output)
     {
         const TerrainPaint::CellRange& range = paint.mesh->Cells();
         PaintDrawCache& cache = *paint.cache;
+        if (cache.frames != frames) {
+            cache.rows.clear();
+            cache.frames = frames;
+        }
         const auto rowCount = static_cast<size_t>(range.maxZ - range.minZ + 1);
         if (cache.rows.size() != rowCount) {
             cache.rows.assign(rowCount, {});
@@ -791,14 +830,15 @@ namespace
             };
             if (!row.built || x0 < row.builtX0 || x1 > row.builtX1 || diagonalChanged()) {
                 // The cells' cuts are kept by the mesh: placing them again is cheap.
-                BuildPaintRow(paint, flips, cellZ, row.built ? std::min(x0, row.builtX0) : x0,
+                BuildPaintRow(paint, flips, frames, cellZ, row.built ? std::min(x0, row.builtX0) : x0,
                               row.built ? std::max(x1, row.builtX1) : x1, row);
             }
 
             const std::span<const PaintDrawCache::PlacedVertex> vertices(row.vertices);
             for (auto span = firstVisible(); span != row.cells.end() && span->cellX < x1; ++span) {
                 std::array<PackedTerrainVertex, 4> corners{};
-                if (!LoadTerrainCellVertices(addresses, dimensions, span->cellX, cellZ, corners)) {
+                if ((frame >= 0 && span->frame != frame) ||
+                    !LoadTerrainCellVertices(addresses, dimensions, span->cellX, cellZ, corners)) {
                     continue;
                 }
                 const bool vertexUv = paint.mesh->HasUvMap();
@@ -819,7 +859,11 @@ namespace
         }
     }
 
-    void Submit(const DrawRequest& request, const DrawSetup& setup, const std::vector<PackedTerrainVertex>& vertices)
+    void Submit(const DrawRequest& request,
+                const DrawSetup& setup,
+                const std::vector<PackedTerrainVertex>& vertices,
+                const std::span<const PaintDrawCache::FrameRange> frameRanges = {},
+                const FrameTextures& frameTextures = {})
     {
         const HookAddresses& addresses = *request.addresses;
         SC4DrawContext* const context = request.drawContext;
@@ -851,11 +895,23 @@ namespace
         if (request.aroundDraw) {
             request.aroundDraw(request.aroundDrawUserData, context, true);
         }
-        reinterpret_cast<DrawPrimsFn>(addresses.drawPrims)(context,
-                                                           kPrimTypeTriangleList,
-                                                           kTerrainVertexFormat,
-                                                           static_cast<uint32_t>(vertices.size()),
-                                                           vertices.data());
+        const auto drawPrims = reinterpret_cast<DrawPrimsFn>(addresses.drawPrims);
+        if (frameRanges.empty() || !frameTextures.names) {
+            drawPrims(context, kPrimTypeTriangleList, kTerrainVertexFormat, static_cast<uint32_t>(vertices.size()),
+                      vertices.data());
+        }
+        else {
+            const auto setTexture = reinterpret_cast<SetTextureFn>(addresses.setTexture);
+            for (const PaintDrawCache::FrameRange& range : frameRanges) {
+                if (range.frame < frameTextures.count) {
+                    setTexture(context, frameTextures.names[range.frame], 0);
+                    drawPrims(context, kPrimTypeTriangleList, kTerrainVertexFormat, range.count,
+                              vertices.data() + range.first);
+                }
+            }
+            // What DrawDecals bound.
+            setTexture(context, frameTextures.names[0], 0);
+        }
         if (request.aroundDraw) {
             request.aroundDraw(request.aroundDrawUserData, context, false);
         }
@@ -953,12 +1009,29 @@ namespace TerrainDecal
                 return DrawResult::Handled;
             }
             PaintDrawCache& cache = *paint.cache;
+            const FrameTextures frameTextures = ReadFrameTextures(addresses, paint, request.overlaySlotBase);
 
             // The shadow passes draw again what the decal pass before them laid.
             if (!(shadowRecovery && cache.lastDrawnValid && cache.lastDrawnPass == request.pass)) {
+                const float opacity = std::clamp(paint.style->opacity, 0.0f, 1.0f);
                 cache.lastDrawn.clear();
-                LayPaint(addresses, dimensions, frustum, flips, drawRect, paint,
-                         std::clamp(paint.style->opacity, 0.0f, 1.0f), cache.lastDrawn);
+                cache.lastDrawnFrames.clear();
+                if (frameTextures.frames <= 1u) {
+                    LayPaint(addresses, dimensions, frustum, flips, drawRect, paint, 0u, -1, opacity, cache.lastDrawn);
+                }
+                else {
+                    // One run of vertices per frame, so each draws with its own texture.
+                    for (uint32_t rest = frameTextures.frames; rest != 0; rest &= rest - 1u) {
+                        const auto frame = static_cast<uint32_t>(std::countr_zero(rest));
+                        const auto first = static_cast<uint32_t>(cache.lastDrawn.size());
+                        LayPaint(addresses, dimensions, frustum, flips, drawRect, paint, frameTextures.frames,
+                                 static_cast<int>(frame), opacity, cache.lastDrawn);
+                        const auto count = static_cast<uint32_t>(cache.lastDrawn.size()) - first;
+                        if (count > 0) {
+                            cache.lastDrawnFrames.push_back({frame, first, count});
+                        }
+                    }
+                }
                 cache.lastDrawnPass = request.pass;
                 cache.lastDrawnValid = true;
             }
@@ -993,7 +1066,7 @@ namespace TerrainDecal
             setup.depthOffset = shadowRecovery ? options_.shadowRecoveryDepthOffset
                                 : paint.style->depthOffset >= 0 ? paint.style->depthOffset
                                                                 : options_.customDefaultDepthOffset;
-            Submit(request, setup, *vertices);
+            Submit(request, setup, *vertices, cache.lastDrawnFrames, frameTextures);
             return DrawResult::Handled;
         }
 

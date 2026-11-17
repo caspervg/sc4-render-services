@@ -124,6 +124,7 @@ namespace TerrainDecal
             uint32_t lowerCount;  // then upperCount vertices on the upper triangle
             uint32_t upperCount;
             bool flipped;         // the cell's diagonal when it was placed
+            uint8_t frame;
         };
 
         struct Row
@@ -136,10 +137,21 @@ namespace TerrainDecal
             std::vector<PlacedVertex> vertices;
         };
 
+        struct FrameRange
+        {
+            uint32_t frame;
+            uint32_t first;  // into lastDrawn
+            uint32_t count;
+        };
+
         // Rows from the paint's first cell row.
         std::vector<Row> rows;
+        // The texture frames the rows picked from.
+        uint32_t frames = 0;
         // The vertices laid in the last decal pass, which the shadow passes after it draw again.
         std::vector<TerrainVertex> lastDrawn;
+        // Empty when they all use frame 0.
+        std::vector<FrameRange> lastDrawnFrames;
         uint32_t lastDrawnPass = 0;
         bool lastDrawnValid = false;
     };

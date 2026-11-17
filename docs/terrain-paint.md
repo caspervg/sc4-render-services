@@ -56,13 +56,16 @@ Later calls take the id:
 - `GetPaintStyle` reads the style back.
 - `RemovePaint` deletes the paint.
 
-Style calls take the struct size, so the style can grow by appending fields in a later build.
+Style calls take the struct size. The service refuses a style smaller than its own (`GetStyleSize`)
+and ignores bytes past it, so a plugin built against a newer header still works with an older
+service, without the newer fields.
 
 ### Style fields
 
 | Field | Meaning |
 |---|---|
 | `textures`, `textureCount` | 1 to 8 terrain textures. With more than one, every 16 m terrain cell of the area takes one of them, chosen by `weight`. The same `variationSeed` always picks the same textures. |
+| `textureFrameMasks` | One per texture. For an FSH with several bitmaps (frames), bit n lets cells use frame n: every cell takes one of the allowed frames, each as likely, the same every time for the same `variationSeed`. Bits past the texture's last frame are ignored. 0 means frame 0 only. |
 | `textureSizeMeters` | The texture repeats every this many metres. Default 16, like the game's tiles. |
 | `textureRotationTurns`, `textureOffsetX/Z` | Turn (1 = a full turn) and shift of the texture. Both are fixed to the ground, so neighbouring paints line up. |
 | `color` | Multiplies the texture, the way decal colours do. For a plain colour, use a white texture. |
@@ -119,6 +122,11 @@ To use the vertex alpha, the renderer changes two things for the paint's draw on
 
 The opacity goes into the vertex alpha as well.
 
+With a frame mask, the overlay's cells are drawn in one batch per frame. Before each batch the
+renderer binds that frame's texture with `SC4DrawContext::SetTexture` (0x007D4070), and afterwards
+it binds frame 0 again, as `DrawDecals` left it. The game loads every bitmap of a decal FSH as a
+frame of one texture, but draws decals with frame 0 only.
+
 ## Textures that follow a path
 
 By default the textures lie flat on the ground. A shape can carry a UV map instead
@@ -141,7 +149,8 @@ instance `2`. A service that does not know paints still loads the city's decals 
 record alone.
 
 The record format is defined by `src/service/decal/TerrainPaintCodec.h`. Every paint carries its
-byte length, so a later minor version can add fields that an older reader skips.
+byte length, so a later minor version can add fields that an older reader skips. Minor version 2
+added wear, 3 the frame masks; a paint from an older minor version reads with masks 0.
 
 ## Limits
 
