@@ -11,6 +11,7 @@ namespace TerrainPaintStats
         OverLots,
         UnderLots,
         OverShadows,
+        OverSidewalks,
         ShadowRecovery,
         ShadowRecoveryCapture,
         Count,

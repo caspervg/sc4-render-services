@@ -56,6 +56,8 @@ namespace TerrainDecal
                 .overlayRectOffset = 0x0C,
                 .overlaySlotsPtrOffset = 0x98,
                 .overlaySlotStride = 0xB4,
+                .networkDrawThunkJumpSite = 0x0061C153u,
+                .networkDrawCallSite = 0x0061E894u,
             };
         default:
             return std::nullopt;

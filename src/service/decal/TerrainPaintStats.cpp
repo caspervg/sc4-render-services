@@ -20,7 +20,7 @@ namespace TerrainPaintStats
         using Clock = std::chrono::steady_clock;
         constexpr auto kPassCount = static_cast<size_t>(Pass::Count);
         constexpr std::array<const char*, kPassCount> kPassNames{
-            "Over lots", "Under lots", "Over shadows", "Shadow recovery", "Shadow recovery capture"};
+            "Over lots", "Under lots", "Over shadows", "Over sidewalks", "Shadow recovery", "Shadow recovery capture"};
         constexpr size_t kTopPaints = 5;
 
         struct PaintTotals

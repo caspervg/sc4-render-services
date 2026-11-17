@@ -99,21 +99,22 @@ private:
         TerrainDecal::ManagedOverlay::Kind kind = TerrainDecal::ManagedOverlay::Kind::Decal;
         uint32_t recordId = 0;
         uint32_t textureIndex = 0;
-        bool underLots = false;
+        TerrainDecal::OwnPass ownPass = TerrainDecal::OwnPass::None;
     };
 
     // ManagedOverlaySource
     bool ResolveOverlay(const void* overlayManager, uint32_t overlayId, TerrainDecal::ManagedOverlay& out) override;
     std::pair<int32_t, uint32_t> OverlayDrawOrder(const void* overlayManager, uint32_t overlayId) override;
-    bool OverlayUnderLots(const void* overlayManager, uint32_t overlayId) override;
-    bool HasOverlaysUnderLots(const void* overlayManager) override;
+    TerrainDecal::OwnPass OverlayOwnPass(const void* overlayManager, uint32_t overlayId) override;
+    bool HasOverlaysIn(const void* overlayManager, TerrainDecal::OwnPass pass) override;
 
     // overlayIndex_ entries, keeping the count of overlays under lots per manager.
     void IndexOverlay_(const void* overlayManager, uint32_t overlayId, const OverlayTarget& target);
     void UnindexOverlay_(const void* overlayManager, uint32_t overlayId);
 
-    static void OnPreStaticPass_(DrawServicePass pass, bool begin, void* userData);
+    static void OnDrawPass_(DrawServicePass pass, bool begin, void* userData);
     void DrawUnderLots_();
+    [[nodiscard]] cISTEOverlayManager* StaticLandManager_();
 
     bool CreateRuntimeDecal_(TerrainDecalId id, const TerrainDecalState& state, uint32_t sequence);
     bool ApplyStateToRuntime_(TerrainDecalRecord& record, const TerrainDecalState& state);
@@ -151,9 +152,12 @@ private:
     uint32_t nextPaintId_ = 1;
     uint32_t nextSequence_ = 1;
     std::unordered_map<OverlayKey, OverlayTarget, OverlayKeyHash> overlayIndex_{};
-    std::unordered_map<const void*, uint32_t> underLotsCounts_{};
+    // By overlay manager: how many of its overlays each pass of the service's own draws.
+    std::unordered_map<const void*, std::array<uint32_t, static_cast<size_t>(TerrainDecal::OwnPass::Count)>>
+        ownPassCounts_{};
     cIGZDrawService* drawService_ = nullptr;
     uint32_t preStaticCallbackToken_ = 0;
+    uint32_t staticCallbackToken_ = 0;
     std::unique_ptr<TerrainDecal::TerrainDecalHook> renderHook_{};
     std::vector<TerrainDecalSnapshot> pendingLoadedDecals_{};
     // Loaded paints whose overlays wait for the city.
