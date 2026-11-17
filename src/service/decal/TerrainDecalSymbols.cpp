@@ -8,6 +8,8 @@ namespace TerrainDecal
         case 641:
             return HookAddresses{
                 .gameVersion = 641,
+                // RET 4. Holds the DrawDecals and DrawShadows call sites below.
+                .drawOverlays = 0x00738A50u,
                 .drawDecals = 0x00736790u,
                 .drawDecalsCallSite = 0x00739320u,
                 .drawRect = 0x00735720u,

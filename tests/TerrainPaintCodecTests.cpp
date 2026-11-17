@@ -1,5 +1,8 @@
-// Checks for the terrain paint and decal save records: run TerrainPaintCodecTests.exe, it prints "ok" or aborts.
+// Checks for the terrain paint and decal records: run TerrainPaintCodecTests.exe, it prints "ok" or
+// aborts. Cities saved by older versions must still load, and older versions must still load the
+// paints this version saves.
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8,8 +11,10 @@
 
 #include "cIGZIStream.h"
 #include "cIGZOStream.h"
-#include "service/decal/TerrainPaintCodec.h"
 #include "service/decal/TerrainDecalSidecarCodec.h"
+#include "service/decal/TerrainPaintCodec.h"
+
+using TerrainPaintCodec::PaintSnapshot;
 
 namespace
 {
@@ -22,198 +27,391 @@ namespace
     }
 #define CHECK(x) Check((x), #x, __LINE__)
 
-    class MemoryOut final : public cIGZOStream
+    // Little endian, like the game's streams on x86.
+    class MemoryOStream final : public cIGZOStream
     {
     public:
-        std::vector<uint8_t> bytes;
-
         bool QueryInterface(uint32_t, void**) override { return false; }
         uint32_t AddRef() override { return 1; }
         uint32_t Release() override { return 1; }
+
         void Flush() override {}
-        bool SetSint8(const int8_t v) override { return Put(v); }
-        bool SetUint8(const uint8_t v) override { return Put(v); }
-        bool SetSint16(const int16_t v) override { return Put(v); }
-        bool SetUint16(const uint16_t v) override { return Put(v); }
-        bool SetSint32(const int32_t v) override { return Put(v); }
-        bool SetUint32(const uint32_t v) override { return Put(v); }
-        bool SetSint64(const int64_t v) override { return Put(v); }
-        bool SetUint64(const uint64_t v) override { return Put(v); }
-        bool SetFloat32(const float v) override { return Put(v); }
-        bool SetFloat64(const double v) override { return Put(v); }
+        bool SetSint8(const int8_t value) override { return Put_(&value, 1); }
+        bool SetUint8(const uint8_t value) override { return Put_(&value, 1); }
+        bool SetSint16(const int16_t value) override { return Put_(&value, 2); }
+        bool SetUint16(const uint16_t value) override { return Put_(&value, 2); }
+        bool SetSint32(const int32_t value) override { return Put_(&value, 4); }
+        bool SetUint32(const uint32_t value) override { return Put_(&value, 4); }
+        bool SetSint64(const int64_t value) override { return Put_(&value, 8); }
+        bool SetUint64(const uint64_t value) override { return Put_(&value, 8); }
+        bool SetFloat32(const float value) override { return Put_(&value, 4); }
+        bool SetFloat64(const double value) override { return Put_(&value, 8); }
         bool SetRZCharStr(const char*) override { return false; }
         bool SetGZStr(const cIGZString&) override { return false; }
         bool SetGZSerializable(const cIGZSerializable&) override { return false; }
-        bool SetVoid(const void* data, const uint32_t size) override
-        {
-            const auto* p = static_cast<const uint8_t*>(data);
-            bytes.insert(bytes.end(), p, p + size);
-            return true;
-        }
+        bool SetVoid(const void* const data, const uint32_t size) override { return Put_(data, size); }
         int32_t GetError() override { return 0; }
         int32_t SetUserData(cIGZVariant*) override { return 0; }
         int32_t GetUserData() override { return 0; }
 
+        std::vector<uint8_t> bytes;
+
     private:
-        template <typename T>
-        bool Put(const T v) { return SetVoid(&v, sizeof(v)); }
+        bool Put_(const void* const data, const size_t size)
+        {
+            const auto* const begin = static_cast<const uint8_t*>(data);
+            bytes.insert(bytes.end(), begin, begin + size);
+            return true;
+        }
     };
 
-    class MemoryIn final : public cIGZIStream
+    class MemoryIStream final : public cIGZIStream
     {
     public:
-        explicit MemoryIn(std::vector<uint8_t> data) : bytes_(std::move(data)) {}
+        explicit MemoryIStream(std::vector<uint8_t> bytes) : bytes_(std::move(bytes)) {}
 
         bool QueryInterface(uint32_t, void**) override { return false; }
         uint32_t AddRef() override { return 1; }
         uint32_t Release() override { return 1; }
-        bool Skip(const uint32_t n) override { return GetVoid(nullptr, n); }
-        bool GetSint8(int8_t& v) override { return Get(v); }
-        bool GetUint8(uint8_t& v) override { return Get(v); }
-        bool GetSint16(int16_t& v) override { return Get(v); }
-        bool GetUint16(uint16_t& v) override { return Get(v); }
-        bool GetSint32(int32_t& v) override { return Get(v); }
-        bool GetUint32(uint32_t& v) override { return Get(v); }
-        bool GetSint64(int64_t& v) override { return Get(v); }
-        bool GetUint64(uint64_t& v) override { return Get(v); }
-        bool GetFloat32(float& v) override { return Get(v); }
-        bool GetFloat64(double& v) override { return Get(v); }
+
+        bool Skip(const uint32_t size) override { return Get_(nullptr, size); }
+        bool GetSint8(int8_t& value) override { return Get_(&value, 1); }
+        bool GetUint8(uint8_t& value) override { return Get_(&value, 1); }
+        bool GetSint16(int16_t& value) override { return Get_(&value, 2); }
+        bool GetUint16(uint16_t& value) override { return Get_(&value, 2); }
+        bool GetSint32(int32_t& value) override { return Get_(&value, 4); }
+        bool GetUint32(uint32_t& value) override { return Get_(&value, 4); }
+        bool GetSint64(int64_t& value) override { return Get_(&value, 8); }
+        bool GetUint64(uint64_t& value) override { return Get_(&value, 8); }
+        bool GetFloat32(float& value) override { return Get_(&value, 4); }
+        bool GetFloat64(double& value) override { return Get_(&value, 8); }
         bool GetRZCharStr(char*, uint32_t) override { return false; }
         bool GetGZStr(cIGZString&) override { return false; }
         bool GetGZSerializable(cIGZSerializable&) override { return false; }
-        bool GetVoid(void* out, const uint32_t size) override
-        {
-            if (bytes_.size() - pos_ < size) {
-                error_ = 1;
-                return false;
-            }
-            if (out) {
-                std::memcpy(out, bytes_.data() + pos_, size);
-            }
-            pos_ += size;
-            return true;
-        }
+        bool GetVoid(void* const data, const uint32_t size) override { return Get_(data, size); }
         int32_t GetError() override { return error_; }
         int32_t SetUserData(cIGZVariant*) override { return 0; }
         int32_t GetUserData() override { return 0; }
 
+        [[nodiscard]] size_t Remaining() const { return bytes_.size() - position_; }
+
     private:
-        template <typename T>
-        bool Get(T& v) { return GetVoid(&v, sizeof(v)); }
+        bool Get_(void* const data, const size_t size)
+        {
+            if (size > bytes_.size() - position_) {
+                error_ = 1;
+                return false;
+            }
+            if (data) {
+                std::memcpy(data, bytes_.data() + position_, size);
+            }
+            position_ += size;
+            return true;
+        }
 
         std::vector<uint8_t> bytes_;
-        size_t pos_ = 0;
+        size_t position_ = 0;
         int32_t error_ = 0;
     };
+
+    PaintSnapshot MakePaint(const uint32_t id, const TerrainPaintLayer layer, const bool frameMasks = true)
+    {
+        PaintSnapshot paint{};
+        paint.id = TerrainPaintId{id};
+        TerrainPaintStyle& style = paint.style;
+        style.textures[0].key = cGZPersistResourceKey(0x7AB50E44, 0x0986135E, 0x00001000 + id);
+        style.textures[0].weight = 2.0f;
+        style.textures[1].key = cGZPersistResourceKey(0x7AB50E44, 0x0986135E, 0x00002000 + id);
+        style.textureCount = 2;
+        style.variationSeed = 17;
+        style.textureSizeMeters = 8.0f;
+        style.textureRotationTurns = 0.25f;
+        style.textureOffsetX = 1.5f;
+        style.textureOffsetZ = -2.5f;
+        style.color = cS3DVector3(0.5f, 0.75f, 1.0f);
+        style.opacity = 0.8f;
+        style.featherMeters = 2.0f;
+        style.drawOrder = -3;
+        style.depthOffset = 1;
+        style.enabled = true;
+        style.wear = 0.3f;
+        style.wearPatchMeters = 0.6f;
+        style.wearSeed = 99;
+        style.layer = layer;
+        if (frameMasks) {
+            style.textureFrameMasks[0] = 0b1011;
+            style.textureFrameMasks[1] = 1u << 31;
+        }
+        paint.ringSizes = {4};
+        paint.points = {{100, 100}, {180, 100}, {180, 150}, {100, 150}};
+        paint.uvMap = {{100, 100, 0, 0}, {180, 100, 5, 0}, {180, 150, 5, 1}};
+        return paint;
+    }
+
+    // The record as older versions wrote it: minor version 2 ends with wear, 3 with the layer.
+    std::vector<uint8_t> WriteOld(const std::vector<PaintSnapshot>& paints, const uint16_t minor)
+    {
+        MemoryOStream out;
+        out.SetUint32(TerrainPaintCodec::kMagic);
+        out.SetUint16(1);
+        out.SetUint16(minor);
+        out.SetUint32(static_cast<uint32_t>(paints.size()));
+        for (const PaintSnapshot& paint : paints) {
+            const TerrainPaintStyle& style = paint.style;
+            const uint32_t byteCount = 4 + 4 + 4 + 16 + 20 + 8 + 4 + 4 + 4 + 12 + style.textureCount * 16u +
+                                       static_cast<uint32_t>(paint.ringSizes.size()) * 4u +
+                                       static_cast<uint32_t>(paint.points.size()) * 8u +
+                                       static_cast<uint32_t>(paint.uvMap.size()) * 16u + (minor >= 3 ? 4u : 0u);
+            out.SetUint32(byteCount);
+            out.SetUint32(paint.id.value);
+            out.SetUint32(style.textureCount);
+            for (uint32_t i = 0; i < style.textureCount; ++i) {
+                out.SetUint32(style.textures[i].key.type);
+                out.SetUint32(style.textures[i].key.group);
+                out.SetUint32(style.textures[i].key.instance);
+                out.SetFloat32(style.textures[i].weight);
+            }
+            out.SetUint32(style.variationSeed);
+            out.SetFloat32(style.textureSizeMeters);
+            out.SetFloat32(style.textureRotationTurns);
+            out.SetFloat32(style.textureOffsetX);
+            out.SetFloat32(style.textureOffsetZ);
+            out.SetFloat32(style.color.fX);
+            out.SetFloat32(style.color.fY);
+            out.SetFloat32(style.color.fZ);
+            out.SetFloat32(style.opacity);
+            out.SetFloat32(style.featherMeters);
+            out.SetSint32(style.drawOrder);
+            out.SetSint32(style.depthOffset);
+            out.SetUint32(style.enabled ? 1u : 0u);
+            out.SetUint32(static_cast<uint32_t>(paint.ringSizes.size()));
+            for (const uint32_t size : paint.ringSizes) {
+                out.SetUint32(size);
+            }
+            for (const TerrainPaintPoint& point : paint.points) {
+                out.SetFloat32(point.x);
+                out.SetFloat32(point.z);
+            }
+            out.SetUint32(static_cast<uint32_t>(paint.uvMap.size()));
+            for (const TerrainPaintUvVertex& vertex : paint.uvMap) {
+                out.SetFloat32(vertex.x);
+                out.SetFloat32(vertex.z);
+                out.SetFloat32(vertex.u);
+                out.SetFloat32(vertex.v);
+            }
+            out.SetFloat32(style.wear);
+            out.SetFloat32(style.wearPatchMeters);
+            out.SetUint32(style.wearSeed);
+            if (minor >= 3) {
+                out.SetUint32(static_cast<uint32_t>(style.layer));
+            }
+        }
+        return out.bytes;
+    }
+
+    std::vector<uint8_t> WriteCurrent(const std::vector<PaintSnapshot>& paints)
+    {
+        std::vector<const PaintSnapshot*> pointers;
+        for (const PaintSnapshot& paint : paints) {
+            pointers.push_back(&paint);
+        }
+        MemoryOStream out;
+        CHECK(TerrainPaintCodec::Write(out, pointers));
+        return out.bytes;
+    }
+
+    bool SameStyle(const TerrainPaintStyle& a, const TerrainPaintStyle& b)
+    {
+        if (a.textureCount != b.textureCount) {
+            return false;
+        }
+        for (uint32_t i = 0; i < a.textureCount; ++i) {
+            if (a.textures[i].key.instance != b.textures[i].key.instance ||
+                a.textures[i].weight != b.textures[i].weight) {
+                return false;
+            }
+        }
+        return a.variationSeed == b.variationSeed && a.textureSizeMeters == b.textureSizeMeters &&
+               a.textureRotationTurns == b.textureRotationTurns && a.textureOffsetX == b.textureOffsetX &&
+               a.textureOffsetZ == b.textureOffsetZ && a.color.fX == b.color.fX && a.color.fY == b.color.fY &&
+               a.color.fZ == b.color.fZ && a.opacity == b.opacity && a.featherMeters == b.featherMeters &&
+               a.drawOrder == b.drawOrder && a.depthOffset == b.depthOffset && a.enabled == b.enabled &&
+               a.wear == b.wear && a.wearPatchMeters == b.wearPatchMeters && a.wearSeed == b.wearSeed &&
+               std::equal(a.textureFrameMasks, a.textureFrameMasks + a.textureCount, b.textureFrameMasks);
+    }
+
+    bool SameShape(const PaintSnapshot& a, const PaintSnapshot& b)
+    {
+        if (a.ringSizes != b.ringSizes || a.points.size() != b.points.size() || a.uvMap.size() != b.uvMap.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < a.points.size(); ++i) {
+            if (a.points[i].x != b.points[i].x || a.points[i].z != b.points[i].z) {
+                return false;
+            }
+        }
+        for (size_t i = 0; i < a.uvMap.size(); ++i) {
+            if (a.uvMap[i].u != b.uvMap[i].u || a.uvMap[i].v != b.uvMap[i].v) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // A city saved before the layer: every paint loads as it was, over lots.
+    void OldRecordLoads()
+    {
+        const std::vector<PaintSnapshot> paints = {MakePaint(1, TerrainPaintLayer::OverLots, false),
+                                                   MakePaint(2, TerrainPaintLayer::OverLots, false)};
+        MemoryIStream in(WriteOld(paints, 2));
+        const auto result = TerrainPaintCodec::Read(in);
+        CHECK(result.ok);
+        CHECK(result.paints.size() == 2);
+        for (size_t i = 0; i < 2; ++i) {
+            CHECK(result.paints[i].id.value == paints[i].id.value);
+            CHECK(SameStyle(result.paints[i].style, paints[i].style));
+            CHECK(SameShape(result.paints[i], paints[i]));
+            CHECK(result.paints[i].style.layer == TerrainPaintLayer::OverLots);
+        }
+        CHECK(in.Remaining() == 0);
+    }
+
+    // A city saved with layers but before frame masks: layers kept, masks 0.
+    void LayerRecordLoads()
+    {
+        const std::vector<PaintSnapshot> paints = {MakePaint(1, TerrainPaintLayer::UnderLots, false),
+                                                   MakePaint(2, TerrainPaintLayer::OverShadows, false)};
+        MemoryIStream in(WriteOld(paints, 3));
+        const auto result = TerrainPaintCodec::Read(in);
+        CHECK(result.ok);
+        CHECK(result.paints.size() == 2);
+        for (size_t i = 0; i < 2; ++i) {
+            CHECK(SameStyle(result.paints[i].style, paints[i].style));
+            CHECK(result.paints[i].style.layer == paints[i].style.layer);
+        }
+        CHECK(in.Remaining() == 0);
+    }
+
+    // What this version saves loads back the same, layer and frame masks included.
+    void RoundTrip()
+    {
+        const std::vector<PaintSnapshot> paints = {MakePaint(1, TerrainPaintLayer::UnderLots),
+                                                   MakePaint(2, TerrainPaintLayer::OverLots),
+                                                   MakePaint(3, TerrainPaintLayer::OverShadows)};
+        MemoryIStream in(WriteCurrent(paints));
+        const auto result = TerrainPaintCodec::Read(in);
+        CHECK(result.ok);
+        CHECK(result.paints.size() == 3);
+        for (size_t i = 0; i < 3; ++i) {
+            CHECK(SameStyle(result.paints[i].style, paints[i].style));
+            CHECK(SameShape(result.paints[i], paints[i]));
+            CHECK(result.paints[i].style.layer == paints[i].style.layer);
+        }
+        CHECK(in.Remaining() == 0);
+    }
+
+    // An older version reads a paint's fields up to what it knows and skips the rest by its byte
+    // count. Each minor version is the one before with fields added at the end of each paint, so
+    // that works.
+    void NewRecordExtendsOldOne()
+    {
+        const std::vector<PaintSnapshot> paints = {MakePaint(1, TerrainPaintLayer::UnderLots),
+                                                   MakePaint(2, TerrainPaintLayer::OverShadows)};
+        const std::vector<uint8_t> oldBytes = WriteOld(paints, 3);
+        const std::vector<uint8_t> newBytes = WriteCurrent(paints);
+        CHECK(newBytes.size() == oldBytes.size() + 2 * 2 * 4);
+
+        // Header: only the minor version differs.
+        CHECK(std::memcmp(oldBytes.data(), newBytes.data(), 6) == 0);
+        uint16_t minor = 0;
+        std::memcpy(&minor, newBytes.data() + 6, 2);
+        CHECK(minor == 4);
+        CHECK(std::memcmp(oldBytes.data() + 8, newBytes.data() + 8, 4) == 0);
+
+        size_t oldAt = 12;
+        size_t newAt = 12;
+        for (const PaintSnapshot& paint : paints) {
+            uint32_t oldCount = 0;
+            uint32_t newCount = 0;
+            std::memcpy(&oldCount, oldBytes.data() + oldAt, 4);
+            std::memcpy(&newCount, newBytes.data() + newAt, 4);
+            CHECK(newCount == oldCount + paint.style.textureCount * 4);
+            // The old fields, unchanged, then the frame masks.
+            CHECK(std::memcmp(oldBytes.data() + oldAt + 4, newBytes.data() + newAt + 4, oldCount) == 0);
+            CHECK(std::memcmp(newBytes.data() + newAt + 4 + oldCount, paint.style.textureFrameMasks,
+                              paint.style.textureCount * 4) == 0);
+            oldAt += 4 + oldCount;
+            newAt += 4 + newCount;
+        }
+        CHECK(oldAt == oldBytes.size());
+        CHECK(newAt == newBytes.size());
+    }
+
+    // A later version may add layers and fields: the paint still loads, over lots.
+    void NewerRecordLoads()
+    {
+        const PaintSnapshot paint = MakePaint(1, TerrainPaintLayer::UnderLots);
+        std::vector<uint8_t> bytes = WriteCurrent({paint});
+        const uint16_t minor = 9;
+        std::memcpy(bytes.data() + 6, &minor, 2);
+        uint32_t byteCount = 0;
+        std::memcpy(&byteCount, bytes.data() + 12, 4);
+        // The layer is the last field before the frame masks.
+        const uint32_t unknownLayer = 7;
+        std::memcpy(bytes.data() + 12 + byteCount - paint.style.textureCount * 4, &unknownLayer, 4);
+        byteCount += 8;
+        std::memcpy(bytes.data() + 12, &byteCount, 4);
+        bytes.insert(bytes.end(), {0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x02, 0x03, 0x04});
+
+        MemoryIStream in(bytes);
+        const auto result = TerrainPaintCodec::Read(in);
+        CHECK(result.ok);
+        CHECK(result.paints.size() == 1);
+        CHECK(result.paints[0].style.layer == TerrainPaintLayer::OverLots);
+        CHECK(result.paints[0].style.wearSeed == 99);
+        CHECK(SameStyle(result.paints[0].style, paint.style));
+        CHECK(in.Remaining() == 0);
+    }
+
+    void MaxTexturesRoundTrip()
+    {
+        PaintSnapshot paint = MakePaint(1, TerrainPaintLayer::OverLots);
+        paint.style.textureCount = kTerrainPaintMaxTextures;
+        paint.style.textureFrameMasks[kTerrainPaintMaxTextures - 1] = 6;
+        MemoryIStream in(WriteCurrent({paint}));
+        const auto result = TerrainPaintCodec::Read(in);
+        CHECK(result.ok);
+        CHECK(result.paints.size() == 1);
+        CHECK(SameStyle(result.paints[0].style, paint.style));
+        CHECK(in.Remaining() == 0);
+    }
 
     // The decal struct sizes callers may pass: before drawOrder, before frame, and now.
     static_assert(kTerrainDecalStateSizeV1 == 108 && kTerrainDecalStateSizeV2 == 112 && kTerrainDecalStateSize == 116);
     static_assert(kTerrainDecalSnapshotSizeV1 == 112 && kTerrainDecalSnapshotSizeV2 == 116 &&
                   kTerrainDecalSnapshotSize == 120);
 
-    // magic, major, minor, paint count, then the first paint's byte count.
-    constexpr size_t kMinorOffset = 6;
-    constexpr size_t kByteCountOffset = 12;
-
-    void Patch32(std::vector<uint8_t>& bytes, const size_t offset, const uint32_t value)
+    // Decal sidecar: the frame round trips, minor 2 records read frame 0, longer records are skipped.
+    void DecalFrame()
     {
-        std::memcpy(bytes.data() + offset, &value, sizeof(value));
-    }
-
-    uint32_t Read32(const std::vector<uint8_t>& bytes, const size_t offset)
-    {
-        uint32_t value = 0;
-        std::memcpy(&value, bytes.data() + offset, sizeof(value));
-        return value;
-    }
-
-    TerrainPaintCodec::ReadResult ReadBack(std::vector<uint8_t> bytes)
-    {
-        MemoryIn in(std::move(bytes));
-        return TerrainPaintCodec::Read(in);
-    }
-}
-
-int main()
-{
-    TerrainPaintCodec::PaintSnapshot paint{};
-    paint.id.value = 9;
-    paint.style.textureCount = 3;
-    for (uint32_t i = 0; i < 3; ++i) {
-        paint.style.textures[i].key = cGZPersistResourceKey(0x7AB50E44, 0x0986135E, 0x100 + i);
-    }
-    paint.style.textureFrameMasks[0] = 0b1011;
-    paint.style.textureFrameMasks[2] = 1u << 31;
-    paint.style.wear = 0.25f;
-    paint.style.wearSeed = 77;
-    paint.points = {{0, 0}, {16, 0}, {16, 16}};
-    paint.ringSizes = {3};
-    paint.uvMap = {{0, 0, 0, 0}, {16, 0, 1, 0}, {16, 16, 1, 1}};
-
-    MemoryOut out;
-    CHECK(TerrainPaintCodec::Write(out, {&paint}));
-    const std::vector<uint8_t> v3 = out.bytes;
-    CHECK(Read32(v3, 4) >> 16 == TerrainPaintCodec::kVersionMinor);
-
-    {
-        const auto result = ReadBack(v3);
-        CHECK(result.ok && result.paints.size() == 1);
-        const TerrainPaintStyle& style = result.paints[0].style;
-        CHECK(style.textureFrameMasks[0] == 0b1011 && style.textureFrameMasks[1] == 0 &&
-              style.textureFrameMasks[2] == (1u << 31));
-        CHECK(style.wear == 0.25f && style.wearSeed == 77 && result.paints[0].uvMap.size() == 3);
-    }
-
-    {
-        // Minor 2, before frame masks: the same paint without them reads with masks 0.
-        std::vector<uint8_t> v2(v3.begin(), v3.end() - 12);
-        v2[kMinorOffset] = 2;
-        Patch32(v2, kByteCountOffset, Read32(v3, kByteCountOffset) - 12);
-        const auto result = ReadBack(v2);
-        CHECK(result.ok && result.paints.size() == 1);
-        const TerrainPaintStyle& style = result.paints[0].style;
-        CHECK(style.textureFrameMasks[0] == 0 && style.textureFrameMasks[2] == 0);
-        CHECK(style.wear == 0.25f && style.wearSeed == 77 && style.textureCount == 3);
-    }
-
-    {
-        // A later minor version's fields after the masks are skipped.
-        std::vector<uint8_t> v4 = v3;
-        v4.insert(v4.end(), 8, 0xAB);
-        Patch32(v4, kByteCountOffset, Read32(v3, kByteCountOffset) + 8);
-        const auto result = ReadBack(v4);
-        CHECK(result.ok && result.paints.size() == 1 && result.paints[0].style.textureFrameMasks[0] == 0b1011);
-    }
-
-    {
-        TerrainPaintCodec::PaintSnapshot full = paint;
-        full.style.textureCount = kTerrainPaintMaxTextures;
-        full.style.textureFrameMasks[kTerrainPaintMaxTextures - 1] = 6;
-        MemoryOut fullOut;
-        CHECK(TerrainPaintCodec::Write(fullOut, {&full}));
-        const auto result = ReadBack(fullOut.bytes);
-        CHECK(result.ok && result.paints[0].style.textureCount == kTerrainPaintMaxTextures &&
-              result.paints[0].style.textureFrameMasks[kTerrainPaintMaxTextures - 1] == 6);
-    }
-
-    {
-        // Decal sidecar: frame round trips, minor 2 records read frame 0, longer records are skipped.
         TerrainDecalSnapshot decal{};
         decal.id.value = 4;
         decal.state.textureKey = cGZPersistResourceKey(0x7AB50E44, 0x1ABE787D, 0xAA40173A);
         decal.state.drawOrder = 7;
         decal.state.frame = 5;
-        MemoryOut decalOut;
-        CHECK(TerrainDecalSidecar::Write(decalOut, {decal, decal}));
-        const std::vector<uint8_t> sidecar = decalOut.bytes;
-        constexpr size_t kPayload = 20;
-        constexpr size_t kRecordSize = 24;
-        constexpr size_t kRecords = 32;
+        MemoryOStream out;
+        CHECK(TerrainDecalSidecar::Write(out, {decal, decal}));
+        const std::vector<uint8_t> sidecar = out.bytes;
+        // Header, then the chunk's payload size, record size and count; records start at 32.
+        constexpr size_t kMinorAt = 6;
+        constexpr size_t kPayloadAt = 20;
+        constexpr size_t kRecordSizeAt = 24;
+        constexpr size_t kRecordsAt = 32;
         constexpr uint32_t kSize = sizeof(TerrainDecalSidecar::PersistedTerrainDecal);
-        CHECK(Read32(sidecar, kRecordSize) == kSize && sidecar.size() == kRecords + 2 * kSize);
+        CHECK(sidecar.size() == kRecordsAt + 2 * kSize);
 
         const auto read = [](std::vector<uint8_t> bytes) {
-            MemoryIn in(std::move(bytes));
+            MemoryIStream in(std::move(bytes));
             return TerrainDecalSidecar::Read(in);
         };
         const auto current = read(sidecar);
@@ -222,15 +420,16 @@ int main()
 
         // Each record cut or padded to recordSize bytes.
         const auto resized = [&](const uint32_t recordSize, const uint16_t minor) {
-            std::vector<uint8_t> bytes(sidecar.begin(), sidecar.begin() + kRecords);
+            std::vector<uint8_t> bytes(sidecar.begin(), sidecar.begin() + kRecordsAt);
             for (size_t i = 0; i < 2; ++i) {
-                const auto record = sidecar.begin() + static_cast<std::ptrdiff_t>(kRecords + i * kSize);
+                const auto record = sidecar.begin() + static_cast<std::ptrdiff_t>(kRecordsAt + i * kSize);
                 bytes.insert(bytes.end(), record, record + std::min(recordSize, kSize));
                 bytes.insert(bytes.end(), recordSize > kSize ? recordSize - kSize : 0u, uint8_t{0xAB});
             }
-            bytes[kMinorOffset] = static_cast<uint8_t>(minor);
-            Patch32(bytes, kPayload, 2 * recordSize);
-            Patch32(bytes, kRecordSize, recordSize);
+            std::memcpy(bytes.data() + kMinorAt, &minor, 2);
+            const uint32_t payload = 2 * recordSize;
+            std::memcpy(bytes.data() + kPayloadAt, &payload, 4);
+            std::memcpy(bytes.data() + kRecordSizeAt, &recordSize, 4);
             return bytes;
         };
         const auto minor2 = read(resized(kSize - 4, 2));
@@ -239,7 +438,17 @@ int main()
         const auto longer = read(resized(kSize + 8, 4));
         CHECK(longer.ok && longer.decals.size() == 2 && longer.decals[1].state.frame == 5);
     }
+}
 
-    std::puts("ok");
+int main()
+{
+    OldRecordLoads();
+    LayerRecordLoads();
+    RoundTrip();
+    NewRecordExtendsOldOne();
+    NewerRecordLoads();
+    MaxTexturesRoundTrip();
+    DecalFrame();
+    std::printf("ok\n");
     return 0;
 }

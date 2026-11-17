@@ -10,6 +10,9 @@ namespace TerrainDecal
     struct HookAddresses
     {
         uint16_t gameVersion = 0;
+        // cSTEOverlayManager::DrawOverlays(SC4DrawContext*), thiscall: one manager's decals and
+        // shadows, as the renderer's view object pass draws them.
+        uintptr_t drawOverlays = 0;
         uintptr_t drawDecals = 0;
         uintptr_t drawDecalsCallSite = 0;
         uintptr_t drawRect = 0;
