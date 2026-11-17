@@ -201,6 +201,22 @@ byte length, so a later minor version can add fields that an older reader skips.
 
 `tests/TerrainPaintCodecTests.cpp` checks these cases.
 
+## Measuring
+
+With `ShowTerrainPaintStats=true` in `SC4RenderServices.ini`, the "Terrain paint stats" window
+shows what drawing paint costs per frame, averaged over the last second:
+- One row per pass: the decal pass by the paint's layer (over lots, under lots, over shadows), then
+  the shadow recovery passes.
+- Overlays drawn, rows built (`BuildPaintRow`), cells visited and vertices lifted, draw calls, and
+  the time spent building rows, lifting vertices (with the rest of the setup), and in `Submit`.
+- The five paints with the most vertices.
+- Paint edits (`CreatePaint`, `SetPaintShape`, `SetPaintStyle`): calls and milliseconds per second,
+  the part spent making meshes, and the slowest call of the last 10 seconds with what it made
+  again. Cells are cut when first drawn, so cutting shows in the draw passes' build time.
+
+Every 10 seconds the same numbers go to the log as one line. With the setting off, the renderer
+measures nothing.
+
 ## Limits
 
 - The renderer needs the texture transform the game sets for decals; paints are not drawn on the

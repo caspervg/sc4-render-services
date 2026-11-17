@@ -22,6 +22,7 @@
 #include "cISTETerrainView.h"
 #include "utils/Logger.h"
 #include "TerrainDecalSidecarCodec.h"
+#include "TerrainPaintStats.h"
 
 namespace
 {
@@ -189,6 +190,8 @@ namespace
 
     [[nodiscard]] std::unique_ptr<TerrainPaint::Mesh> BuildMesh(const TerrainPaintCodec::PaintSnapshot& data)
     {
+        TerrainPaintStats::Edit* const edit = TerrainPaintStats::currentEdit;
+        const double start = edit ? TerrainPaintStats::NowMs() : 0.0;
         std::vector<TerrainPaint::Ring> rings;
         rings.reserve(data.ringSizes.size());
         size_t next = 0;
@@ -205,9 +208,14 @@ namespace
         for (const TerrainPaintUvVertex& vertex : data.uvMap) {
             uvMap.push_back({vertex.x, vertex.z, vertex.u, vertex.v});
         }
-        return std::make_unique<TerrainPaint::Mesh>(
+        auto mesh = std::make_unique<TerrainPaint::Mesh>(
             rings, data.style.featherMeters, uvMap,
             TerrainPaint::Wear{data.style.wear, data.style.wearPatchMeters, data.style.wearSeed});
+        if (edit) {
+            edit->meshMs += TerrainPaintStats::NowMs() - start;
+            edit->newMesh = true;
+        }
+        return mesh;
     }
 }
 
@@ -495,6 +503,7 @@ bool TerrainDecalService::CreatePaint(const TerrainPaintShape& shape,
                                       const uint32_t styleSize,
                                       TerrainPaintId* const outId)
 {
+    TerrainPaintStats::EditScope measure("CreatePaint", nextPaintId_);
     if (!style || !outId || styleSize < kTerrainPaintStyleSizeV1) {
         return false;
     }
@@ -568,6 +577,7 @@ bool TerrainDecalService::RemovePaint(const TerrainPaintId id)
 
 bool TerrainDecalService::SetPaintShape(const TerrainPaintId id, const TerrainPaintShape& shape)
 {
+    TerrainPaintStats::EditScope measure("SetPaintShape", id.value);
     const auto it = paints_.find(id.value);
     if (it == paints_.end()) {
         return false;
@@ -591,6 +601,7 @@ bool TerrainDecalService::SetPaintShape(const TerrainPaintId id, const TerrainPa
 
 bool TerrainDecalService::SetPaintStyle(const TerrainPaintId id, const TerrainPaintStyle* const style, const uint32_t styleSize)
 {
+    TerrainPaintStats::EditScope measure("SetPaintStyle", id.value);
     const auto it = paints_.find(id.value);
     if (it == paints_.end() || !style || styleSize < kTerrainPaintStyleSizeV1) {
         return false;
@@ -651,6 +662,9 @@ bool TerrainDecalService::RealizePaint_(PaintRecord& record, const bool newTextu
                               record.overlayIds.size() == record.data.style.textureCount;
     if (!keepOverlays) {
         UnrealizePaint_(record, true);
+        if (TerrainPaintStats::currentEdit) {
+            TerrainPaintStats::currentEdit->newOverlays = true;
+        }
     }
     // The paint changed: what the renderer kept of it is out of date.
     record.drawCaches.assign(record.data.style.textureCount, {});
@@ -759,6 +773,7 @@ bool TerrainDecalService::ResolveOverlay(const void* const overlayManager,
     out.paint = TerrainDecal::PaintOverlay{
         .mesh = paint->second.mesh.get(),
         .style = &paint->second.data.style,
+        .paintId = paint->first,
         .textureIndex = target.textureIndex,
         .uvFromGround = paint->second.uvFromGround,
         .cache = target.textureIndex < paint->second.drawCaches.size() ? &paint->second.drawCaches[target.textureIndex]

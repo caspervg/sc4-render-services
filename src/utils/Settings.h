@@ -26,6 +26,7 @@ public:
     [[nodiscard]] float GetUIScale() const noexcept;
     [[nodiscard]] std::string GetLayoutFile() const noexcept;
     [[nodiscard]] bool GetShowDemoPanel() const noexcept;
+    [[nodiscard]] bool GetShowTerrainPaintStats() const noexcept;
 
     // Service toggles
     [[nodiscard]] bool GetEnableImGuiService() const noexcept;
@@ -49,6 +50,7 @@ private:
     float uiScale_;
     std::string layoutFile_;
     bool showDemoPanel_;
+    bool showTerrainPaintStats_;
     bool enableImGuiService_;
     bool enableS3DCameraService_;
     bool enableDrawService_;

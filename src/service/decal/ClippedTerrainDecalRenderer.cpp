@@ -16,6 +16,7 @@
 #include "cIGZGDriver.h"
 #include "SC4DrawContextAccess.h"
 #include "TerrainPaintMesh.h"
+#include "TerrainPaintStats.h"
 #include "utils/Logger.h"
 
 namespace
@@ -793,10 +794,12 @@ namespace
                   const uint32_t frames,
                   const int frame,
                   const float alphaScale,
-                  std::vector<PackedTerrainVertex>& output)
+                  std::vector<PackedTerrainVertex>& output,
+                  TerrainPaintStats::Counters* const stats)
     {
         const TerrainPaint::CellRange& range = paint.mesh->Cells();
         PaintDrawCache& cache = *paint.cache;
+        const size_t firstVertex = output.size();
         if (cache.frames != frames) {
             cache.rows.clear();
             cache.frames = frames;
@@ -828,12 +831,20 @@ namespace
             };
             if (!row.built || x0 < row.builtX0 || x1 > row.builtX1 || diagonalChanged()) {
                 // The cells' cuts are kept by the mesh: placing them again is cheap.
+                const double buildStart = stats ? TerrainPaintStats::NowMs() : 0.0;
                 BuildPaintRow(paint, flips, frames, cellZ, row.built ? std::min(x0, row.builtX0) : x0,
                               row.built ? std::max(x1, row.builtX1) : x1, row);
+                if (stats) {
+                    ++stats->rows;
+                    stats->buildMs += TerrainPaintStats::NowMs() - buildStart;
+                }
             }
 
             const std::span<const PaintDrawCache::PlacedVertex> vertices(row.vertices);
             for (auto span = firstVisible(); span != row.cells.end() && span->cellX < x1; ++span) {
+                if (stats) {
+                    ++stats->cells;
+                }
                 std::array<PackedTerrainVertex, 4> corners{};
                 if ((frame >= 0 && span->frame != frame) ||
                     !LoadTerrainCellVertices(addresses, dimensions, span->cellX, cellZ, corners)) {
@@ -847,6 +858,9 @@ namespace
                              corners[t[3]], corners[t[4]], corners[t[5]], alphaScale, vertexUv, output);
             }
         }
+        if (stats) {
+            stats->vertices += output.size() - firstVertex;
+        }
     }
 
     void ScaleAlpha(std::vector<PackedTerrainVertex>& vertices, const float scale) noexcept
@@ -857,11 +871,12 @@ namespace
         }
     }
 
-    void Submit(const DrawRequest& request,
-                const DrawSetup& setup,
-                const std::vector<PackedTerrainVertex>& vertices,
-                const std::span<const PaintDrawCache::FrameRange> frameRanges = {},
-                const FrameTextures& frameTextures = {})
+    // Returns the number of DrawPrims calls.
+    uint32_t Submit(const DrawRequest& request,
+                    const DrawSetup& setup,
+                    const std::vector<PackedTerrainVertex>& vertices,
+                    const std::span<const PaintDrawCache::FrameRange> frameRanges = {},
+                    const FrameTextures& frameTextures = {})
     {
         const HookAddresses& addresses = *request.addresses;
         SC4DrawContext* const context = request.drawContext;
@@ -894,14 +909,17 @@ namespace
             request.aroundDraw(request.aroundDrawUserData, context, true);
         }
         const auto drawPrims = reinterpret_cast<DrawPrimsFn>(addresses.drawPrims);
+        uint32_t drawCalls = 1;
         if (frameRanges.empty() || !frameTextures.names) {
             drawPrims(context, kPrimTypeTriangleList, kTerrainVertexFormat, static_cast<uint32_t>(vertices.size()),
                       vertices.data());
         }
         else {
             const auto setTexture = reinterpret_cast<SetTextureFn>(addresses.setTexture);
+            drawCalls = 0;
             for (const PaintDrawCache::FrameRange& range : frameRanges) {
                 if (range.frame < frameTextures.count) {
+                    ++drawCalls;
                     setTexture(context, frameTextures.names[range.frame], 0);
                     drawPrims(context, kPrimTypeTriangleList, kTerrainVertexFormat, range.count,
                               vertices.data() + range.first);
@@ -930,6 +948,18 @@ namespace
             reinterpret_cast<SetTexTransform4Fn>(addresses.setTexTransform4)(context, setup.baseTexTransform,
                                                                              setup.texTransformStage);
         }
+        return drawCalls;
+    }
+
+    [[nodiscard]] TerrainPaintStats::Pass StatsPass(const DrawMode mode, const TerrainPaintLayer layer) noexcept
+    {
+        using TerrainPaintStats::Pass;
+        if (mode != DrawMode::Normal) {
+            return mode == DrawMode::ShadowRecovery ? Pass::ShadowRecovery : Pass::ShadowRecoveryCapture;
+        }
+        return layer == TerrainPaintLayer::UnderLots     ? Pass::UnderLots
+               : layer == TerrainPaintLayer::OverShadows ? Pass::OverShadows
+                                                         : Pass::OverLots;
     }
 }
 
@@ -1007,6 +1037,17 @@ namespace TerrainDecal
                 return DrawResult::Handled;
             }
             PaintDrawCache& cache = *paint.cache;
+            TerrainPaintStats::Counters statsCounters{};
+            TerrainPaintStats::Counters* const stats = TerrainPaintStats::enabled ? &statsCounters : nullptr;
+            const double statsStart = stats ? TerrainPaintStats::NowMs() : 0.0;
+            const auto report = [&](const double submitStart) {
+                const double end = TerrainPaintStats::NowMs();
+                statsCounters.overlays = 1;
+                statsCounters.liftMs = submitStart - statsStart - statsCounters.buildMs;
+                statsCounters.submitMs = end - submitStart;
+                TerrainPaintStats::Add(StatsPass(request.mode, paint.style->layer), paint.paintId,
+                                       paint.style->textureCount, statsCounters);
+            };
             const uint32_t frameMask = paint.textureIndex < kTerrainPaintMaxTextures
                                            ? paint.style->textureFrameMasks[paint.textureIndex]
                                            : 0u;
@@ -1018,7 +1059,8 @@ namespace TerrainDecal
                 cache.lastDrawn.clear();
                 cache.lastDrawnFrames.clear();
                 if (frameTextures.frames <= 1u) {
-                    LayPaint(addresses, dimensions, frustum, flips, drawRect, paint, 0u, -1, opacity, cache.lastDrawn);
+                    LayPaint(addresses, dimensions, frustum, flips, drawRect, paint, 0u, -1, opacity, cache.lastDrawn,
+                             stats);
                 }
                 else {
                     // One run of vertices per frame, so each draws with its own texture.
@@ -1026,7 +1068,7 @@ namespace TerrainDecal
                         const auto frame = static_cast<uint32_t>(std::countr_zero(rest));
                         const auto first = static_cast<uint32_t>(cache.lastDrawn.size());
                         LayPaint(addresses, dimensions, frustum, flips, drawRect, paint, frameTextures.frames,
-                                 static_cast<int>(frame), opacity, cache.lastDrawn);
+                                 static_cast<int>(frame), opacity, cache.lastDrawn, stats);
                         const auto count = static_cast<uint32_t>(cache.lastDrawn.size()) - first;
                         if (count > 0) {
                             cache.lastDrawnFrames.push_back({frame, first, count});
@@ -1046,6 +1088,9 @@ namespace TerrainDecal
                 vertices = &output;
             }
             if (vertices->empty()) {
+                if (stats) {
+                    report(TerrainPaintStats::NowMs());
+                }
                 return DrawResult::Handled;
             }
 
@@ -1067,7 +1112,12 @@ namespace TerrainDecal
             setup.depthOffset = shadowRecovery ? options_.shadowRecoveryDepthOffset
                                 : paint.style->depthOffset >= 0 ? paint.style->depthOffset
                                                                 : options_.customDefaultDepthOffset;
-            Submit(request, setup, *vertices, cache.lastDrawnFrames, frameTextures);
+            const double submitStart = stats ? TerrainPaintStats::NowMs() : 0.0;
+            const uint32_t drawCalls = Submit(request, setup, *vertices, cache.lastDrawnFrames, frameTextures);
+            if (stats) {
+                statsCounters.drawCalls = drawCalls;
+                report(submitStart);
+            }
             return DrawResult::Handled;
         }
 

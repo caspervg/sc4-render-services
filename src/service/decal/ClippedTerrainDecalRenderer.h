@@ -161,6 +161,7 @@ namespace TerrainDecal
     {
         const TerrainPaint::Mesh* mesh = nullptr;
         const TerrainPaintStyle* style = nullptr;
+        uint32_t paintId = 0;
         uint32_t textureIndex = 0;
         // Texture coordinates from ground coordinates: u = a x + b z + c, v = d x + e z + f.
         std::array<float, 6> uvFromGround{};

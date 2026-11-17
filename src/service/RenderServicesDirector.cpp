@@ -3,6 +3,7 @@
 #include "S3DCameraService.h"
 #include "WorldDrawService.h"
 #include "decal/TerrainDecalService.h"
+#include "decal/TerrainPaintStats.h"
 
 #include "GZServPtrs.h"
 #include "cIGZFrameWork.h"
@@ -26,6 +27,7 @@ namespace {
     constexpr std::string_view kSettingsFileName = "SC4RenderServices.ini";
     constexpr auto kDemoPanelId = 0xA17E0001u;
     constexpr auto kDemoPanelOrder = 0;
+    constexpr auto kTerrainPaintStatsPanelId = 0xA17E0002u;
     constexpr uint32_t kSC4MessagePostCityInit = 0x26D31EC1;
     constexpr uint32_t kSC4MessagePreCityShutdown = 0x26D31EC2;
     constexpr uint32_t kSC4MessageLoad = 0x26C63341;
@@ -180,6 +182,9 @@ public:
                 mpFrameWork->AddToTick(&imguiService_);
                 if (settings.GetShowDemoPanel()) {
                     RegisterDemoPanel_();
+                }
+                if (settings.GetShowTerrainPaintStats()) {
+                    RegisterTerrainPaintStatsPanel_();
                 }
                 LOG_INFO("RenderServicesDirector: ImGuiService registered");
             } else {
@@ -337,6 +342,25 @@ private:
             LOG_INFO("RenderServicesDirector: DemoPanel registered");
         } else {
             LOG_WARN("RenderServicesDirector: failed to register DemoPanel");
+        }
+    }
+
+    void RegisterTerrainPaintStatsPanel_() {
+        ImGuiPanelDesc desc{};
+        desc.id = kTerrainPaintStatsPanelId;
+        desc.order = kDemoPanelOrder;
+        desc.visible = true;
+        desc.on_render = [](void*) {
+            TerrainPaintStats::EndFrame();
+            TerrainPaintStats::RenderPanel();
+        };
+        desc.on_shutdown = [](void*) { TerrainPaintStats::enabled = false; };
+
+        if (imguiService_.RegisterPanel(desc)) {
+            TerrainPaintStats::enabled = true;
+            LOG_INFO("RenderServicesDirector: terrain paint stats panel registered");
+        } else {
+            LOG_WARN("RenderServicesDirector: failed to register the terrain paint stats panel");
         }
     }
 

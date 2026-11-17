@@ -245,6 +245,7 @@ set(CUSTOM_SERVICES_SOURCES
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalService.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalSidecarCodec.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainPaintCodec.cpp
+        ${SC4RS_ROOT}/src/service/decal/TerrainPaintStats.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalSymbols.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalHook.cpp
         ${SC4RS_ROOT}/src/service/RenderServicesDirector.cpp

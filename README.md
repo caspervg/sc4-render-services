@@ -84,6 +84,9 @@ LayoutFile=SC4RenderServices_layout.ini
 ; Useful for verifying that the service installed correctly.
 ShowDemoPanel=false
 
+; Show a panel with what drawing terrain paint costs per frame, and log a summary every 10 seconds.
+ShowTerrainPaintStats=false
+
 ; Enable or disable individual services.
 ; The world draw service is part of the draw service and follows EnableDrawService.
 EnableImGuiService=true
