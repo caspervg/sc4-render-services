@@ -378,11 +378,13 @@ namespace
         PaintSnapshot paint = MakePaint(1, TerrainPaintLayer::OverLots);
         paint.style.textureCount = kTerrainPaintMaxTextures;
         paint.style.textureFrameMasks[kTerrainPaintMaxTextures - 1] = 6;
+        paint.style.flags = kTerrainPaintFlagDraft;
         MemoryIStream in(WriteCurrent({paint}));
         const auto result = TerrainPaintCodec::Read(in);
         CHECK(result.ok);
         CHECK(result.paints.size() == 1);
         CHECK(SameStyle(result.paints[0].style, paint.style));
+        CHECK(result.paints[0].style.flags == 0);
         CHECK(in.Remaining() == 0);
     }
 

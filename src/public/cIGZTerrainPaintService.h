@@ -67,6 +67,10 @@ struct TerrainPaintTexture {
 
 // Not stored in the city save. Use it for previews.
 static constexpr uint32_t kTerrainPaintFlagTransient = 1u << 0;
+// Cut and drawn without the soft edge and without wear, which is much cheaper: for a paint that
+// changes every frame, such as while a slider is held. Not stored in the city save. Changing it
+// cuts the paint again, like changing the soft edge.
+static constexpr uint32_t kTerrainPaintFlagDraft = 1u << 1;
 
 // Where a paint sits among what the game draws flat on the ground. Buildings, props and cars
 // hide a paint in every layer, as they hide the ground.

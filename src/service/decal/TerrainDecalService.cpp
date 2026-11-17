@@ -208,9 +208,10 @@ namespace
         for (const TerrainPaintUvVertex& vertex : data.uvMap) {
             uvMap.push_back({vertex.x, vertex.z, vertex.u, vertex.v});
         }
+        const bool draft = (data.style.flags & kTerrainPaintFlagDraft) != 0;
         auto mesh = std::make_unique<TerrainPaint::Mesh>(
-            rings, data.style.featherMeters, uvMap,
-            TerrainPaint::Wear{data.style.wear, data.style.wearPatchMeters, data.style.wearSeed});
+            rings, draft ? 0.0f : data.style.featherMeters, uvMap,
+            draft ? TerrainPaint::Wear{} : TerrainPaint::Wear{data.style.wear, data.style.wearPatchMeters, data.style.wearSeed});
         if (edit) {
             edit->meshMs += TerrainPaintStats::NowMs() - start;
             edit->newMesh = true;
@@ -619,7 +620,8 @@ bool TerrainDecalService::SetPaintStyle(const TerrainPaintId id, const TerrainPa
     // These are in the mesh: it is made again when one of them changes.
     const bool featherChanged = validated.featherMeters != current.featherMeters || validated.wear != current.wear ||
                                 validated.wearPatchMeters != current.wearPatchMeters ||
-                                validated.wearSeed != current.wearSeed;
+                                validated.wearSeed != current.wearSeed ||
+                                ((validated.flags ^ current.flags) & kTerrainPaintFlagDraft) != 0;
     bool newTextures = validated.textureCount != current.textureCount;
     for (uint32_t i = 0; !newTextures && i < validated.textureCount; ++i) {
         const cGZPersistResourceKey& a = validated.textures[i].key;

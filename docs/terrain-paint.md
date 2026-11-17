@@ -76,7 +76,7 @@ without the newer fields.
 | `drawOrder` | Paints and decals draw in ascending order. Game decals count as 0. When the order is equal, game decals come first, then the rest in the order they were made. |
 | `depthOffset` | As for decals; -1 uses the service default. |
 | `enabled` | Hidden while false. It is still saved. |
-| `flags` | `kTerrainPaintFlagTransient`: the paint is not saved. Use it for previews. |
+| `flags` | `kTerrainPaintFlagTransient`: the paint is not saved. Use it for previews. `kTerrainPaintFlagDraft`: no soft edge and no wear, so cutting the paint is cheap, for a paint that changes every frame. Flags are not saved, and older services ignore the ones they do not know. |
 | `layer` | Where the paint sits among what the game draws flat on the ground. See [Layers](#layers). |
 
 Style calls accept the size the style had before `layer` (`kTerrainPaintStyleSizeV1`). Paints
