@@ -11,6 +11,7 @@
 
 #include "cIGZIStream.h"
 #include "cIGZOStream.h"
+#include "service/decal/ClippedTerrainDecalRenderer.h"
 #include "service/decal/TerrainDecalSidecarCodec.h"
 #include "service/decal/TerrainPaintCodec.h"
 
@@ -388,6 +389,36 @@ namespace
         CHECK(in.Remaining() == 0);
     }
 
+    // The row budget: an equal share per overlay with rows to build, a cap over all of them,
+    // and an overlay held back by the others goes first in the next frame.
+    void RowBudget()
+    {
+        TerrainDecal::RowBudget budget;
+        TerrainDecal::PaintDrawCache a;
+        TerrainDecal::PaintDrawCache b;
+        budget.SetFrameMs(4.0f);
+        budget.BeginFrame(0.0);
+        CHECK(budget.MayBuild(a, 0.0));
+        budget.Spend(a, 5.0);
+        CHECK(!budget.MayBuild(a, 1.0));
+        CHECK(!budget.MayBuild(b, 1.0) && b.budgetStarved);
+
+        budget.BeginFrame(10.0);
+        CHECK(budget.MayBuild(a, 10.0));
+        budget.Spend(a, 3.0);
+        CHECK(!budget.MayBuild(a, 11.0));
+        CHECK(budget.MayBuild(b, 11.0));
+        budget.Spend(b, 3.0);
+        CHECK(!budget.MayBuild(b, 12.0));
+
+        // No frame signal for a long time: a new frame starts anyway.
+        CHECK(budget.MayBuild(a, 500.0));
+
+        budget.SetFrameMs(0.0f);
+        budget.Spend(a, 100.0);
+        CHECK(budget.MayBuild(a, 501.0));
+    }
+
     // The decal struct sizes callers may pass: before drawOrder, before frame, and now.
     static_assert(kTerrainDecalStateSizeV1 == 108 && kTerrainDecalStateSizeV2 == 112 && kTerrainDecalStateSize == 116);
     static_assert(kTerrainDecalSnapshotSizeV1 == 112 && kTerrainDecalSnapshotSizeV2 == 116 &&
@@ -451,6 +482,7 @@ int main()
     NewerRecordLoads();
     MaxTexturesRoundTrip();
     DecalFrame();
+    RowBudget();
     std::printf("ok\n");
     return 0;
 }

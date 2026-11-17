@@ -43,6 +43,8 @@ namespace TerrainDecal
         int customDefaultDepthOffset = 2;
         int shadowRecoveryDepthOffset = 4;
         float shadowRecoveryOpacityScale = 0.25f;
+        // Time for cutting and placing terrain paint rows per frame, over all paints. 0: no cap.
+        float paintRowBudgetMs = 4.0f;
     };
 
     // The game's terrain vertex, 32 bytes, as DrawPrims takes it with vertex format 0x0B.
@@ -131,6 +133,8 @@ namespace TerrainDecal
         struct Row
         {
             bool built = false;
+            // The cache's generation it was built in: older rows are drawn until built again.
+            uint32_t generation = 0;
             // The cells [builtX0, builtX1) of the row that are placed: what was on screen so far.
             int32_t builtX0 = 0;
             int32_t builtX1 = 0;
@@ -145,8 +149,10 @@ namespace TerrainDecal
             uint32_t count;
         };
 
-        // Rows from the paint's first cell row.
+        // Rows from cell row rowsMinZ.
         std::vector<Row> rows;
+        int32_t rowsMinZ = 0;
+        uint32_t generation = 0;
         // The texture frames the rows picked from.
         uint32_t frames = 0;
         // The vertices laid in the last decal pass, which the shadow passes after it draw again.
@@ -155,7 +161,81 @@ namespace TerrainDecal
         std::vector<FrameRange> lastDrawnFrames;
         uint32_t lastDrawnPass = 0;
         bool lastDrawnValid = false;
+
+        // This overlay's part of the row budget.
+        uint32_t budgetFrame = 0;
+        double budgetSpentMs = 0.0;
+        bool budgetStarved = false;
+
+        // The paint changed: its rows are built again, and drawn as they were until then.
+        void Invalidate() noexcept
+        {
+            ++generation;
+            lastDrawnValid = false;
+        }
     };
+
+    // Caps the time cutting and placing paint rows takes per frame. Each overlay with rows to
+    // build gets an equal share; one held back by the others goes first in the next frame.
+    class RowBudget
+    {
+    public:
+        void SetFrameMs(const float ms) noexcept { frameMs_ = ms; }
+        void BeginFrame(double nowMs) noexcept;
+        [[nodiscard]] bool MayBuild(PaintDrawCache& cache, double nowMs) noexcept;
+        void Spend(PaintDrawCache& cache, double ms) noexcept;
+
+    private:
+        // Without a frame signal, a frame ends after this long.
+        static constexpr double kMaxFrameMs = 100.0;
+
+        double frameMs_ = 4.0;
+        double frameStartMs_ = 0.0;
+        double spentMs_ = 0.0;
+        uint32_t frame_ = 1;
+        uint32_t waiting_ = 0;
+        uint32_t waitingBefore_ = 1;
+    };
+
+    inline void RowBudget::BeginFrame(const double nowMs) noexcept
+    {
+        waitingBefore_ = waiting_ > 0 ? waiting_ : 1u;
+        waiting_ = 0;
+        spentMs_ = 0.0;
+        frameStartMs_ = nowMs;
+        ++frame_;
+    }
+
+    inline bool RowBudget::MayBuild(PaintDrawCache& cache, const double nowMs) noexcept
+    {
+        if (!(frameMs_ > 0.0)) {
+            return true;
+        }
+        if (nowMs - frameStartMs_ > kMaxFrameMs) {
+            BeginFrame(nowMs);
+        }
+        if (cache.budgetFrame != frame_) {
+            cache.budgetFrame = frame_;
+            cache.budgetSpentMs = 0.0;
+            ++waiting_;
+        }
+        const double share = frameMs_ / waitingBefore_;
+        if (cache.budgetSpentMs >= share) {
+            return false;
+        }
+        if (spentMs_ < frameMs_ || cache.budgetStarved) {
+            return true;
+        }
+        cache.budgetStarved = true;
+        return false;
+    }
+
+    inline void RowBudget::Spend(PaintDrawCache& cache, const double ms) noexcept
+    {
+        spentMs_ += ms;
+        cache.budgetSpentMs += ms;
+        cache.budgetStarved = false;
+    }
 
     struct PaintOverlay
     {
@@ -210,9 +290,12 @@ namespace TerrainDecal
         void SetOverlaySource(ManagedOverlaySource* source) noexcept;
 
         [[nodiscard]] DrawResult Draw(const DrawRequest& request);
+        // Starts the next frame's row budget.
+        void BeginFrame() noexcept;
 
     private:
         RendererOptions options_;
+        RowBudget rowBudget_;
         ManagedOverlaySource* source_ = nullptr;
     };
 }

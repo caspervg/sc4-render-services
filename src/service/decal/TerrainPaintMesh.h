@@ -101,6 +101,8 @@ namespace TerrainPaint
 
         // Empty when the cell is outside the area. flipped: split along the cell's other diagonal.
         [[nodiscard]] const CellMesh& Cell(int32_t cellX, int32_t cellZ, bool flipped = false) const;
+        // Whether Cell() returns at once: the cell is cut already, or outside the area.
+        [[nodiscard]] bool HasCell(int32_t cellX, int32_t cellZ, bool flipped = false) const;
 
     private:
         struct Edge

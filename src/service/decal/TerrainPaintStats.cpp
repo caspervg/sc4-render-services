@@ -71,6 +71,7 @@ namespace TerrainPaintStats
             into.cells += c.cells;
             into.vertices += c.vertices;
             into.drawCalls += c.drawCalls;
+            into.deferredRows += c.deferredRows;
             into.buildMs += c.buildMs;
             into.liftMs += c.liftMs;
             into.submitMs += c.submitMs;
@@ -101,9 +102,9 @@ namespace TerrainPaintStats
 
         std::string Segment(const char* name, const Counters& c)
         {
-            return std::format("{}: overlays {:.1f}, rows {:.1f}, cells {:.0f}, vertices {:.0f}, draws {:.1f}, "
-                               "build {:.2f} ms, lift {:.2f} ms, submit {:.2f} ms",
-                               name, PerFrame(c.overlays), PerFrame(c.rows), PerFrame(c.cells),
+            return std::format("{}: overlays {:.1f}, rows {:.1f}, deferred {:.1f}, cells {:.0f}, vertices {:.0f}, "
+                               "draws {:.1f}, build {:.2f} ms, lift {:.2f} ms, submit {:.2f} ms",
+                               name, PerFrame(c.overlays), PerFrame(c.rows), PerFrame(c.deferredRows), PerFrame(c.cells),
                                PerFrame(c.vertices), PerFrame(c.drawCalls), PerFrame(c.buildMs),
                                PerFrame(c.liftMs), PerFrame(c.submitMs));
         }
@@ -149,6 +150,8 @@ namespace TerrainPaintStats
             ImGui::Text("%.1f", PerFrame(c.overlays));
             ImGui::TableNextColumn();
             ImGui::Text("%.1f", PerFrame(c.rows));
+            ImGui::TableNextColumn();
+            ImGui::Text("%.1f", PerFrame(c.deferredRows));
             ImGui::TableNextColumn();
             ImGui::Text("%.0f", PerFrame(c.cells));
             ImGui::TableNextColumn();
@@ -217,8 +220,8 @@ namespace TerrainPaintStats
         ImGui::Text("Per frame, average of the last %.1f s (%u frames, %.0f fps).", published.seconds,
                     published.frames, published.seconds > 0.0 ? published.frames / published.seconds : 0.0);
         constexpr ImGuiTableFlags kFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit;
-        if (ImGui::BeginTable("passes", 9, kFlags)) {
-            for (const char* header : {"Pass", "Overlays", "Rows built", "Cells", "Vertices", "Draw calls",
+        if (ImGui::BeginTable("passes", 10, kFlags)) {
+            for (const char* header : {"Pass", "Overlays", "Rows built", "Rows put off", "Cells", "Vertices", "Draw calls",
                                        "Build ms", "Lift ms", "Submit ms"}) {
                 ImGui::TableSetupColumn(header);
             }

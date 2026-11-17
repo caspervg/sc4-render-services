@@ -364,6 +364,12 @@ namespace TerrainPaint
         return cache.emplace(key, CachedCell{std::move(signature), BuildCell_(cellX, cellZ, flipped)}).first->second.mesh;
     }
 
+    bool Mesh::HasCell(const int32_t cellX, const int32_t cellZ, const bool flipped) const
+    {
+        return area_.empty() || cellX < cells_.minX || cellX > cells_.maxX || cellZ < cells_.minZ ||
+               cellZ > cells_.maxZ || cellCache_[flipped ? 1 : 0].contains(Key_(cellX, cellZ));
+    }
+
     void Mesh::ReuseCellsFrom(std::unique_ptr<Mesh> previous)
     {
         if (!previous || !SameSettings_(*previous)) {

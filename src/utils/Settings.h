@@ -37,6 +37,7 @@ public:
     [[nodiscard]] int GetTerrainDecalCustomDefaultDepthOffset() const noexcept;
     [[nodiscard]] float GetTerrainDecalShadowRecoveryOpacityScale() const noexcept;
     [[nodiscard]] bool GetTerrainDecalShadowRecoveryUseStencil() const noexcept;
+    [[nodiscard]] float GetTerrainPaintRowBudgetMs() const noexcept;
 
 private:
     spdlog::level::level_enum logLevel_;
@@ -59,4 +60,5 @@ private:
     int terrainDecalCustomDefaultDepthOffset_;
     float terrainDecalShadowRecoveryOpacityScale_;
     bool terrainDecalShadowRecoveryUseStencil_;
+    float terrainPaintRowBudgetMs_;
 };

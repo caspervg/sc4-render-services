@@ -111,6 +111,11 @@ TerrainDecalShadowRecoveryOpacityScale=0.25
 ; that have a stencil buffer, such as SCD3D11 and scvk 0.4.0 or later. The game's built-in
 ; DirectX driver keeps its own method. Set to false to draw every decal again instead.
 TerrainDecalShadowRecoveryUseStencil=true
+
+; Milliseconds per frame for cutting terrain paint into cells after it changes, over all paints.
+; What is not done yet is drawn as it was, or not at all, and done in the next frames, nearest
+; the middle of the screen first. 0 does it all at once. Valid range: 0 - 100.
+TerrainPaintRowBudgetMs=4
 ```
 
 ## Build

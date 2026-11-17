@@ -142,6 +142,13 @@ What a frame costs:
   drawing uses.
 - The cut is made once per cell row, the first time the row is on screen. The renderer keeps each
   piece with its weights on the terrain triangle, which do not depend on the heights.
+- Cutting has a time budget per frame over all paints, `TerrainPaintRowBudgetMs` in
+  `SC4RenderServices.ini` (default 4, 0 for no cap). Each paint overlay with rows to cut gets an
+  equal share, rows nearest the middle of the screen first. A row whose cells are not all cut yet
+  is drawn as it was before the change, or not at all, and is replaced in one go once they are.
+  While rows wait, the static view is told to draw the overlay again
+  (`cSTEOverlayManager::RedisplayStaticOverlay`, `0x00737D40`), so the work goes on when nothing
+  else moves.
 - Each frame then reads the four corners of each visible cell and blends them. Heights and
   colours are always current, so terrain edits and lighting changes show up at once, with nothing
   to go stale.
@@ -207,7 +214,7 @@ With `ShowTerrainPaintStats=true` in `SC4RenderServices.ini`, the "Terrain paint
 shows what drawing paint costs per frame, averaged over the last second:
 - One row per pass: the decal pass by the paint's layer (over lots, under lots, over shadows), then
   the shadow recovery passes.
-- Overlays drawn, rows built (`BuildPaintRow`), cells visited and vertices lifted, draw calls, and
+- Overlays drawn, rows built (`BuildPaintRow`) and put off by the budget, cells visited and vertices lifted, draw calls, and
   the time spent building rows, lifting vertices (with the rest of the setup), and in `Submit`.
 - The five paints with the most vertices.
 - Paint edits (`CreatePaint`, `SetPaintShape`, `SetPaintStyle`): calls and milliseconds per second,

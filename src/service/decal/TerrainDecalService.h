@@ -62,6 +62,7 @@ public:
     void SetEnableCustomRenderer(bool enableCustomRenderer) noexcept;
     void SetCustomDefaultDepthOffset(int customDefaultDepthOffset) noexcept;
     void SetShadowRecoveryOpacityScale(float shadowRecoveryOpacityScale) noexcept;
+    void SetPaintRowBudgetMs(float paintRowBudgetMs) noexcept;
     void SetShadowRecoveryUseStencil(bool shadowRecoveryUseStencil) noexcept;
     // Draws paints and decals under lots at the end of its PreStatic pass. Set it before Init.
     // Without it they are drawn with the others.
@@ -160,6 +161,7 @@ private:
     bool enableCustomRenderer_ = true;
     int customDefaultDepthOffset_ = 2;
     float shadowRecoveryOpacityScale_ = 0.25f;
+    float paintRowBudgetMs_ = 4.0f;
     bool shadowRecoveryUseStencil_ = true;
     bool cityLoaded_ = false;
 };

@@ -24,6 +24,7 @@ namespace TerrainDecal
                 .setTransparency = 0x007D2A20u,
                 .setTexWrapModes = 0x007D41E0u,
                 .setTexture = 0x007D4070u,
+                .redisplayStaticOverlay = 0x00737D40u,
                 .setDepthOffset = 0x007D4480u,
                 .setVertexBuffer = 0x007D2970u,
                 .drawPrims = 0x007D2990u,

@@ -32,6 +32,7 @@ namespace TerrainDecal
             // Limit the shadow recovery redraw to one layer per pixel with the stencil buffer,
             // on drivers that have one.
             bool shadowRecoveryUseStencil = true;
+            float paintRowBudgetMs = 4.0f;
         };
 
         explicit TerrainDecalHook(Options options = {});

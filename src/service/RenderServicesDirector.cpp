@@ -231,6 +231,7 @@ public:
             terrainDecalService_.SetCustomDefaultDepthOffset(settings.GetTerrainDecalCustomDefaultDepthOffset());
             terrainDecalService_.SetShadowRecoveryOpacityScale(settings.GetTerrainDecalShadowRecoveryOpacityScale());
             terrainDecalService_.SetShadowRecoveryUseStencil(settings.GetTerrainDecalShadowRecoveryUseStencil());
+            terrainDecalService_.SetPaintRowBudgetMs(settings.GetTerrainPaintRowBudgetMs());
             terrainDecalService_.SetDrawService(drawServiceRegistered_ ? &drawService_ : nullptr);
             if (terrainDecalService_.Init()) {
                 mpFrameWork->AddSystemService(&terrainDecalService_);

@@ -23,6 +23,7 @@ namespace TerrainPaintStats
         uint64_t cells = 0;      // cells visited while lifting
         uint64_t vertices = 0;   // vertices lifted
         uint64_t drawCalls = 0;
+        uint64_t deferredRows = 0;  // put off by the row budget
         double buildMs = 0.0;
         double liftMs = 0.0;     // lifting and the rest of the setup before the draw
         double submitMs = 0.0;

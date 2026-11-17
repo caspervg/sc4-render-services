@@ -668,8 +668,12 @@ bool TerrainDecalService::RealizePaint_(PaintRecord& record, const bool newTextu
             TerrainPaintStats::currentEdit->newOverlays = true;
         }
     }
-    // The paint changed: what the renderer kept of it is out of date.
-    record.drawCaches.assign(record.data.style.textureCount, {});
+    // The paint changed: what the renderer kept of it is out of date, but drawn until it has
+    // been built again.
+    record.drawCaches.resize(record.data.style.textureCount);
+    for (TerrainDecal::PaintDrawCache& cache : record.drawCaches) {
+        cache.Invalidate();
+    }
     if (!PaintsAvailable_()) {
         // Kept, so it is saved again, but not drawn.
         return true;
@@ -892,6 +896,11 @@ void TerrainDecalService::SetCustomDefaultDepthOffset(const int customDefaultDep
     customDefaultDepthOffset_ = customDefaultDepthOffset;
 }
 
+void TerrainDecalService::SetPaintRowBudgetMs(const float paintRowBudgetMs) noexcept
+{
+    paintRowBudgetMs_ = paintRowBudgetMs;
+}
+
 void TerrainDecalService::SetShadowRecoveryOpacityScale(const float shadowRecoveryOpacityScale) noexcept
 {
     shadowRecoveryOpacityScale_ = shadowRecoveryOpacityScale;
@@ -920,6 +929,7 @@ bool TerrainDecalService::Init()
         .customDefaultDepthOffset = customDefaultDepthOffset_,
         .shadowRecoveryOpacityScale = shadowRecoveryOpacityScale_,
         .shadowRecoveryUseStencil = shadowRecoveryUseStencil_,
+        .paintRowBudgetMs = paintRowBudgetMs_,
     });
 
     if (!renderHook_->Install()) {
