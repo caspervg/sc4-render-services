@@ -55,7 +55,7 @@ struct TerrainPaintShape {
     uint32_t uvVertexCount = 0;
 };
 
-static constexpr uint32_t kTerrainPaintMaxTextures = 8;
+static constexpr uint32_t kTerrainPaintMaxTextures = 32;
 
 struct TerrainPaintTexture {
     // A terrain decal texture (FSH, for example type 0x7AB50E44, group 0x0986135E).

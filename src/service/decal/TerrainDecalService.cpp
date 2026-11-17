@@ -103,7 +103,7 @@ namespace
     [[nodiscard]] bool ValidateStyle(TerrainPaintStyle& style, std::string& error)
     {
         if (style.textureCount < 1 || style.textureCount > kTerrainPaintMaxTextures) {
-            error = "textureCount must be 1 to 8";
+            error = "textureCount must be 1 to 32";
             return false;
         }
         for (uint32_t i = 0; i < style.textureCount; ++i) {

@@ -10,7 +10,7 @@ A paint is a **shape** and a **style**:
 
 - The shape is one or more polygon rings in the ground plane (x and z in metres). The area is
   everything inside an odd number of rings, so a ring inside another one is a hole.
-- The style says how the area looks: up to eight textures, their size, turn and offset, a colour,
+- The style says how the area looks: up to 32 textures, their size, turn and offset, a colour,
   an opacity, a soft edge, and the draw order.
 
 The service drapes the paint over the terrain and follows later terrain changes. It draws the
@@ -64,7 +64,7 @@ service, without the newer fields.
 
 | Field | Meaning |
 |---|---|
-| `textures`, `textureCount` | 1 to 8 terrain textures. With more than one, every 16 m terrain cell of the area takes one of them, chosen by `weight`. The same `variationSeed` always picks the same textures. |
+| `textures`, `textureCount` | 1 to 32 terrain textures. With more than one, every 16 m terrain cell of the area takes one of them, chosen by `weight`. The same `variationSeed` always picks the same textures. |
 | `textureFrameMasks` | One per texture. For an FSH with several bitmaps (frames), bit n lets cells use frame n: every cell takes one of the allowed frames, each as likely, the same every time for the same `variationSeed`. Bits past the texture's last frame are ignored. 0 means frame 0 only. |
 | `textureSizeMeters` | The texture repeats every this many metres. Default 16, like the game's tiles. |
 | `textureRotationTurns`, `textureOffsetX/Z` | Turn (1 = a full turn) and shift of the texture. Both are fixed to the ground, so neighbouring paints line up. |

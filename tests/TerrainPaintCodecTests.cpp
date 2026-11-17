@@ -178,6 +178,17 @@ int main()
         CHECK(result.ok && result.paints.size() == 1 && result.paints[0].style.textureFrameMasks[0] == 0b1011);
     }
 
+    {
+        TerrainPaintCodec::PaintSnapshot full = paint;
+        full.style.textureCount = kTerrainPaintMaxTextures;
+        full.style.textureFrameMasks[kTerrainPaintMaxTextures - 1] = 6;
+        MemoryOut fullOut;
+        CHECK(TerrainPaintCodec::Write(fullOut, {&full}));
+        const auto result = ReadBack(fullOut.bytes);
+        CHECK(result.ok && result.paints[0].style.textureCount == kTerrainPaintMaxTextures &&
+              result.paints[0].style.textureFrameMasks[kTerrainPaintMaxTextures - 1] == 6);
+    }
+
     std::puts("ok");
     return 0;
 }
