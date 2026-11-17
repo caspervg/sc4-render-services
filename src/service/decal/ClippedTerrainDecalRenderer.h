@@ -92,6 +92,7 @@ namespace TerrainDecal
         bool mirror = false;
         // -1 means "use RendererOptions::customDefaultDepthOffset".
         int depthOffset = -1;
+        uint32_t frame = 0;
     };
 
     // One texture of a terrain paint. The paint has one overlay per texture; each draws the

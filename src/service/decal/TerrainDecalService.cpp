@@ -92,6 +92,7 @@ namespace
         overrides.uvOffset = state.decalInfo.uvOffset;
         overrides.mirror = (state.flags & kTerrainDecalFlagMirror) != 0;
         overrides.depthOffset = state.depthOffset;
+        overrides.frame = state.frame;
     }
 
     [[nodiscard]] bool IsFinite(const float value) noexcept

@@ -1,4 +1,5 @@
-// Checks for the terrain paint save record: run TerrainPaintCodecTests.exe, it prints "ok" or aborts.
+// Checks for the terrain paint and decal save records: run TerrainPaintCodecTests.exe, it prints "ok" or aborts.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8,6 +9,7 @@
 #include "cIGZIStream.h"
 #include "cIGZOStream.h"
 #include "service/decal/TerrainPaintCodec.h"
+#include "service/decal/TerrainDecalSidecarCodec.h"
 
 namespace
 {
@@ -104,6 +106,11 @@ namespace
         int32_t error_ = 0;
     };
 
+    // The decal struct sizes callers may pass: before drawOrder, before frame, and now.
+    static_assert(kTerrainDecalStateSizeV1 == 108 && kTerrainDecalStateSizeV2 == 112 && kTerrainDecalStateSize == 116);
+    static_assert(kTerrainDecalSnapshotSizeV1 == 112 && kTerrainDecalSnapshotSizeV2 == 116 &&
+                  kTerrainDecalSnapshotSize == 120);
+
     // magic, major, minor, paint count, then the first paint's byte count.
     constexpr size_t kMinorOffset = 6;
     constexpr size_t kByteCountOffset = 12;
@@ -187,6 +194,50 @@ int main()
         const auto result = ReadBack(fullOut.bytes);
         CHECK(result.ok && result.paints[0].style.textureCount == kTerrainPaintMaxTextures &&
               result.paints[0].style.textureFrameMasks[kTerrainPaintMaxTextures - 1] == 6);
+    }
+
+    {
+        // Decal sidecar: frame round trips, minor 2 records read frame 0, longer records are skipped.
+        TerrainDecalSnapshot decal{};
+        decal.id.value = 4;
+        decal.state.textureKey = cGZPersistResourceKey(0x7AB50E44, 0x1ABE787D, 0xAA40173A);
+        decal.state.drawOrder = 7;
+        decal.state.frame = 5;
+        MemoryOut decalOut;
+        CHECK(TerrainDecalSidecar::Write(decalOut, {decal, decal}));
+        const std::vector<uint8_t> sidecar = decalOut.bytes;
+        constexpr size_t kPayload = 20;
+        constexpr size_t kRecordSize = 24;
+        constexpr size_t kRecords = 32;
+        constexpr uint32_t kSize = sizeof(TerrainDecalSidecar::PersistedTerrainDecal);
+        CHECK(Read32(sidecar, kRecordSize) == kSize && sidecar.size() == kRecords + 2 * kSize);
+
+        const auto read = [](std::vector<uint8_t> bytes) {
+            MemoryIn in(std::move(bytes));
+            return TerrainDecalSidecar::Read(in);
+        };
+        const auto current = read(sidecar);
+        CHECK(current.ok && current.decals.size() == 2 && current.decals[1].state.frame == 5 &&
+              current.decals[1].state.drawOrder == 7);
+
+        // Each record cut or padded to recordSize bytes.
+        const auto resized = [&](const uint32_t recordSize, const uint16_t minor) {
+            std::vector<uint8_t> bytes(sidecar.begin(), sidecar.begin() + kRecords);
+            for (size_t i = 0; i < 2; ++i) {
+                const auto record = sidecar.begin() + static_cast<std::ptrdiff_t>(kRecords + i * kSize);
+                bytes.insert(bytes.end(), record, record + std::min(recordSize, kSize));
+                bytes.insert(bytes.end(), recordSize > kSize ? recordSize - kSize : 0u, uint8_t{0xAB});
+            }
+            bytes[kMinorOffset] = static_cast<uint8_t>(minor);
+            Patch32(bytes, kPayload, 2 * recordSize);
+            Patch32(bytes, kRecordSize, recordSize);
+            return bytes;
+        };
+        const auto minor2 = read(resized(kSize - 4, 2));
+        CHECK(minor2.ok && minor2.decals.size() == 2 && minor2.decals[1].state.frame == 0 &&
+              minor2.decals[1].state.drawOrder == 7);
+        const auto longer = read(resized(kSize + 8, 4));
+        CHECK(longer.ok && longer.decals.size() == 2 && longer.decals[1].state.frame == 5);
     }
 
     std::puts("ok");

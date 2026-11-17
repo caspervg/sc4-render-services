@@ -137,13 +137,11 @@ namespace
         uint32_t count = 0;
     };
 
+    // mask: the frames allowed.
     [[nodiscard]] FrameTextures ReadFrameTextures(const HookAddresses& addresses,
-                                                  const PaintOverlay& paint,
+                                                  const uint32_t mask,
                                                   const std::byte* const slotBase) noexcept
     {
-        const uint32_t mask = paint.textureIndex < kTerrainPaintMaxTextures
-                                  ? paint.style->textureFrameMasks[paint.textureIndex]
-                                  : 0u;
         if (mask <= 1u || !addresses.setTexture) {
             return {};
         }
@@ -1009,7 +1007,10 @@ namespace TerrainDecal
                 return DrawResult::Handled;
             }
             PaintDrawCache& cache = *paint.cache;
-            const FrameTextures frameTextures = ReadFrameTextures(addresses, paint, request.overlaySlotBase);
+            const uint32_t frameMask = paint.textureIndex < kTerrainPaintMaxTextures
+                                           ? paint.style->textureFrameMasks[paint.textureIndex]
+                                           : 0u;
+            const FrameTextures frameTextures = ReadFrameTextures(addresses, frameMask, request.overlaySlotBase);
 
             // The shadow passes draw again what the decal pass before them laid.
             if (!(shadowRecovery && cache.lastDrawnValid && cache.lastDrawnPass == request.pass)) {
@@ -1149,7 +1150,12 @@ namespace TerrainDecal
         if (request.mode == DrawMode::ShadowRecovery && std::isfinite(slot.opacity)) {
             setup.transparency = slot.opacity * std::clamp(options_.shadowRecoveryOpacityScale, 0.0f, 1.0f);
         }
-        Submit(request, setup, output);
+        const FrameTextures frameTextures =
+            isManaged && overrides.frame > 0 && overrides.frame < 32
+                ? ReadFrameTextures(addresses, 1u << overrides.frame, request.overlaySlotBase)
+                : FrameTextures{};
+        const PaintDrawCache::FrameRange whole{overrides.frame, 0, static_cast<uint32_t>(output.size())};
+        Submit(request, setup, output, std::span(&whole, 1), frameTextures);
         return DrawResult::Handled;
     }
 }

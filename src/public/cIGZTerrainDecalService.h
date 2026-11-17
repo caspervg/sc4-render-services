@@ -53,6 +53,9 @@ struct TerrainDecalState {
     // The game's own decals count as 0; equal values keep the game's order.
     // Requires the custom clipped renderer.
     int32_t drawOrder = 0;
+    // For an FSH with several bitmaps: the one to draw. Out of range draws frame 0.
+    // Requires the custom clipped renderer.
+    uint32_t frame = 0;
 };
 
 struct TerrainDecalSnapshot {
@@ -66,6 +69,9 @@ static constexpr size_t kTerrainDecalSnapshotSize = sizeof(TerrainDecalSnapshot)
 // Sizes before drawOrder was added. The service still accepts callers built against them.
 static constexpr size_t kTerrainDecalStateSizeV1 = offsetof(TerrainDecalState, drawOrder);
 static constexpr size_t kTerrainDecalSnapshotSizeV1 = offsetof(TerrainDecalSnapshot, state) + kTerrainDecalStateSizeV1;
+// Sizes before frame was added.
+static constexpr size_t kTerrainDecalStateSizeV2 = offsetof(TerrainDecalState, frame);
+static constexpr size_t kTerrainDecalSnapshotSizeV2 = offsetof(TerrainDecalSnapshot, state) + kTerrainDecalStateSizeV2;
 
 // ReSharper disable once CppPolymorphicClassWithNonVirtualPublicDestructor
 class cIGZTerrainDecalService : public cIGZUnknown {

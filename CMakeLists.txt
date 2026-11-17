@@ -218,6 +218,7 @@ if(SC4RS_BUILD_TESTS)
     add_executable(TerrainPaintCodecTests
             ${SC4RS_ROOT}/tests/TerrainPaintCodecTests.cpp
             ${SC4RS_ROOT}/src/service/decal/TerrainPaintCodec.cpp
+            ${SC4RS_ROOT}/src/service/decal/TerrainDecalSidecarCodec.cpp
     )
     target_include_directories(TerrainPaintCodecTests PRIVATE ${SC4RS_ROOT}/src)
     target_link_libraries(TerrainPaintCodecTests PRIVATE gzcom2)

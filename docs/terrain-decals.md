@@ -123,6 +123,8 @@ Important fields:
 - `drawOrder`: decals and terrain paints draw in ascending order, so a higher
   value lands on top. Game decals count as 0. Requires the custom clipped
   renderer. See `docs/terrain-paint.md`.
+- `frame`: for an FSH with several bitmaps, the one to draw. 0, or a frame the
+  texture does not have, draws the first. Requires the custom clipped renderer.
 
 Minimal example:
 
@@ -223,7 +225,8 @@ edges. Query `GZIID_cIGZTerrainPaintService`; see `docs/terrain-paint.md`.
 - `baseSize` must be greater than zero.
 - UV window bounds must satisfy `u1 <= u2` and `v1 <= v2`.
 - `CreateDecal` and friends take the struct size. Callers built before
-  `drawOrder` existed pass the older size and get draw order 0.
+  `drawOrder` or `frame` existed pass the older size and get draw order 0 and
+  frame 0.
 - `flags` are preserved in snapshots and save data; the mirror bit
   (`kTerrainDecalFlagMirror`) is consumed by the custom renderer, but
   `TerrainDecalState::flags` is not pushed into the game overlay manager
