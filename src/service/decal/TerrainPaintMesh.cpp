@@ -300,6 +300,16 @@ namespace TerrainPaint
         }
 
 
+        const double margin = NearMargin_();
+        for (size_t i = 0; i < area_.size(); ++i) {
+            const RectD ring = GetBounds(area_[i]);
+            for (int32_t cz = CellIndex(ring.top - margin); cz <= CellIndex(ring.bottom + margin); ++cz) {
+                for (int32_t cx = CellIndex(ring.left - margin); cx <= CellIndex(ring.right + margin); ++cx) {
+                    pathsNearCell_[Key_(cx, cz)].push_back(static_cast<uint32_t>(i));
+                }
+            }
+        }
+
         const RectD bounds = GetBounds(area_);
         cells_ = CellRange{
             .minX = CellIndex(bounds.left),
@@ -374,11 +384,11 @@ namespace TerrainPaint
     std::vector<double> Mesh::Signature_(const int32_t cellX, const int32_t cellZ) const
     {
         // As far around the cell as RegionsIn_ and the soft edge look.
-        const double margin = featherMeters_ * 1.5 + 0.1;
+        const double margin = NearMargin_();
         const double x0 = static_cast<double>(cellX) * kCellSize - margin;
         const double z0 = static_cast<double>(cellZ) * kCellSize - margin;
         const RectD near(x0, z0, x0 + kCellSize + 2.0 * margin, z0 + kCellSize + 2.0 * margin);
-        const PathsD local = RectClip(near, area_, kPrecision);
+        const PathsD local = AreaNear_(cellX, cellZ, near);
 
         std::vector<std::pair<double, double>> points;
         for (const PathD& path : local) {
@@ -423,7 +433,7 @@ namespace TerrainPaint
 
         const PathsD worn = WearPatches_(cellRect, cellX, cellZ);
         CellMesh mesh;
-        for (auto& [region, core] : RegionsIn_(cellRect)) {
+        for (auto& [region, core] : RegionsIn_(cellX, cellZ, cellRect)) {
             PathsD inCell = std::move(region);
             if (!worn.empty() && !inCell.empty()) {
                 inCell = Difference(inCell, worn, FillRule::NonZero, kPrecision);
@@ -523,35 +533,55 @@ namespace TerrainPaint
         return out;
     }
 
-    std::vector<std::pair<PathsD, bool>> Mesh::RegionsIn_(const RectD& cellRect) const
+    PathsD Mesh::AreaNear_(const int32_t cellX, const int32_t cellZ, const RectD& rect) const
+    {
+        // Rings whose bounds miss the rect add nothing to the clip, so only the ones near the
+        // cell are clipped: a patchy paint has thousands of rings.
+        const auto it = pathsNearCell_.find(Key_(cellX, cellZ));
+        if (it == pathsNearCell_.end()) {
+            return {};
+        }
+        PathsD near;
+        near.reserve(it->second.size());
+        for (const uint32_t i : it->second) {
+            near.push_back(area_[i]);
+        }
+        return RectClip(rect, near, kPrecision);
+    }
+
+    std::vector<std::pair<PathsD, bool>> Mesh::RegionsIn_(const int32_t cellX, const int32_t cellZ,
+                                                          const RectD& cellRect) const
     {
         std::vector<std::pair<PathsD, bool>> regions;
         if (!(featherMeters_ > 0.0f)) {
-            regions.emplace_back(RectClip(cellRect, area_, kPrecision), true);
+            regions.emplace_back(AreaNear_(cellX, cellZ, cellRect), true);
             return regions;
         }
 
         // The bands are worked out from the part of the area near the cell, so a change to a long
         // shape costs only the cells drawn. The cut around that part is far enough away that the
         // insets from it stay out of the cell.
-        const double margin = featherMeters_ * 1.5 + 0.1;
+        const double margin = NearMargin_();
         const RectD near(cellRect.left - margin, cellRect.top - margin, cellRect.right + margin, cellRect.bottom + margin);
-        const PathsD local = RectClip(near, area_, kPrecision);
+        const PathsD local = AreaNear_(cellX, cellZ, near);
         if (local.empty()) {
             return regions;
         }
         PathsD outer = local;
+        PathsD outerInCell = RectClip(cellRect, outer, kPrecision);
         for (int band = 1; band <= kFeatherBands; ++band) {
-            const double inset = featherMeters_ * band / kFeatherBands;
             // Mitred: the bands only split the soft edge for the triangles, the alpha comes from the
             // distance to the outline. Round joins put dozens of points on every corner, which
-            // marking-like shapes have hundreds of.
-            PathsD inner = InflatePaths(local, -inset, JoinType::Miter, EndType::Polygon, 2.0, kPrecision, kArcTolerance);
-            regions.emplace_back(RectClip(cellRect, Difference(outer, inner, FillRule::NonZero, kPrecision), kPrecision),
-                                 false);
+            // marking-like shapes have hundreds of. Each band insets the one before, which has
+            // fewer points left than the area.
+            PathsD inner = InflatePaths(outer, -featherMeters_ / kFeatherBands, JoinType::Miter, EndType::Polygon, 2.0,
+                                        kPrecision, kArcTolerance);
+            PathsD innerInCell = RectClip(cellRect, inner, kPrecision);
+            regions.emplace_back(Difference(outerInCell, innerInCell, FillRule::NonZero, kPrecision), false);
             outer = std::move(inner);
+            outerInCell = std::move(innerInCell);
         }
-        regions.emplace_back(RectClip(cellRect, outer, kPrecision), true);
+        regions.emplace_back(std::move(outerInCell), true);
         return regions;
     }
 
@@ -562,7 +592,7 @@ namespace TerrainPaint
         if (!(amount > 0.0) || !(wear_.patchMeters > 0.0f)) {
             return patches;
         }
-        const PathsD paint = RectClip(cellRect, area_, kPrecision);
+        const PathsD paint = AreaNear_(cellX, cellZ, cellRect);
         const double paintArea = std::abs(Area(paint));
         if (!(paintArea > 0.0)) {
             return patches;

@@ -112,7 +112,11 @@ namespace TerrainPaint
         [[nodiscard]] float AlphaAt_(double x, double z) const;
         // The area in a cell as nested regions from the outline inwards, each with whether it is
         // the solid core: the soft-edge bands, then the core. Without a soft edge, only the core.
-        [[nodiscard]] std::vector<std::pair<Clipper2Lib::PathsD, bool>> RegionsIn_(const Clipper2Lib::RectD& cellRect) const;
+        [[nodiscard]] std::vector<std::pair<Clipper2Lib::PathsD, bool>> RegionsIn_(int32_t cellX, int32_t cellZ,
+                                                                                   const Clipper2Lib::RectD& cellRect) const;
+        // The area inside rect, which lies within NearMargin_() of the cell.
+        [[nodiscard]] Clipper2Lib::PathsD AreaNear_(int32_t cellX, int32_t cellZ, const Clipper2Lib::RectD& rect) const;
+        [[nodiscard]] double NearMargin_() const noexcept { return featherMeters_ * 1.5 + 0.1; }
         [[nodiscard]] std::vector<MeshVertex> MapUv_(const std::vector<MeshVertex>& triangles, uint64_t cellKey) const;
         // The patches worn away in a cell, sampled where it has paint; empty without wear.
         [[nodiscard]] Clipper2Lib::PathsD WearPatches_(const Clipper2Lib::RectD& cellRect, int32_t cellX, int32_t cellZ) const;
@@ -123,6 +127,8 @@ namespace TerrainPaint
         [[nodiscard]] bool SameSettings_(const Mesh& other) const noexcept;
 
         Clipper2Lib::PathsD area_;
+        // area_ rings by the cells their bounds, grown by NearMargin_(), touch.
+        std::unordered_map<uint64_t, std::vector<uint32_t>> pathsNearCell_;
         float featherMeters_ = 0.0f;
         Wear wear_{};
         CellRange cells_{};

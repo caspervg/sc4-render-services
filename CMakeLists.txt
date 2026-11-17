@@ -214,6 +214,8 @@ option(SC4RS_BUILD_TESTS "Build the offline tests" ${SC4RS_IS_TOP_LEVEL})
 if(SC4RS_BUILD_TESTS)
     add_executable(TerrainPaintMeshTests ${SC4RS_ROOT}/tests/TerrainPaintMeshTests.cpp)
     target_link_libraries(TerrainPaintMeshTests PRIVATE sc4rs_terrain_paint)
+    add_executable(TerrainPaintMeshBench ${SC4RS_ROOT}/tests/TerrainPaintMeshBench.cpp)
+    target_link_libraries(TerrainPaintMeshBench PRIVATE sc4rs_terrain_paint)
 
     add_executable(TerrainPaintCodecTests
             ${SC4RS_ROOT}/tests/TerrainPaintCodecTests.cpp
