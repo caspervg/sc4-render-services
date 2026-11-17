@@ -102,6 +102,10 @@ struct TerrainPaintStyle {
     float wear = 0.0f;
     float wearPatchMeters = 0.5f;
     uint32_t wearSeed = 0;
+
+    // For an FSH with several bitmaps (frames): bit n set lets the cells of texture i use frame n,
+    // each cell one of them, the same every time for the same seed. 0 means frame 0 only.
+    uint32_t textureFrameMasks[kTerrainPaintMaxTextures]{};
 };
 
 static constexpr size_t kTerrainPaintStyleSize = sizeof(TerrainPaintStyle);

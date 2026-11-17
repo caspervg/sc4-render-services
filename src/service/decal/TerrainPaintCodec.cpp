@@ -48,7 +48,7 @@ namespace TerrainPaintCodec
                                       + 4                // ring count
                                       + 4                // UV map vertex count
                                       + 3 * 4;           // wear, patch size, seed
-            return kFixed + paint.style.textureCount * 16u +
+            return kFixed + paint.style.textureCount * (16u + 4u) +
                    static_cast<uint32_t>(paint.ringSizes.size()) * 4u +
                    static_cast<uint32_t>(paint.points.size()) * 8u +
                    static_cast<uint32_t>(paint.uvMap.size()) * 16u;
@@ -135,6 +135,16 @@ namespace TerrainPaintCodec
                 (!r.F32(style.wear) || !r.F32(style.wearPatchMeters) || !r.U32(style.wearSeed))) {
                 error = "truncated terrain paint wear";
                 return false;
+            }
+
+            // Minor version 3 and later: frame masks.
+            if (r.Consumed() + 4u * textureCount <= byteCount) {
+                for (uint32_t i = 0; i < textureCount; ++i) {
+                    if (!r.U32(style.textureFrameMasks[i])) {
+                        error = "truncated terrain paint frame masks";
+                        return false;
+                    }
+                }
             }
 
             if (r.Consumed() > byteCount) {
@@ -236,6 +246,9 @@ namespace TerrainPaintCodec
                      out.SetFloat32(vertex.v);
             }
             ok = ok && out.SetFloat32(style.wear) && out.SetFloat32(style.wearPatchMeters) && out.SetUint32(style.wearSeed);
+            for (uint32_t i = 0; ok && i < style.textureCount; ++i) {
+                ok = out.SetUint32(style.textureFrameMasks[i]);
+            }
             if (!ok) {
                 return false;
             }

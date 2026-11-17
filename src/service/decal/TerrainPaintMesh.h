@@ -75,6 +75,10 @@ namespace TerrainPaint
     // seed and cell. Negative weights count as 0; with no positive weight, the first texture.
     [[nodiscard]] uint32_t PickTexture(std::span<const float> weights, uint32_t seed, int32_t cellX, int32_t cellZ);
 
+    // Which frame of texture slot `slot` a terrain cell gets: one of the set bits of frames, each
+    // as likely, the same every time. Independent of PickTexture. With no bit set, frame 0.
+    [[nodiscard]] uint32_t PickFrame(uint32_t frames, uint32_t seed, int32_t cellX, int32_t cellZ, uint32_t slot);
+
     // The painted area of one paint, cut into terrain cells. Cells are cut on first use and kept,
     // so a large paint costs only what is on screen.
     class Mesh

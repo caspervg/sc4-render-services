@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <numbers>
 
@@ -176,6 +177,17 @@ namespace TerrainPaint
             return inside;
         }
 
+        // A murmur3 finaliser: spreads neighbouring cells well.
+        uint32_t Mix(uint32_t h)
+        {
+            h ^= h >> 16;
+            h *= 0x85EBCA6Bu;
+            h ^= h >> 13;
+            h *= 0xC2B2AE35u;
+            h ^= h >> 16;
+            return h;
+        }
+
         // The decal renderer's terrain triangles wind clockwise in x/z; keep ours the same so
         // a culling state treats them alike.
         void AppendTriangle(std::vector<MeshVertex>& out, MeshVertex a, MeshVertex b, MeshVertex c)
@@ -188,6 +200,22 @@ namespace TerrainPaint
             out.push_back(b);
             out.push_back(c);
         }
+    }
+
+    uint32_t PickFrame(const uint32_t frames, const uint32_t seed, const int32_t cellX, const int32_t cellZ,
+                       const uint32_t slot)
+    {
+        if (std::popcount(frames) <= 1) {
+            return frames != 0 ? static_cast<uint32_t>(std::countr_zero(frames)) : 0u;
+        }
+        const uint32_t h = Mix(seed ^ (static_cast<uint32_t>(cellX) * 0x27D4EB2Fu) ^
+                               (static_cast<uint32_t>(cellZ) * 0x165667B1u) ^ ((slot + 1u) * 0xD3A2646Cu));
+        auto k = static_cast<uint32_t>((static_cast<uint64_t>(h) * static_cast<uint32_t>(std::popcount(frames))) >> 32u);
+        uint32_t rest = frames;
+        for (; k > 0; --k) {
+            rest &= rest - 1u;
+        }
+        return static_cast<uint32_t>(std::countr_zero(rest));
     }
 
     uint32_t PickTexture(const std::span<const float> weights, const uint32_t seed, const int32_t cellX, const int32_t cellZ)
@@ -204,14 +232,8 @@ namespace TerrainPaint
             return 0;
         }
 
-        // A murmur3 finaliser over seed and cell spreads neighbouring cells well.
-        uint32_t h = seed ^ (static_cast<uint32_t>(cellX) * 0x9E3779B1u) ^ (static_cast<uint32_t>(cellZ) * 0x85EBCA77u);
-        h ^= h >> 16;
-        h *= 0x85EBCA6Bu;
-        h ^= h >> 13;
-        h *= 0xC2B2AE35u;
-        h ^= h >> 16;
-
+        const uint32_t h =
+            Mix(seed ^ (static_cast<uint32_t>(cellX) * 0x9E3779B1u) ^ (static_cast<uint32_t>(cellZ) * 0x85EBCA77u));
         double pick = (static_cast<double>(h) / 4294967296.0) * total;
         uint32_t last = 0;
         for (uint32_t i = 0; i < weights.size(); ++i) {
