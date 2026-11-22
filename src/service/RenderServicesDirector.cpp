@@ -205,6 +205,7 @@ public:
         if (settings.GetEnableDrawService()) {
             if (drawService_.Init()) {
                 mpFrameWork->AddSystemService(&drawService_);
+                drawServiceRegistered_ = true;
                 LOG_INFO("RenderServicesDirector: DrawService registered");
                 ImGuiService* const imgui = settings.GetEnableImGuiService() ? &imguiService_ : nullptr;
                 worldDrawService_.SetDependencies(&drawService_, imgui);
@@ -225,6 +226,7 @@ public:
             terrainDecalService_.SetCustomDefaultDepthOffset(settings.GetTerrainDecalCustomDefaultDepthOffset());
             terrainDecalService_.SetShadowRecoveryOpacityScale(settings.GetTerrainDecalShadowRecoveryOpacityScale());
             terrainDecalService_.SetShadowRecoveryUseStencil(settings.GetTerrainDecalShadowRecoveryUseStencil());
+            terrainDecalService_.SetDrawService(drawServiceRegistered_ ? &drawService_ : nullptr);
             if (terrainDecalService_.Init()) {
                 mpFrameWork->AddSystemService(&terrainDecalService_);
                 mpFrameWork->AddToTick(&terrainDecalService_);
@@ -310,9 +312,11 @@ public:
         cameraService_.Shutdown();
         worldDrawService_.Shutdown();
         worldDrawServiceRegistered_ = false;
-        drawService_.Shutdown();
+        // Before the draw service: it unregisters its draw pass callback there.
         terrainDecalService_.Shutdown();
         terrainDecalServiceRegistered_ = false;
+        drawService_.Shutdown();
+        drawServiceRegistered_ = false;
         return true;
     }
 
@@ -375,6 +379,7 @@ private:
     ImGuiService imguiService_;
     S3DCameraService cameraService_;
     DrawService drawService_;
+    bool drawServiceRegistered_ = false;
     WorldDrawService worldDrawService_;
     bool worldDrawServiceRegistered_ = false;
     TerrainDecalService terrainDecalService_;

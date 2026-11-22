@@ -46,11 +46,19 @@ namespace TerrainDecal
         // The service whose overlays get custom drawing and a draw order.
         void SetOverlaySource(ManagedOverlaySource* source) noexcept;
 
+        // Whether something calls DrawUnderLots after the terrain every time the static view is
+        // drawn. Until then, overlays under lots are drawn with the others.
+        void SetUnderLotsPassAvailable(bool available) noexcept;
+        // Draws the overlays of the manager that go under lots and networks, and nothing else.
+        // Call it after the terrain and before the static models.
+        void DrawUnderLots(void* overlayManager, SC4DrawContext* drawContext);
+
     private:
         [[nodiscard]] std::array<RelativeCallPatch*, 5> Patches_() noexcept;
 
         using DrawRectFn = void(__thiscall*)(void*, SC4DrawContext*, const cRZRect*);
         using DrawOverlayPassFn = void(__thiscall*)(void*, const float*, SC4DrawContext*, int*);
+        using DrawOverlaysFn = void(__thiscall*)(void*, SC4DrawContext*);
         using SetTexTransform4Fn = void(__thiscall*)(SC4DrawContext*, const float*, int);
 
         static void __fastcall DrawDecalsCallThunk(void* overlayManager, void*, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds);
@@ -61,6 +69,9 @@ namespace TerrainDecal
         static void AroundStencilRecoveryDraw_(void* userData, SC4DrawContext* drawContext, bool before);
 
         void SortByDrawOrder_(const void* overlayManager, int* decalIds) const;
+        // Keeps the overlays that belong in the pass being drawn: in the under-lots pass only
+        // those under lots, otherwise all but those.
+        void FilterByLayer_(const void* overlayManager, int* decalIds) const;
         void HandleDrawRectCall_(void* overlayManager, SC4DrawContext* drawContext, const cRZRect* rect);
         void HandleDrawShadowsCall_(const RelativeCallPatch& patch, void* overlayManager, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds);
         void HandleSetTexTransform4Call_(SC4DrawContext* drawContext, const float* matrix, int stage);
@@ -93,6 +104,9 @@ namespace TerrainDecal
         bool shadowRecoveryCaptureActive_ = false;
         // Numbers the decal passes; the shadow passes after one keep its number.
         uint32_t overlayPass_ = 0;
+        bool underLotsPassAvailable_ = false;
+        // DrawUnderLots is drawing: only overlays under lots, and no shadows.
+        bool underLotsPassActive_ = false;
 
         // Stencil shadow recovery: the claim pass marks each pixel with the topmost decal's
         // number, the draw pass then draws each decal only where it holds the mark.

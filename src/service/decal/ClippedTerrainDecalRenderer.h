@@ -176,6 +176,11 @@ namespace TerrainDecal
         // The draw order of an overlay, 0 for those the service does not manage. The second
         // value orders overlays with equal draw order: 0 for the game's, then creation order.
         virtual std::pair<int32_t, uint32_t> OverlayDrawOrder(const void* overlayManager, uint32_t overlayId) = 0;
+        // Whether the overlay is drawn right after the terrain, before lots and networks,
+        // instead of in the overlay manager's own pass.
+        virtual bool OverlayUnderLots(const void* overlayManager, uint32_t overlayId) = 0;
+        // Whether any overlay of the manager is drawn under lots. Cheap: asked every pass.
+        virtual bool HasOverlaysUnderLots(const void* overlayManager) = 0;
 
     protected:
         ~ManagedOverlaySource() = default;
