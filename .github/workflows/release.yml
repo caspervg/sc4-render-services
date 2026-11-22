@@ -43,14 +43,21 @@ jobs:
       build-script: |
         $PSNativeCommandUseErrorActionPreference = $true
         $version = '${{ needs.check.outputs.version }}'
-        choco install nsis -y --no-progress
+        # NSIS 3.11, pinned by hash, run from its zip without installing.
+        $nsisZip = Join-Path $env:RUNNER_TEMP 'nsis-3.11.zip'
+        curl.exe -sSfL -o $nsisZip 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip'
+        if ((Get-FileHash -Algorithm SHA256 $nsisZip).Hash -ne 'C7D27F780DDB6CFFB4730138CD1591E841F4B7EDB155856901CDF5F214394FA1') {
+          throw 'nsis-3.11.zip does not match its pinned SHA-256'
+        }
+        Expand-Archive $nsisZip -DestinationPath $env:RUNNER_TEMP
+        $makensis = Join-Path $env:RUNNER_TEMP 'nsis-3.11\makensis.exe'
         cmake --preset vs2022-win32-release -DSC4RS_BUILD_SAMPLES=ON '-DSC4RS_RELEASE_VERSION=${{ github.ref_name }}'
         cmake --build --preset vs2022-win32-release-all
 
         $dll = 'cmake-build-release-visual-studio/Release/SC4RenderServices.dll'
         $out = New-Item -ItemType Directory -Force -Path release-package
         Push-Location dist
-        & 'C:\Program Files (x86)\NSIS\makensis.exe' "/DAPP_VERSION=$version" `
+        & $makensis "/DAPP_VERSION=$version" `
           "/DINSTALLER_OUTPUT=..\release-package\SC4RenderServices-$version-Setup.exe" `
           '/DRENDER_SERVICES_DLL_PATH=..\cmake-build-release-visual-studio\Release\SC4RenderServices.dll' `
           '/DRENDER_SERVICES_INI_PATH=..\SC4RenderServices.ini' SC4RenderServicesInstaller.nsi
