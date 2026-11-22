@@ -2,8 +2,11 @@ SC4 Render Services
 
 This release archive contains:
 - the Windows installer
+- SC4RenderServices.dll, the same DLL the installer places, to check with
+  `gh attestation verify SC4RenderServices.dll --repo caspervg/sc4-render-services`
 - LICENSE.txt
-- ThirdPartyNotices.txt
+- THIRD_PARTY_NOTICES.txt
+- SC4RenderServices.spdx.json, the SBOM
 
 Installation:
 1. Run the included installer.

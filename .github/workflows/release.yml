@@ -1,0 +1,75 @@
+name: Release
+
+# Builds and attests the release zip for a vMAJOR.MINOR.PATCH tag with memo33/sc4-dll-actions, and
+# leaves it in a draft release. Check a download with:
+#   gh attestation verify <file> --repo caspervg/sc4-render-services --deny-self-hosted-runners \
+#     --signer-repo memo33/sc4-dll-actions --signer-digest c7aa3d2d748a9bd52a573a79f1f6ba78dde6f25f
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Validate tag
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Release tags look like v1.0.0 or v1.0.0-rc.1, not $TAG_NAME"
+            exit 1
+          fi
+          echo "version=${TAG_NAME#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    # Head of its v1 branch on 2026-11-22. Change --signer-digest above with the pin.
+    uses: memo33/sc4-dll-actions/.github/workflows/attested-build.yaml@c7aa3d2d748a9bd52a573a79f1f6ba78dde6f25f
+    with:
+      build-os: windows-2022
+      install-cmake: true
+      build-script: |
+        $PSNativeCommandUseErrorActionPreference = $true
+        $version = '${{ needs.check.outputs.version }}'
+        # NSIS 3.11, pinned by hash, run from its zip without installing.
+        $nsisZip = Join-Path $env:RUNNER_TEMP 'nsis-3.11.zip'
+        curl.exe -sSfL -o $nsisZip 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip'
+        if ((Get-FileHash -Algorithm SHA256 $nsisZip).Hash -ne 'C7D27F780DDB6CFFB4730138CD1591E841F4B7EDB155856901CDF5F214394FA1') {
+          throw 'nsis-3.11.zip does not match its pinned SHA-256'
+        }
+        Expand-Archive $nsisZip -DestinationPath $env:RUNNER_TEMP
+        $makensis = Join-Path $env:RUNNER_TEMP 'nsis-3.11\makensis.exe'
+        cmake --preset vs2022-win32-release -DSC4RS_BUILD_SAMPLES=ON '-DSC4RS_RELEASE_VERSION=${{ github.ref_name }}'
+        cmake --build --preset vs2022-win32-release-all
+
+        $dll = 'cmake-build-release-visual-studio/Release/SC4RenderServices.dll'
+        $out = New-Item -ItemType Directory -Force -Path release-package
+        Push-Location dist
+        & $makensis "/DAPP_VERSION=$version" `
+          "/DINSTALLER_OUTPUT=..\release-package\SC4RenderServices-$version-Setup.exe" `
+          '/DRENDER_SERVICES_DLL_PATH=..\cmake-build-release-visual-studio\Release\SC4RenderServices.dll' `
+          '/DRENDER_SERVICES_INI_PATH=..\SC4RenderServices.ini' SC4RenderServicesInstaller.nsi
+        Pop-Location
+        Copy-Item $dll, dist/README.txt, LICENSE.txt, dist/THIRD_PARTY_NOTICES.txt -Destination $out
+        python tools/make-sbom.py --dll $dll --version '${{ github.ref_name }}' --output (Join-Path $out 'SC4RenderServices.spdx.json')
+      build-output: release-package
+      artifact-name: sc4-render-services-${{ needs.check.outputs.version }}-win32-release.zip
+      attestation-subject-path: SC4RenderServices.dll
+      prerelease: ${{ contains(github.ref_name, '-') }}
+    permissions:
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+      contents: write
