@@ -1079,6 +1079,7 @@ namespace
         }
         return layer == TerrainPaintLayer::UnderLots     ? Pass::UnderLots
                : layer == TerrainPaintLayer::OverShadows ? Pass::OverShadows
+               : layer == TerrainPaintLayer::OverSidewalks ? Pass::OverSidewalks
                                                          : Pass::OverLots;
     }
 }

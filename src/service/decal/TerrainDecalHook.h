@@ -54,8 +54,22 @@ namespace TerrainDecal
         // Call it after the terrain and before the static models.
         void DrawUnderLots(void* overlayManager, SC4DrawContext* drawContext);
 
+        // Whether something calls BeginStaticView and EndStaticView around the static models every
+        // time the static view is drawn, and the network draw hook is in. Until then, overlays
+        // over sidewalks are drawn with the others.
+        void SetOverSidewalksPassAvailable(bool available) noexcept;
+        [[nodiscard]] bool CanDrawOverSidewalks() const noexcept;
+        // overlayManager: the one with overlays over sidewalks, or null when there are none. The
+        // network tiles of this static view then draw their sidewalk and surface apart, with the
+        // overlays in between.
+        void BeginStaticView(void* overlayManager) noexcept;
+        // Draws the overlays over sidewalks if no network tile did.
+        void EndStaticView(SC4DrawContext* drawContext);
+
     private:
         [[nodiscard]] std::array<RelativeCallPatch*, 5> Patches_() noexcept;
+        void DrawOwnPass_(void* overlayManager, SC4DrawContext* drawContext, OwnPass pass);
+        [[nodiscard]] bool OwnPassAvailable_(OwnPass pass) const noexcept;
 
         using DrawRectFn = void(__thiscall*)(void*, SC4DrawContext*, const cRZRect*);
         using DrawOverlayPassFn = void(__thiscall*)(void*, const float*, SC4DrawContext*, int*);
@@ -67,11 +81,13 @@ namespace TerrainDecal
         static void __fastcall DrawShadowsCallThunk(void* overlayManager, void*, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds);
         static void __fastcall DrawShadowsRoughCallThunk(void* overlayManager, void*, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds);
         static void __fastcall SetTexTransform4CallThunk(SC4DrawContext* drawContext, void*, const float* matrix, int stage);
+        static int __fastcall NetworkDrawThunk(void* drawable, void*, SC4DrawContext* drawContext, uint32_t highlight);
+        int HandleNetworkDraw_(void* drawable, SC4DrawContext* drawContext, uint32_t highlight);
         static void AroundStencilRecoveryDraw_(void* userData, SC4DrawContext* drawContext, bool before);
 
         void SortByDrawOrder_(const void* overlayManager, int* decalIds) const;
-        // Keeps the overlays that belong in the pass being drawn: in the under-lots pass only
-        // those under lots, otherwise all but those.
+        // Keeps the overlays that belong in the pass being drawn: in a pass of the service's own
+        // only those of that pass, otherwise all but those that have one.
         void FilterByLayer_(const void* overlayManager, int* decalIds) const;
         void HandleDrawRectCall_(void* overlayManager, SC4DrawContext* drawContext, const cRZRect* rect);
         void HandleDrawShadowsCall_(const RelativeCallPatch& patch, void* overlayManager, const float* worldToScreenMatrix, SC4DrawContext* drawContext, int* decalIds);
@@ -96,6 +112,8 @@ namespace TerrainDecal
         RelativeCallPatch drawShadowsCallSitePatch_;
         RelativeCallPatch drawShadowsRoughCallSitePatch_;
         RelativeCallPatch setTexTransformCallSitePatch_;
+        RelativeCallPatch networkDrawThunkPatch_;
+        RelativeCallPatch networkDrawCallPatch_;
         ClippedTerrainDecalRenderer renderer_;
         std::string lastError_{};
         std::array<float, 16> currentTexTransform_{};
@@ -106,8 +124,13 @@ namespace TerrainDecal
         // Numbers the decal passes; the shadow passes after one keep its number.
         uint32_t overlayPass_ = 0;
         bool underLotsPassAvailable_ = false;
-        // DrawUnderLots is drawing: only overlays under lots, and no shadows.
-        bool underLotsPassActive_ = false;
+        bool overSidewalksPassAvailable_ = false;
+        // The pass of the service's own being drawn: only its overlays, and no shadows.
+        OwnPass activeOwnPass_ = OwnPass::None;
+        // While the static models are drawn: the manager with overlays over sidewalks, and
+        // whether they are drawn yet.
+        void* overSidewalksManager_ = nullptr;
+        bool overSidewalksDrawn_ = false;
 
         // Stencil shadow recovery: the claim pass marks each pixel with the topmost decal's
         // number, the draw pass then draws each decal only where it holds the mark.

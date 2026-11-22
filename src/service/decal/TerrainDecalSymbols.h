@@ -62,6 +62,10 @@ namespace TerrainDecal
         std::ptrdiff_t overlayRectOffset = 0;
         std::ptrdiff_t overlaySlotsPtrOffset = 0;
         std::ptrdiff_t overlaySlotStride = 0;
+        // The JMP in the vtordisp thunk of cSC4NetworkOccupant::Draw (0x0061A850), the static
+        // view's way in, and the CALL to it in cSC4NetworkOccupantWithPreBuiltModel::Draw.
+        uintptr_t networkDrawThunkJumpSite = 0;
+        uintptr_t networkDrawCallSite = 0;
     };
 
     [[nodiscard]] std::optional<HookAddresses> ResolveHookAddresses(uint16_t gameVersion);

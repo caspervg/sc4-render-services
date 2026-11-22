@@ -145,7 +145,7 @@ namespace TerrainPaintCodec
                 error = "truncated terrain paint layer";
                 return false;
             }
-            style.layer = layer <= static_cast<uint32_t>(TerrainPaintLayer::OverShadows)
+            style.layer = layer <= static_cast<uint32_t>(TerrainPaintLayer::OverSidewalks)
                               ? static_cast<TerrainPaintLayer>(layer)
                               : TerrainPaintLayer::OverLots;
 

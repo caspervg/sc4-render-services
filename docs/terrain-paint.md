@@ -99,6 +99,7 @@ props and cars hide a paint in every layer, the way they hide the ground.
 | `OverLots` (default) | With the `StaticLand` overlays (3) | Over lot and network textures, under shadows |
 | `UnderLots` | Right after the terrain (between 1 and 2) | Under lot and network textures, like part of the ground. Shadows fall on it |
 | `OverShadows` | With the `DynamicLand` overlays (4) | Over lot and network textures and over shadows. SCD3D11's live shadows do not fall on it |
+| `OverSidewalks` | In the static models (2), between the sidewalks and surfaces of network tiles | Over lot textures and sidewalks, under road surfaces. Shadows fall on it |
 
 `UnderLots` paints stay on the `StaticLand` overlay manager, so the game culls them and redraws
 the static view when they change, as for any decal. The service draws them in a pass of its own: at
@@ -107,6 +108,17 @@ again, with the decal pass limited to them and the shadow passes left out. The u
 leaves them out, and so does shadow recovery. This needs the draw service
 (`EnableDrawService=true`), whose `PreStatic` hook also covers the partial redraws of the static
 view. Without it, `UnderLots` paints are drawn as `OverLots`.
+
+`OverSidewalks` paints are on `StaticLand` too. A network tile's `Draw` (`0x0061A850`) draws its
+sidewalk texture and then its surface on the same quad, so the service splits it. The static view
+(`DrawStaticView_`, `0x007C7370`) draws its models in rounds, and draws a model again in the next
+round when its `Draw` returns 2. In the first round a network tile draws only its sidewalk and
+returns 2. The first network tile in the second round draws the `OverSidewalks` paints, and then
+every tile draws its surface and what goes over it. When no network tile is in view, the paints are
+drawn at the end of the static pass. The service reaches `Draw` through the `JMP` in its vtordisp
+thunk (`0x0061C153`) and the call in `cSC4NetworkOccupantWithPreBuiltModel::Draw` (`0x0061E894`).
+Highlighted tiles and models added to the static view one at a time are drawn as before. This also
+needs the draw service. Without it, `OverSidewalks` paints are drawn as `OverLots`.
 
 Decals can go under lots too, with the `kTerrainDecalFlagUnderLots` flag
 (`docs/terrain-decals.md`).

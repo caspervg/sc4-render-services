@@ -298,12 +298,13 @@ namespace
     {
         const std::vector<PaintSnapshot> paints = {MakePaint(1, TerrainPaintLayer::UnderLots),
                                                    MakePaint(2, TerrainPaintLayer::OverLots),
-                                                   MakePaint(3, TerrainPaintLayer::OverShadows)};
+                                                   MakePaint(3, TerrainPaintLayer::OverShadows),
+                                                   MakePaint(4, TerrainPaintLayer::OverSidewalks)};
         MemoryIStream in(WriteCurrent(paints));
         const auto result = TerrainPaintCodec::Read(in);
         CHECK(result.ok);
-        CHECK(result.paints.size() == 3);
-        for (size_t i = 0; i < 3; ++i) {
+        CHECK(result.paints.size() == 4);
+        for (size_t i = 0; i < 4; ++i) {
             CHECK(SameStyle(result.paints[i].style, paints[i].style));
             CHECK(SameShape(result.paints[i], paints[i]));
             CHECK(result.paints[i].style.layer == paints[i].style.layer);

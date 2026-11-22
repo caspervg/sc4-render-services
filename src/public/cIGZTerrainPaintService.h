@@ -85,6 +85,11 @@ enum class TerrainPaintLayer : uint32_t {
     // With the game's dynamic overlays, after the shadows: over lot and network textures and
     // over shadows. SCD3D11's live shadows do not fall on it.
     OverShadows = 2,
+    // Over lot textures and the sidewalks of networks, under the road surface: the game draws a
+    // network tile's sidewalk and surface apart, with the paint between them. Needs the draw
+    // service. Without it, or with a service that does not know this layer, the paint draws as
+    // OverLots.
+    OverSidewalks = 3,
 };
 
 struct TerrainPaintStyle {
