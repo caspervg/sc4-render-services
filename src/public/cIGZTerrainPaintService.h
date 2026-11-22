@@ -13,7 +13,8 @@
 // (x and z in metres). The style says what the area looks like: which textures, how big they are
 // and how they are turned, a colour, an opacity, a soft edge, and where the paint sits among the
 // other paints and decals. The service drapes the area over the terrain, follows later terrain
-// edits, draws it under the game's shadows like a decal, and keeps it in the city save.
+// edits, draws it like a decal (by default over lots and networks, under the game's shadows,
+// see TerrainPaintLayer), and keeps it in the city save.
 //
 // The interface is implemented by the terrain decal service. Query it with
 // GZIID_cIGZTerrainPaintService from the service you get for kTerrainDecalServiceID.
@@ -55,7 +56,7 @@ struct TerrainPaintShape {
     uint32_t uvVertexCount = 0;
 };
 
-static constexpr uint32_t kTerrainPaintMaxTextures = 8;
+static constexpr uint32_t kTerrainPaintMaxTextures = 32;
 
 struct TerrainPaintTexture {
     // A terrain decal texture (FSH, for example type 0x7AB50E44, group 0x0986135E).
@@ -66,6 +67,30 @@ struct TerrainPaintTexture {
 
 // Not stored in the city save. Use it for previews.
 static constexpr uint32_t kTerrainPaintFlagTransient = 1u << 0;
+// Cut and drawn without the soft edge and without wear, which is much cheaper: for a paint that
+// changes every frame, such as while a slider is held. Not stored in the city save. Changing it
+// cuts the paint again, like changing the soft edge.
+static constexpr uint32_t kTerrainPaintFlagDraft = 1u << 1;
+
+// Where a paint sits among what the game draws flat on the ground. Buildings, props and cars
+// hide a paint in every layer, as they hide the ground.
+enum class TerrainPaintLayer : uint32_t {
+    // After lots and networks, with the game's decals: over lot and network textures, under the
+    // shadows of buildings. The default.
+    OverLots = 0,
+    // Right after the terrain, before lots and networks: under lot and network textures, as if
+    // it were part of the ground. Shadows fall on it. Needs the draw service
+    // (EnableDrawService=true). Without it the paint draws as OverLots.
+    UnderLots = 1,
+    // With the game's dynamic overlays, after the shadows: over lot and network textures and
+    // over shadows. SCD3D11's live shadows do not fall on it.
+    OverShadows = 2,
+    // Over lot textures and the sidewalks of networks, under the road surface: the game draws a
+    // network tile's sidewalk and surface apart, with the paint between them. Needs the draw
+    // service. Without it, or with a service that does not know this layer, the paint draws as
+    // OverLots.
+    OverSidewalks = 3,
+};
 
 struct TerrainPaintStyle {
     // One to kTerrainPaintMaxTextures textures. With more than one, every 16 m terrain cell of the
@@ -102,9 +127,20 @@ struct TerrainPaintStyle {
     float wear = 0.0f;
     float wearPatchMeters = 0.5f;
     uint32_t wearSeed = 0;
+
+    // Draw order sorts paints and decals within one layer. Paints in different layers keep
+    // the layers' order, whatever their draw order.
+    TerrainPaintLayer layer = TerrainPaintLayer::OverLots;
+
+    // For an FSH with several bitmaps (frames): bit n set lets the cells of texture i use frame n,
+    // each cell one of them, the same every time for the same seed. 0 means frame 0 only.
+    uint32_t textureFrameMasks[kTerrainPaintMaxTextures]{};
 };
 
 static constexpr size_t kTerrainPaintStyleSize = sizeof(TerrainPaintStyle);
+// The size before layer was added. The service still accepts callers built against it, and their
+// paints are OverLots.
+static constexpr size_t kTerrainPaintStyleSizeV1 = offsetof(TerrainPaintStyle, layer);
 
 // ReSharper disable once CppPolymorphicClassWithNonVirtualPublicDestructor
 class cIGZTerrainPaintService : public cIGZUnknown {

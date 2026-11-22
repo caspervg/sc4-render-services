@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "cRZBaseSystemService.h"
+#include "public/cIGZDrawService.h"
 #include "public/cIGZTerrainDecalService.h"
 #include "public/cIGZTerrainPaintService.h"
 #include "public/TerrainDecalServiceIds.h"
@@ -61,7 +62,11 @@ public:
     void SetEnableCustomRenderer(bool enableCustomRenderer) noexcept;
     void SetCustomDefaultDepthOffset(int customDefaultDepthOffset) noexcept;
     void SetShadowRecoveryOpacityScale(float shadowRecoveryOpacityScale) noexcept;
+    void SetPaintRowBudgetMs(float paintRowBudgetMs) noexcept;
     void SetShadowRecoveryUseStencil(bool shadowRecoveryUseStencil) noexcept;
+    // Draws paints and decals under lots at the end of its PreStatic pass. Set it before Init.
+    // Without it they are drawn with the others.
+    void SetDrawService(cIGZDrawService* drawService) noexcept;
     bool Init() override;
     bool Shutdown();
     bool HandleMessage(cIGZMessage2* message);
@@ -94,11 +99,22 @@ private:
         TerrainDecal::ManagedOverlay::Kind kind = TerrainDecal::ManagedOverlay::Kind::Decal;
         uint32_t recordId = 0;
         uint32_t textureIndex = 0;
+        TerrainDecal::OwnPass ownPass = TerrainDecal::OwnPass::None;
     };
 
     // ManagedOverlaySource
     bool ResolveOverlay(const void* overlayManager, uint32_t overlayId, TerrainDecal::ManagedOverlay& out) override;
     std::pair<int32_t, uint32_t> OverlayDrawOrder(const void* overlayManager, uint32_t overlayId) override;
+    TerrainDecal::OwnPass OverlayOwnPass(const void* overlayManager, uint32_t overlayId) override;
+    bool HasOverlaysIn(const void* overlayManager, TerrainDecal::OwnPass pass) override;
+
+    // overlayIndex_ entries, keeping the count of overlays under lots per manager.
+    void IndexOverlay_(const void* overlayManager, uint32_t overlayId, const OverlayTarget& target);
+    void UnindexOverlay_(const void* overlayManager, uint32_t overlayId);
+
+    static void OnDrawPass_(DrawServicePass pass, bool begin, void* userData);
+    void DrawUnderLots_();
+    [[nodiscard]] cISTEOverlayManager* StaticLandManager_();
 
     bool CreateRuntimeDecal_(TerrainDecalId id, const TerrainDecalState& state, uint32_t sequence);
     bool ApplyStateToRuntime_(TerrainDecalRecord& record, const TerrainDecalState& state);
@@ -136,6 +152,12 @@ private:
     uint32_t nextPaintId_ = 1;
     uint32_t nextSequence_ = 1;
     std::unordered_map<OverlayKey, OverlayTarget, OverlayKeyHash> overlayIndex_{};
+    // By overlay manager: how many of its overlays each pass of the service's own draws.
+    std::unordered_map<const void*, std::array<uint32_t, static_cast<size_t>(TerrainDecal::OwnPass::Count)>>
+        ownPassCounts_{};
+    cIGZDrawService* drawService_ = nullptr;
+    uint32_t preStaticCallbackToken_ = 0;
+    uint32_t staticCallbackToken_ = 0;
     std::unique_ptr<TerrainDecal::TerrainDecalHook> renderHook_{};
     std::vector<TerrainDecalSnapshot> pendingLoadedDecals_{};
     // Loaded paints whose overlays wait for the city.
@@ -143,6 +165,7 @@ private:
     bool enableCustomRenderer_ = true;
     int customDefaultDepthOffset_ = 2;
     float shadowRecoveryOpacityScale_ = 0.25f;
+    float paintRowBudgetMs_ = 4.0f;
     bool shadowRecoveryUseStencil_ = true;
     bool cityLoaded_ = false;
 };

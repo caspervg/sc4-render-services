@@ -8,6 +8,8 @@ namespace TerrainDecal
         case 641:
             return HookAddresses{
                 .gameVersion = 641,
+                // RET 4. Holds the DrawDecals and DrawShadows call sites below.
+                .drawOverlays = 0x00738A50u,
                 .drawDecals = 0x00736790u,
                 .drawDecalsCallSite = 0x00739320u,
                 .drawRect = 0x00735720u,
@@ -21,6 +23,8 @@ namespace TerrainDecal
                 .clearTexTransform = 0x007D4420u,
                 .setTransparency = 0x007D2A20u,
                 .setTexWrapModes = 0x007D41E0u,
+                .setTexture = 0x007D4070u,
+                .redisplayStaticOverlay = 0x00737D40u,
                 .setDepthOffset = 0x007D4480u,
                 .setVertexBuffer = 0x007D2970u,
                 .drawPrims = 0x007D2990u,
@@ -52,6 +56,8 @@ namespace TerrainDecal
                 .overlayRectOffset = 0x0C,
                 .overlaySlotsPtrOffset = 0x98,
                 .overlaySlotStride = 0xB4,
+                .networkDrawThunkJumpSite = 0x0061C153u,
+                .networkDrawCallSite = 0x0061E894u,
             };
         default:
             return std::nullopt;

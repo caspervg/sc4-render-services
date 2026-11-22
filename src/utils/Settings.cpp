@@ -26,6 +26,7 @@ namespace {
     constexpr float kMinUIScale = 0.25f;
     constexpr float kMaxUIScale = 4.0f;
     constexpr bool kDefaultShowDemoPanel = false;
+    constexpr bool kDefaultShowTerrainPaintStats = false;
     constexpr bool kDefaultEnableImGuiService = true;
     constexpr bool kDefaultEnableS3DCameraService = true;
     constexpr bool kDefaultEnableDrawService = true;
@@ -38,6 +39,8 @@ namespace {
     constexpr float kMinTerrainDecalShadowRecoveryOpacityScale = 0.0f;
     constexpr float kMaxTerrainDecalShadowRecoveryOpacityScale = 1.0f;
     constexpr bool kDefaultTerrainDecalShadowRecoveryUseStencil = true;
+    constexpr float kDefaultTerrainPaintRowBudgetMs = 4.0f;
+    constexpr float kMaxTerrainPaintRowBudgetMs = 100.0f;
 
     const std::string kDefaultTheme = "dark";
     const std::string kDefaultLayoutFile = "SC4RenderServices_layout.ini";
@@ -124,6 +127,7 @@ Settings::Settings()
     , uiScale_(kDefaultUIScale)
     , layoutFile_(kDefaultLayoutFile)
     , showDemoPanel_(kDefaultShowDemoPanel)
+    , showTerrainPaintStats_(kDefaultShowTerrainPaintStats)
     , enableImGuiService_(kDefaultEnableImGuiService)
     , enableS3DCameraService_(kDefaultEnableS3DCameraService)
     , enableDrawService_(kDefaultEnableDrawService)
@@ -131,7 +135,8 @@ Settings::Settings()
     , enableCustomTerrainDecalRenderer_(kDefaultEnableCustomTerrainDecalRenderer)
     , terrainDecalCustomDefaultDepthOffset_(kDefaultTerrainDecalCustomDefaultDepthOffset)
     , terrainDecalShadowRecoveryOpacityScale_(kDefaultTerrainDecalShadowRecoveryOpacityScale)
-    , terrainDecalShadowRecoveryUseStencil_(kDefaultTerrainDecalShadowRecoveryUseStencil) {}
+    , terrainDecalShadowRecoveryUseStencil_(kDefaultTerrainDecalShadowRecoveryUseStencil)
+    , terrainPaintRowBudgetMs_(kDefaultTerrainPaintRowBudgetMs) {}
 
 void Settings::Load(const std::filesystem::path& settingsFilePath) {
     // Reset to defaults
@@ -282,6 +287,17 @@ void Settings::Load(const std::filesystem::path& settingsFilePath) {
             }
         }
 
+        if (section.has("ShowTerrainPaintStats")) {
+            bool valid = false;
+            const std::string text = section.get("ShowTerrainPaintStats");
+            showTerrainPaintStats_ = ParseBool(text, valid);
+            if (!valid) {
+                showTerrainPaintStats_ = kDefaultShowTerrainPaintStats;
+                LOG_ERROR("Invalid ShowTerrainPaintStats value '{}' in {}. Using default false.", text,
+                          settingsFilePath.string());
+            }
+        }
+
         // EnableImGuiService
         if (section.has("EnableImGuiService")) {
             bool valid = false;
@@ -379,6 +395,18 @@ void Settings::Load(const std::filesystem::path& settingsFilePath) {
             }
         }
 
+        if (section.has("TerrainPaintRowBudgetMs")) {
+            bool valid = false;
+            const std::string text = section.get("TerrainPaintRowBudgetMs");
+            const float parsed = ParseFloat(text, valid);
+            if (!valid) {
+                LOG_ERROR("Invalid TerrainPaintRowBudgetMs value '{}' in {}. Using default {}.",
+                          text, settingsFilePath.string(), kDefaultTerrainPaintRowBudgetMs);
+            } else {
+                terrainPaintRowBudgetMs_ = std::clamp(parsed, 0.0f, kMaxTerrainPaintRowBudgetMs);
+            }
+        }
+
         // TerrainDecalShadowRecoveryUseStencil
         if (section.has("TerrainDecalShadowRecoveryUseStencil")) {
             bool valid = false;
@@ -408,6 +436,7 @@ std::string Settings::GetTheme() const noexcept { return theme_; }
 bool Settings::GetKeyboardNav() const noexcept { return keyboardNav_; }
 float Settings::GetUIScale() const noexcept { return uiScale_; }
 bool Settings::GetShowDemoPanel() const noexcept { return showDemoPanel_; }
+bool Settings::GetShowTerrainPaintStats() const noexcept { return showTerrainPaintStats_; }
 bool Settings::GetEnableImGuiService() const noexcept { return enableImGuiService_; }
 bool Settings::GetEnableS3DCameraService() const noexcept { return enableS3DCameraService_; }
 bool Settings::GetEnableDrawService() const noexcept { return enableDrawService_; }
@@ -416,3 +445,4 @@ bool Settings::GetEnableCustomTerrainDecalRenderer() const noexcept { return ena
 int Settings::GetTerrainDecalCustomDefaultDepthOffset() const noexcept { return terrainDecalCustomDefaultDepthOffset_; }
 float Settings::GetTerrainDecalShadowRecoveryOpacityScale() const noexcept { return terrainDecalShadowRecoveryOpacityScale_; }
 bool Settings::GetTerrainDecalShadowRecoveryUseStencil() const noexcept { return terrainDecalShadowRecoveryUseStencil_; }
+float Settings::GetTerrainPaintRowBudgetMs() const noexcept { return terrainPaintRowBudgetMs_; }

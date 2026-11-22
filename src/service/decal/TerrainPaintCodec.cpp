@@ -47,8 +47,9 @@ namespace TerrainPaintCodec
                                       + 4                // state
                                       + 4                // ring count
                                       + 4                // UV map vertex count
-                                      + 3 * 4;           // wear, patch size, seed
-            return kFixed + paint.style.textureCount * 16u +
+                                      + 3 * 4            // wear, patch size, seed
+                                      + 4;               // layer
+            return kFixed + paint.style.textureCount * (16u + 4u) +
                    static_cast<uint32_t>(paint.ringSizes.size()) * 4u +
                    static_cast<uint32_t>(paint.points.size()) * 8u +
                    static_cast<uint32_t>(paint.uvMap.size()) * 16u;
@@ -135,6 +136,27 @@ namespace TerrainPaintCodec
                 (!r.F32(style.wear) || !r.F32(style.wearPatchMeters) || !r.U32(style.wearSeed))) {
                 error = "truncated terrain paint wear";
                 return false;
+            }
+
+            // Minor version 3 and later: the layer. Older paints are OverLots, and so are paints in a
+            // layer a newer version added, so they are still drawn and saved.
+            uint32_t layer = 0;
+            if (r.Consumed() + 4u <= byteCount && !r.U32(layer)) {
+                error = "truncated terrain paint layer";
+                return false;
+            }
+            style.layer = layer <= static_cast<uint32_t>(TerrainPaintLayer::OverSidewalks)
+                              ? static_cast<TerrainPaintLayer>(layer)
+                              : TerrainPaintLayer::OverLots;
+
+            // Minor version 4 and later: frame masks.
+            if (r.Consumed() + 4u * textureCount <= byteCount) {
+                for (uint32_t i = 0; i < textureCount; ++i) {
+                    if (!r.U32(style.textureFrameMasks[i])) {
+                        error = "truncated terrain paint frame masks";
+                        return false;
+                    }
+                }
             }
 
             if (r.Consumed() > byteCount) {
@@ -235,7 +257,11 @@ namespace TerrainPaintCodec
                 ok = out.SetFloat32(vertex.x) && out.SetFloat32(vertex.z) && out.SetFloat32(vertex.u) &&
                      out.SetFloat32(vertex.v);
             }
-            ok = ok && out.SetFloat32(style.wear) && out.SetFloat32(style.wearPatchMeters) && out.SetUint32(style.wearSeed);
+            ok = ok && out.SetFloat32(style.wear) && out.SetFloat32(style.wearPatchMeters) &&
+                 out.SetUint32(style.wearSeed) && out.SetUint32(static_cast<uint32_t>(style.layer));
+            for (uint32_t i = 0; ok && i < style.textureCount; ++i) {
+                ok = out.SetUint32(style.textureFrameMasks[i]);
+            }
             if (!ok) {
                 return false;
             }

@@ -16,6 +16,7 @@
 #include "cIGZGDriver.h"
 #include "SC4DrawContextAccess.h"
 #include "TerrainPaintMesh.h"
+#include "TerrainPaintStats.h"
 #include "utils/Logger.h"
 
 namespace
@@ -36,6 +37,8 @@ namespace
     constexpr std::ptrdiff_t kSlotRectOffset = 0x0C;
     constexpr std::ptrdiff_t kSlotMatrixOffset = 0x1C;
     constexpr std::ptrdiff_t kSlotOpacityOffset = 0x9C;
+    // cS3DTextureBinding*: +0 the driver texture name of each frame, +4 the frame count.
+    constexpr std::ptrdiff_t kSlotTextureBindingOffset = 0xAC;
 
     // Overlay flags as cSTEOverlayManager::DrawDecals (0x00736790) reads them.
     constexpr uint32_t kOverlayFlagWrapU = 0x02;
@@ -49,6 +52,12 @@ namespace
     using SetTransparencyFn = void(__thiscall*)(SC4DrawContext*, float);
     using SetTexTransform4Fn = void(__thiscall*)(SC4DrawContext*, const float*, int);
     using ClearTexTransformFn = void(__thiscall*)(SC4DrawContext*, int);
+    using SetTextureFn = void(__thiscall*)(SC4DrawContext*, uint32_t, int);
+    using RedisplayStaticOverlayFn = void(__thiscall*)(void*, int);
+
+    // Set on the dynamic overlay managers, which draw every frame; the static ones draw into the
+    // static view only when it changes (cSTEOverlayManager::SetOverlayAlpha checks it).
+    constexpr std::ptrdiff_t kOverlayManagerDynamicFlagOffset = 0x15;
 
     struct TerrainDrawRect
     {
@@ -124,6 +133,30 @@ namespace
         bool vertexUv = false;
         uint32_t slotFlags = 0;
     };
+
+    // The frames of a paint overlay's texture its cells pick from. frames <= 1 draws as a single
+    // texture, with what DrawDecals bound.
+    struct FrameTextures
+    {
+        uint32_t frames = 0;
+        const uint32_t* names = nullptr;
+        uint32_t count = 0;
+    };
+
+    // mask: the frames allowed.
+    [[nodiscard]] FrameTextures ReadFrameTextures(const HookAddresses& addresses,
+                                                  const uint32_t mask,
+                                                  const std::byte* const slotBase) noexcept
+    {
+        if (mask <= 1u || !addresses.setTexture) {
+            return {};
+        }
+        const auto* const binding = DrawContextAccess::ReadField<const std::byte*>(slotBase, kSlotTextureBindingOffset);
+        const auto* const names = binding ? DrawContextAccess::ReadField<const uint32_t*>(binding, 0) : nullptr;
+        const uint32_t count = names ? DrawContextAccess::ReadField<uint32_t>(binding, 4) : 0u;
+        const uint32_t frames = mask & (count >= 32u ? ~0u : (1u << count) - 1u);
+        return frames > 1u ? FrameTextures{frames, names, count} : FrameTextures{};
+    }
 
     // Logs a category of problem once per overlay instead of every frame.
     [[nodiscard]] bool FirstTime(const uint32_t overlayId, const std::string_view category)
@@ -508,6 +541,13 @@ namespace
             active_ = true;
         }
 
+        // The cell row in the middle of the screen, within [z0, z1).
+        [[nodiscard]] int MiddleRow(const int z0, const int z1) const noexcept
+        {
+            const int middle = active_ ? (rowStart_ + rowEnd_) / 2 : (z0 + z1) / 2;
+            return std::clamp(middle, z0, std::max(z0, z1 - 1));
+        }
+
         // Narrows the cells [x0, x1) of cell row z to those on screen; false when none are.
         [[nodiscard]] bool VisibleCells(const int z, int& x0, int& x1) const noexcept
         {
@@ -664,29 +704,48 @@ namespace
         }
     }
 
+    // Which cells of a paint with several textures this overlay draws.
+    class TextureCells
+    {
+    public:
+        explicit TextureCells(const PaintOverlay& paint) : paint_(paint)
+        {
+            count_ = std::min(paint.style->textureCount, kTerrainPaintMaxTextures);
+            for (uint32_t i = 0; i < count_; ++i) {
+                weights_[i] = paint.style->textures[i].weight;
+            }
+        }
+
+        [[nodiscard]] bool Has(const int cellX, const int cellZ) const
+        {
+            return count_ <= 1 || TerrainPaint::PickTexture(std::span(weights_.data(), count_), paint_.style->variationSeed,
+                                                            cellX, cellZ) == paint_.textureIndex;
+        }
+
+    private:
+        const PaintOverlay& paint_;
+        std::array<float, kTerrainPaintMaxTextures> weights_{};
+        uint32_t count_ = 0;
+    };
+
     // The overlay's cells [x0, x1) of one cell row, placed on their terrain triangles. A long
     // shape is placed only as far as it has been on screen.
     void BuildPaintRow(const PaintOverlay& paint,
                        const TerrainCellFlips& flips,
+                       const uint32_t frames,
                        const int cellZ,
                        const int x0,
                        const int x1,
                        PaintDrawCache::Row& row)
     {
         const TerrainPaint::CellRange& range = paint.mesh->Cells();
-        std::array<float, kTerrainPaintMaxTextures> weights{};
-        const uint32_t textureCount = std::min(paint.style->textureCount, kTerrainPaintMaxTextures);
-        for (uint32_t i = 0; i < textureCount; ++i) {
-            weights[i] = paint.style->textures[i].weight;
-        }
-        const std::span<const float> weightSpan(weights.data(), textureCount);
+        const TextureCells textureCells(paint);
 
         row.cells.clear();
         row.vertices.clear();
         constexpr float kSize = TerrainPaint::kCellSize;
         for (int cellX = std::max(x0, range.minX); cellX < std::min(x1, range.maxX + 1); ++cellX) {
-            if (textureCount > 1 &&
-                TerrainPaint::PickTexture(weightSpan, paint.style->variationSeed, cellX, cellZ) != paint.textureIndex) {
+            if (!textureCells.Has(cellX, cellZ)) {
                 continue;
             }
             const bool flipped = flips.IsFlipped(cellX, cellZ);
@@ -706,6 +765,8 @@ namespace
                 .lowerCount = static_cast<uint32_t>(cell.lower.size()),
                 .upperCount = static_cast<uint32_t>(cell.upper.size()),
                 .flipped = flipped,
+                .frame = static_cast<uint8_t>(
+                    TerrainPaint::PickFrame(frames, paint.style->variationSeed, cellX, cellZ, paint.textureIndex)),
             });
             const std::array<size_t, 6>& t = CellTriangles(flipped);
             PlaceVertices(cell.lower, corners[t[0]], corners[t[1]], corners[t[2]], row.vertices);
@@ -752,53 +813,161 @@ namespace
         }
     }
 
-    // The paint overlay's triangles on the visible part of the terrain.
+    // Cuts the cells [x0, x1) of a row that are not cut yet, as far as the budget allows; true
+    // when they all are.
+    bool CutRow(const PaintOverlay& paint,
+                const TerrainCellFlips& flips,
+                const int cellZ,
+                const int x0,
+                const int x1,
+                RowBudget& budget,
+                TerrainPaintStats::Counters* const stats)
+    {
+        const TerrainPaint::CellRange& range = paint.mesh->Cells();
+        const TextureCells textureCells(paint);
+        for (int cellX = std::max(x0, range.minX); cellX < std::min(x1, range.maxX + 1); ++cellX) {
+            const bool flipped = flips.IsFlipped(cellX, cellZ);
+            if (!textureCells.Has(cellX, cellZ) || paint.mesh->HasCell(cellX, cellZ, flipped)) {
+                continue;
+            }
+            const double start = TerrainPaintStats::NowMs();
+            if (!budget.MayBuild(*paint.cache, start)) {
+                return false;
+            }
+            (void)paint.mesh->Cell(cellX, cellZ, flipped);
+            const double ms = TerrainPaintStats::NowMs() - start;
+            budget.Spend(*paint.cache, ms);
+            if (stats) {
+                stats->buildMs += ms;
+            }
+        }
+        return true;
+    }
+
+    // Keeps the rows of cell rows still in the paint when its first row moves.
+    void AlignRows(PaintDrawCache& cache, const TerrainPaint::CellRange& range)
+    {
+        const auto rowCount = static_cast<size_t>(range.maxZ - range.minZ + 1);
+        if (cache.rowsMinZ == range.minZ && cache.rows.size() == rowCount) {
+            return;
+        }
+        std::vector<PaintDrawCache::Row> rows(rowCount);
+        for (size_t i = 0; i < cache.rows.size(); ++i) {
+            const int64_t z = static_cast<int64_t>(cache.rowsMinZ) + static_cast<int64_t>(i);
+            if (z >= range.minZ && z <= range.maxZ) {
+                rows[static_cast<size_t>(z - range.minZ)] = std::move(cache.rows[i]);
+            }
+        }
+        cache.rows = std::move(rows);
+        cache.rowsMinZ = range.minZ;
+    }
+
+    // The paint overlay's triangles on the visible part of the terrain: of the cells that picked
+    // frame, or of all cells when frame is negative. With a budget, rows are built first, nearest
+    // the middle of the screen first; rows it puts off are drawn as they were, or not at all.
     void LayPaint(const HookAddresses& addresses,
                   const TerrainGridDimensions& dimensions,
                   const DrawFrustum& frustum,
                   const TerrainCellFlips& flips,
                   const TerrainDrawRect& drawRect,
                   const PaintOverlay& paint,
+                  const uint32_t frames,
+                  const int frame,
                   const float alphaScale,
-                  std::vector<PackedTerrainVertex>& output)
+                  std::vector<PackedTerrainVertex>& output,
+                  RowBudget* const budget,
+                  uint32_t& deferredRows,
+                  TerrainPaintStats::Counters* const stats)
     {
         const TerrainPaint::CellRange& range = paint.mesh->Cells();
         PaintDrawCache& cache = *paint.cache;
-        const auto rowCount = static_cast<size_t>(range.maxZ - range.minZ + 1);
-        if (cache.rows.size() != rowCount) {
-            cache.rows.assign(rowCount, {});
+        const size_t firstVertex = output.size();
+        if (cache.frames != frames) {
+            cache.rows.clear();
+            cache.frames = frames;
         }
+        AlignRows(cache, range);
 
         const int zStart = std::max(drawRect.zStart, range.minZ);
         const int zEnd = std::min(drawRect.zEnd, range.maxZ + 1);
-        for (int cellZ = zStart; cellZ < zEnd; ++cellZ) {
-            int x0 = std::max(drawRect.xStart, range.minX);
-            int x1 = std::min(drawRect.xEnd, range.maxX + 1);
-            if (!frustum.VisibleCells(cellZ, x0, x1)) {
-                continue;
-            }
-            PaintDrawCache::Row& row = cache.rows[static_cast<size_t>(cellZ - range.minZ)];
-            const auto firstVisible = [&] {
-                return std::ranges::lower_bound(row.cells, x0, {}, &PaintDrawCache::CellSpan::cellX);
-            };
-            const auto diagonalChanged = [&] {
-                for (auto span = firstVisible(); span != row.cells.end() && span->cellX < x1; ++span) {
+        const auto visible = [&](const int cellZ, int& x0, int& x1) {
+            x0 = std::max(drawRect.xStart, range.minX);
+            x1 = std::min(drawRect.xEnd, range.maxX + 1);
+            return frustum.VisibleCells(cellZ, x0, x1);
+        };
+        const auto rowAt = [&](const int cellZ) -> PaintDrawCache::Row& {
+            return cache.rows[static_cast<size_t>(cellZ - range.minZ)];
+        };
+        const auto firstVisible = [](PaintDrawCache::Row& row, const int x0) {
+            return std::ranges::lower_bound(row.cells, x0, {}, &PaintDrawCache::CellSpan::cellX);
+        };
+
+        if (budget) {
+            const auto needsBuild = [&](PaintDrawCache::Row& row, const int cellZ, const int x0, const int x1) {
+                if (!row.built || row.generation != cache.generation || x0 < row.builtX0 || x1 > row.builtX1) {
+                    return true;
+                }
+                for (auto span = firstVisible(row, x0); span != row.cells.end() && span->cellX < x1; ++span) {
                     if (span->flipped != flips.IsFlipped(span->cellX, cellZ)) {
                         return true;
                     }
                 }
                 return false;
             };
-            if (!row.built || x0 < row.builtX0 || x1 > row.builtX1 || diagonalChanged()) {
-                // The cells' cuts are kept by the mesh: placing them again is cheap.
-                BuildPaintRow(paint, flips, cellZ, row.built ? std::min(x0, row.builtX0) : x0,
-                              row.built ? std::max(x1, row.builtX1) : x1, row);
+            thread_local std::vector<std::pair<int, int>> wanted;  // distance from the middle, cell row
+            wanted.clear();
+            const int middle = frustum.MiddleRow(zStart, zEnd);
+            for (int cellZ = zStart; cellZ < zEnd; ++cellZ) {
+                int x0 = 0;
+                int x1 = 0;
+                if (visible(cellZ, x0, x1) && needsBuild(rowAt(cellZ), cellZ, x0, x1)) {
+                    wanted.emplace_back(std::abs(cellZ - middle), cellZ);
+                }
             }
+            std::ranges::sort(wanted);
+            for (const auto& [distance, cellZ] : wanted) {
+                int x0 = 0;
+                int x1 = 0;
+                (void)visible(cellZ, x0, x1);
+                PaintDrawCache::Row& row = rowAt(cellZ);
+                const bool fresh = !row.built || row.generation != cache.generation;
+                const int bx0 = fresh ? x0 : std::min(x0, row.builtX0);
+                const int bx1 = fresh ? x1 : std::max(x1, row.builtX1);
+                if (!CutRow(paint, flips, cellZ, bx0, bx1, *budget, stats)) {
+                    ++deferredRows;
+                    continue;
+                }
+                // The cells are cut: placing them is cheap, and replaces the row at once.
+                const double start = TerrainPaintStats::NowMs();
+                BuildPaintRow(paint, flips, frames, cellZ, bx0, bx1, row);
+                row.generation = cache.generation;
+                const double ms = TerrainPaintStats::NowMs() - start;
+                budget->Spend(cache, ms);
+                if (stats) {
+                    ++stats->rows;
+                    stats->buildMs += ms;
+                }
+            }
+        }
 
+        for (int cellZ = zStart; cellZ < zEnd; ++cellZ) {
+            int x0 = 0;
+            int x1 = 0;
+            if (!visible(cellZ, x0, x1)) {
+                continue;
+            }
+            PaintDrawCache::Row& row = rowAt(cellZ);
+            if (!row.built) {
+                continue;
+            }
             const std::span<const PaintDrawCache::PlacedVertex> vertices(row.vertices);
-            for (auto span = firstVisible(); span != row.cells.end() && span->cellX < x1; ++span) {
+            for (auto span = firstVisible(row, x0); span != row.cells.end() && span->cellX < x1; ++span) {
+                if (stats) {
+                    ++stats->cells;
+                }
                 std::array<PackedTerrainVertex, 4> corners{};
-                if (!LoadTerrainCellVertices(addresses, dimensions, span->cellX, cellZ, corners)) {
+                if ((frame >= 0 && span->frame != frame) ||
+                    !LoadTerrainCellVertices(addresses, dimensions, span->cellX, cellZ, corners)) {
                     continue;
                 }
                 const bool vertexUv = paint.mesh->HasUvMap();
@@ -808,6 +977,9 @@ namespace
                 LiftVertices(vertices.subspan(span->first + span->lowerCount, span->upperCount),
                              corners[t[3]], corners[t[4]], corners[t[5]], alphaScale, vertexUv, output);
             }
+        }
+        if (stats) {
+            stats->vertices += output.size() - firstVertex;
         }
     }
 
@@ -819,7 +991,12 @@ namespace
         }
     }
 
-    void Submit(const DrawRequest& request, const DrawSetup& setup, const std::vector<PackedTerrainVertex>& vertices)
+    // Returns the number of DrawPrims calls.
+    uint32_t Submit(const DrawRequest& request,
+                    const DrawSetup& setup,
+                    const std::vector<PackedTerrainVertex>& vertices,
+                    const std::span<const PaintDrawCache::FrameRange> frameRanges = {},
+                    const FrameTextures& frameTextures = {})
     {
         const HookAddresses& addresses = *request.addresses;
         SC4DrawContext* const context = request.drawContext;
@@ -851,11 +1028,26 @@ namespace
         if (request.aroundDraw) {
             request.aroundDraw(request.aroundDrawUserData, context, true);
         }
-        reinterpret_cast<DrawPrimsFn>(addresses.drawPrims)(context,
-                                                           kPrimTypeTriangleList,
-                                                           kTerrainVertexFormat,
-                                                           static_cast<uint32_t>(vertices.size()),
-                                                           vertices.data());
+        const auto drawPrims = reinterpret_cast<DrawPrimsFn>(addresses.drawPrims);
+        uint32_t drawCalls = 1;
+        if (frameRanges.empty() || !frameTextures.names) {
+            drawPrims(context, kPrimTypeTriangleList, kTerrainVertexFormat, static_cast<uint32_t>(vertices.size()),
+                      vertices.data());
+        }
+        else {
+            const auto setTexture = reinterpret_cast<SetTextureFn>(addresses.setTexture);
+            drawCalls = 0;
+            for (const PaintDrawCache::FrameRange& range : frameRanges) {
+                if (range.frame < frameTextures.count) {
+                    ++drawCalls;
+                    setTexture(context, frameTextures.names[range.frame], 0);
+                    drawPrims(context, kPrimTypeTriangleList, kTerrainVertexFormat, range.count,
+                              vertices.data() + range.first);
+                }
+            }
+            // What DrawDecals bound.
+            setTexture(context, frameTextures.names[0], 0);
+        }
         if (request.aroundDraw) {
             request.aroundDraw(request.aroundDrawUserData, context, false);
         }
@@ -876,6 +1068,19 @@ namespace
             reinterpret_cast<SetTexTransform4Fn>(addresses.setTexTransform4)(context, setup.baseTexTransform,
                                                                              setup.texTransformStage);
         }
+        return drawCalls;
+    }
+
+    [[nodiscard]] TerrainPaintStats::Pass StatsPass(const DrawMode mode, const TerrainPaintLayer layer) noexcept
+    {
+        using TerrainPaintStats::Pass;
+        if (mode != DrawMode::Normal) {
+            return mode == DrawMode::ShadowRecovery ? Pass::ShadowRecovery : Pass::ShadowRecoveryCapture;
+        }
+        return layer == TerrainPaintLayer::UnderLots     ? Pass::UnderLots
+               : layer == TerrainPaintLayer::OverShadows ? Pass::OverShadows
+               : layer == TerrainPaintLayer::OverSidewalks ? Pass::OverSidewalks
+                                                         : Pass::OverLots;
     }
 }
 
@@ -884,11 +1089,18 @@ namespace TerrainDecal
     ClippedTerrainDecalRenderer::ClippedTerrainDecalRenderer(const RendererOptions options)
         : options_(options)
     {
+        rowBudget_.SetFrameMs(options.paintRowBudgetMs);
     }
 
     void ClippedTerrainDecalRenderer::SetOptions(const RendererOptions& options) noexcept
     {
         options_ = options;
+        rowBudget_.SetFrameMs(options.paintRowBudgetMs);
+    }
+
+    void ClippedTerrainDecalRenderer::BeginFrame() noexcept
+    {
+        rowBudget_.BeginFrame(TerrainPaintStats::NowMs());
     }
 
     const RendererOptions& ClippedTerrainDecalRenderer::GetOptions() const noexcept
@@ -953,14 +1165,57 @@ namespace TerrainDecal
                 return DrawResult::Handled;
             }
             PaintDrawCache& cache = *paint.cache;
+            TerrainPaintStats::Counters statsCounters{};
+            TerrainPaintStats::Counters* const stats = TerrainPaintStats::enabled ? &statsCounters : nullptr;
+            const double statsStart = stats ? TerrainPaintStats::NowMs() : 0.0;
+            uint32_t deferredRows = 0;
+            const auto report = [&](const double submitStart) {
+                const double end = TerrainPaintStats::NowMs();
+                statsCounters.overlays = 1;
+                statsCounters.deferredRows = deferredRows;
+                statsCounters.liftMs = submitStart - statsStart - statsCounters.buildMs;
+                statsCounters.submitMs = end - submitStart;
+                TerrainPaintStats::Add(StatsPass(request.mode, paint.style->layer), paint.paintId,
+                                       paint.style->textureCount, statsCounters);
+            };
+            const uint32_t frameMask = paint.textureIndex < kTerrainPaintMaxTextures
+                                           ? paint.style->textureFrameMasks[paint.textureIndex]
+                                           : 0u;
+            const FrameTextures frameTextures = ReadFrameTextures(addresses, frameMask, request.overlaySlotBase);
 
             // The shadow passes draw again what the decal pass before them laid.
             if (!(shadowRecovery && cache.lastDrawnValid && cache.lastDrawnPass == request.pass)) {
+                const float opacity = std::clamp(paint.style->opacity, 0.0f, 1.0f);
                 cache.lastDrawn.clear();
-                LayPaint(addresses, dimensions, frustum, flips, drawRect, paint,
-                         std::clamp(paint.style->opacity, 0.0f, 1.0f), cache.lastDrawn);
+                cache.lastDrawnFrames.clear();
+                if (frameTextures.frames <= 1u) {
+                    LayPaint(addresses, dimensions, frustum, flips, drawRect, paint, 0u, -1, opacity, cache.lastDrawn,
+                             &rowBudget_, deferredRows, stats);
+                }
+                else {
+                    // One run of vertices per frame, so each draws with its own texture.
+                    for (uint32_t rest = frameTextures.frames; rest != 0; rest &= rest - 1u) {
+                        const auto frame = static_cast<uint32_t>(std::countr_zero(rest));
+                        const auto first = static_cast<uint32_t>(cache.lastDrawn.size());
+                        // Rows are built in the first run only.
+                        LayPaint(addresses, dimensions, frustum, flips, drawRect, paint, frameTextures.frames,
+                                 static_cast<int>(frame), opacity, cache.lastDrawn,
+                                 rest == frameTextures.frames ? &rowBudget_ : nullptr, deferredRows, stats);
+                        const auto count = static_cast<uint32_t>(cache.lastDrawn.size()) - first;
+                        if (count > 0) {
+                            cache.lastDrawnFrames.push_back({frame, first, count});
+                        }
+                    }
+                }
                 cache.lastDrawnPass = request.pass;
                 cache.lastDrawnValid = true;
+                if (deferredRows > 0 && addresses.redisplayStaticOverlay && hasOverlayId &&
+                    static_cast<const std::byte*>(request.overlayManager)[kOverlayManagerDynamicFlagOffset] == std::byte{0}) {
+                    // The static view keeps what it drew: have it draw this overlay again next frame,
+                    // so the rows put off get built.
+                    reinterpret_cast<RedisplayStaticOverlayFn>(addresses.redisplayStaticOverlay)(request.overlayManager,
+                                                                                                 static_cast<int>(overlayId));
+                }
             }
             const std::vector<PackedTerrainVertex>* vertices = &cache.lastDrawn;
             const float recoveryScale = request.mode == DrawMode::ShadowRecovery
@@ -972,6 +1227,9 @@ namespace TerrainDecal
                 vertices = &output;
             }
             if (vertices->empty()) {
+                if (stats) {
+                    report(TerrainPaintStats::NowMs());
+                }
                 return DrawResult::Handled;
             }
 
@@ -993,7 +1251,12 @@ namespace TerrainDecal
             setup.depthOffset = shadowRecovery ? options_.shadowRecoveryDepthOffset
                                 : paint.style->depthOffset >= 0 ? paint.style->depthOffset
                                                                 : options_.customDefaultDepthOffset;
-            Submit(request, setup, *vertices);
+            const double submitStart = stats ? TerrainPaintStats::NowMs() : 0.0;
+            const uint32_t drawCalls = Submit(request, setup, *vertices, cache.lastDrawnFrames, frameTextures);
+            if (stats) {
+                statsCounters.drawCalls = drawCalls;
+                report(submitStart);
+            }
             return DrawResult::Handled;
         }
 
@@ -1076,7 +1339,12 @@ namespace TerrainDecal
         if (request.mode == DrawMode::ShadowRecovery && std::isfinite(slot.opacity)) {
             setup.transparency = slot.opacity * std::clamp(options_.shadowRecoveryOpacityScale, 0.0f, 1.0f);
         }
-        Submit(request, setup, output);
+        const FrameTextures frameTextures =
+            isManaged && overrides.frame > 0 && overrides.frame < 32
+                ? ReadFrameTextures(addresses, 1u << overrides.frame, request.overlaySlotBase)
+                : FrameTextures{};
+        const PaintDrawCache::FrameRange whole{overrides.frame, 0, static_cast<uint32_t>(output.size())};
+        Submit(request, setup, output, std::span(&whole, 1), frameTextures);
         return DrawResult::Handled;
     }
 }

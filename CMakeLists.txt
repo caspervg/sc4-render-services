@@ -214,6 +214,16 @@ option(SC4RS_BUILD_TESTS "Build the offline tests" ${SC4RS_IS_TOP_LEVEL})
 if(SC4RS_BUILD_TESTS)
     add_executable(TerrainPaintMeshTests ${SC4RS_ROOT}/tests/TerrainPaintMeshTests.cpp)
     target_link_libraries(TerrainPaintMeshTests PRIVATE sc4rs_terrain_paint)
+    add_executable(TerrainPaintMeshBench ${SC4RS_ROOT}/tests/TerrainPaintMeshBench.cpp)
+    target_link_libraries(TerrainPaintMeshBench PRIVATE sc4rs_terrain_paint)
+
+    add_executable(TerrainPaintCodecTests
+            ${SC4RS_ROOT}/tests/TerrainPaintCodecTests.cpp
+            ${SC4RS_ROOT}/src/service/decal/TerrainPaintCodec.cpp
+            ${SC4RS_ROOT}/src/service/decal/TerrainDecalSidecarCodec.cpp
+    )
+    target_include_directories(TerrainPaintCodecTests PRIVATE ${SC4RS_ROOT}/src)
+    target_link_libraries(TerrainPaintCodecTests PRIVATE gzcom2)
 
     add_executable(ImGuiThemesTests
             ${SC4RS_ROOT}/tests/ImGuiThemesTests.cpp
@@ -237,6 +247,7 @@ set(CUSTOM_SERVICES_SOURCES
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalService.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalSidecarCodec.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainPaintCodec.cpp
+        ${SC4RS_ROOT}/src/service/decal/TerrainPaintStats.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalSymbols.cpp
         ${SC4RS_ROOT}/src/service/decal/TerrainDecalHook.cpp
         ${SC4RS_ROOT}/src/service/RenderServicesDirector.cpp

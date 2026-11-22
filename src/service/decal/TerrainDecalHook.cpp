@@ -89,6 +89,18 @@ namespace TerrainDecal
             std::memcpy(&flags, slotBase + 4, sizeof(flags));
             return (flags & 0x80u) == 0u;
         }
+
+        // The network occupant's GetTexture (vtable +0x134, 0x0061C950), as cSC4NetworkOccupant::Draw
+        // calls it: the texture, or the fallback, from the game's cache; null when neither exists.
+        // The occupant interface is 0x17C before the drawable. The game does not release the result.
+        [[nodiscard]] bool SurfaceTextureExists(std::byte* const drawable, const uint32_t texture,
+                                                 const uint32_t fallback)
+        {
+            void* const occupant = drawable - 0x17C;
+            using GetTextureFn = void*(__thiscall*)(void*, uint32_t, uint32_t);
+            const auto getTexture = reinterpret_cast<GetTextureFn>((*static_cast<void***>(occupant))[0x134 / 4]);
+            return getTexture(occupant, texture, fallback) != nullptr;
+        }
     }
 
     TerrainDecalHook::TerrainDecalHook(const Options options)
@@ -97,6 +109,7 @@ namespace TerrainDecal
               .enableClippedRendering = options.enableCustomRenderer,
               .customDefaultDepthOffset = options.customDefaultDepthOffset,
               .shadowRecoveryOpacityScale = options.shadowRecoveryOpacityScale,
+              .paintRowBudgetMs = options.paintRowBudgetMs,
           })
     {
     }
@@ -162,6 +175,17 @@ namespace TerrainDecal
             }
         }
 
+        // Optional: without it, paint over sidewalks draws over lots.
+        networkDrawThunkPatch_.Configure("cSC4NetworkOccupant::Draw thunk jump", addresses_->networkDrawThunkJumpSite,
+                                         reinterpret_cast<void*>(&NetworkDrawThunk));
+        networkDrawCallPatch_.Configure("cSC4NetworkOccupantWithPreBuiltModel::Draw->Draw call site",
+                                        addresses_->networkDrawCallSite, reinterpret_cast<void*>(&NetworkDrawThunk));
+        if (!networkDrawThunkPatch_.Install() || !networkDrawCallPatch_.Install()) {
+            networkDrawCallPatch_.Uninstall();
+            networkDrawThunkPatch_.Uninstall();
+            LOG_WARN("TerrainDecalHook: network draw hook not installed, paint over sidewalks draws over lots");
+        }
+
         lastError_.clear();
         LOG_INFO("TerrainDecalHook: installed at 0x{:08X} (order), 0x{:08X} / 0x{:08X} (draw); shadow replay at 0x{:08X} / 0x{:08X} for {}",
                  static_cast<uint32_t>(addresses_->drawDecalsCallSite),
@@ -175,6 +199,9 @@ namespace TerrainDecal
 
     void TerrainDecalHook::Uninstall()
     {
+        networkDrawCallPatch_.Uninstall();
+        networkDrawThunkPatch_.Uninstall();
+        overSidewalksManager_ = nullptr;
         auto patches = Patches_();
         for (auto it = patches.rbegin(); it != patches.rend(); ++it) {
             (*it)->Uninstall();
@@ -221,12 +248,174 @@ namespace TerrainDecal
         }
 
         ++sActiveHook_->overlayPass_;
+        sActiveHook_->FilterByLayer_(overlayManager, decalIds);
         sActiveHook_->SortByDrawOrder_(overlayManager, decalIds);
         sActiveHook_->CallOriginalOverlayPass_(sActiveHook_->drawDecalsCallSitePatch_,
                                                overlayManager,
                                                worldToScreenMatrix,
                                                drawContext,
                                                decalIds);
+        // The dynamic land overlays draw once every frame, last: the frame's paint rows are done.
+        constexpr std::ptrdiff_t kDynamicFlagOffset = 0x15;
+        if (!IsWaterOverlayManager(overlayManager) &&
+            static_cast<const std::byte*>(overlayManager)[kDynamicFlagOffset] != std::byte{0}) {
+            sActiveHook_->renderer_.BeginFrame();
+        }
+    }
+
+    void TerrainDecalHook::SetUnderLotsPassAvailable(const bool available) noexcept
+    {
+        underLotsPassAvailable_ = available;
+    }
+
+    void TerrainDecalHook::DrawUnderLots(void* const overlayManager, SC4DrawContext* const drawContext)
+    {
+        DrawOwnPass_(overlayManager, drawContext, OwnPass::UnderLots);
+    }
+
+    void TerrainDecalHook::SetOverSidewalksPassAvailable(const bool available) noexcept
+    {
+        overSidewalksPassAvailable_ = available;
+    }
+
+    bool TerrainDecalHook::CanDrawOverSidewalks() const noexcept
+    {
+        return networkDrawThunkPatch_.IsInstalled() && networkDrawCallPatch_.IsInstalled();
+    }
+
+    void TerrainDecalHook::BeginStaticView(void* const overlayManager) noexcept
+    {
+        overSidewalksManager_ = OwnPassAvailable_(OwnPass::OverSidewalks) ? overlayManager : nullptr;
+        overSidewalksDrawn_ = false;
+    }
+
+    void TerrainDecalHook::EndStaticView(SC4DrawContext* const drawContext)
+    {
+        if (overSidewalksManager_ && !overSidewalksDrawn_) {
+            DrawOwnPass_(overSidewalksManager_, drawContext, OwnPass::OverSidewalks);
+        }
+        overSidewalksManager_ = nullptr;
+    }
+
+    bool TerrainDecalHook::OwnPassAvailable_(const OwnPass pass) const noexcept
+    {
+        return pass == OwnPass::UnderLots       ? underLotsPassAvailable_
+               : pass == OwnPass::OverSidewalks ? overSidewalksPassAvailable_ && CanDrawOverSidewalks()
+                                                : false;
+    }
+
+    void TerrainDecalHook::DrawOwnPass_(void* const overlayManager, SC4DrawContext* const drawContext,
+                                        const OwnPass pass)
+    {
+        if (!IsInstalled() || !addresses_ || !addresses_->drawOverlays || !overlayManager || !drawContext ||
+            !overlaySource_ || activeOwnPass_ != OwnPass::None || !overlaySource_->HasOverlaysIn(overlayManager, pass)) {
+            return;
+        }
+
+        // The game's own overlay pass for the manager, so culling, texture setup and the custom
+        // renderer all work as usual. The decal pass keeps only the overlays of this pass, and the
+        // shadow passes are left out: the game draws shadows after the static models.
+        activeOwnPass_ = pass;
+        reinterpret_cast<DrawOverlaysFn>(addresses_->drawOverlays)(overlayManager, drawContext);
+        activeOwnPass_ = OwnPass::None;
+
+        // What this pass laid is not to be drawn again by a later pass.
+        ++overlayPass_;
+        currentTexTransformValid_ = false;
+        currentTexTransformStage_ = -1;
+    }
+
+    void TerrainDecalHook::FilterByLayer_(const void* const overlayManager, int* const decalIds) const
+    {
+        if (!overlaySource_) {
+            return;
+        }
+        // Overlays go to a pass of their own only while there is one.
+        if (activeOwnPass_ == OwnPass::None) {
+            bool any = false;
+            for (const OwnPass pass : {OwnPass::UnderLots, OwnPass::OverSidewalks}) {
+                any = any || (OwnPassAvailable_(pass) && overlaySource_->HasOverlaysIn(overlayManager, pass));
+            }
+            if (!any) {
+                return;
+            }
+        }
+
+        // decalIds is the game's std::vector<uint32_t> of overlay slots, refilled for every
+        // overlay pass. Its elements are plain integers, so moving its end in drops the rest.
+        auto* const range = reinterpret_cast<uint32_t**>(decalIds);
+        if (!range || !range[0]) {
+            return;
+        }
+        uint32_t* out = range[0];
+        for (const uint32_t* id = range[0]; id != range[1]; ++id) {
+            OwnPass pass = overlaySource_->OverlayOwnPass(overlayManager, *id);
+            if (pass != OwnPass::None && !OwnPassAvailable_(pass)) {
+                pass = OwnPass::None;
+            }
+            if (pass == activeOwnPass_) {
+                *out++ = *id;
+            }
+        }
+        range[1] = out;
+    }
+
+    int __fastcall TerrainDecalHook::NetworkDrawThunk(void* const drawable, void*, SC4DrawContext* const drawContext,
+                                                      const uint32_t highlight)
+    {
+        return sActiveHook_ ? sActiveHook_->HandleNetworkDraw_(drawable, drawContext, highlight) : 1;
+    }
+
+    int TerrainDecalHook::HandleNetworkDraw_(void* const drawable, SC4DrawContext* const drawContext,
+                                             const uint32_t highlight)
+    {
+        // cSC4NetworkOccupant::Draw (0x0061A850), thiscall on the drawable part of the occupant.
+        // It draws the sidewalk texture and then the surface on the same quad, and returns 1.
+        using NetworkDrawFn = int(__thiscall*)(void*, SC4DrawContext*, uint32_t);
+        const auto original = reinterpret_cast<NetworkDrawFn>(networkDrawThunkPatch_.GetOriginalTarget());
+        if (!overSidewalksManager_ || (highlight & 0xFFu) != 0 || !drawContext) {
+            return original(drawable, drawContext, highlight);
+        }
+
+        // From the drawable: the surface texture, the sidewalk texture (0 for none) and the
+        // surface variation, which adds 0x10 per step to the surface texture.
+        auto* const base = static_cast<std::byte*>(drawable);
+        auto& surface = *reinterpret_cast<uint32_t*>(base - 0x80);
+        auto& sidewalk = *reinterpret_cast<uint32_t*>(base - 0x7C);
+        auto& variation = *reinterpret_cast<uint8_t*>(base - 0x77);
+        // DrawStaticView_ (0x007C7370) draws in rounds, counted at +4 of the draw context: an
+        // occupant whose Draw returns 2 is drawn again in the next round.
+        const uint32_t round = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const std::byte*>(drawContext) + 4);
+
+        if (round == 0) {
+            // The sidewalk alone, drawn as the surface so it gets the game's own states. The game
+            // draws the sidewalk only under a surface texture that exists (0x0061A9FC): bridge and
+            // other model pieces can carry a sidewalk texture but have none, and must not show it.
+            if (sidewalk != 0 && SurfaceTextureExists(base, surface + variation * 0x10u, surface)) {
+                const uint32_t savedSurface = surface;
+                const uint8_t savedVariation = variation;
+                const uint32_t savedSidewalk = sidewalk;
+                surface = savedSidewalk;
+                variation = 0;
+                sidewalk = 0;
+                original(drawable, drawContext, highlight);
+                surface = savedSurface;
+                variation = savedVariation;
+                sidewalk = savedSidewalk;
+            }
+            return 2;
+        }
+
+        if (!overSidewalksDrawn_) {
+            overSidewalksDrawn_ = true;
+            DrawOwnPass_(overSidewalksManager_, drawContext, OwnPass::OverSidewalks);
+        }
+        // The surface alone, and what goes over it.
+        const uint32_t savedSidewalk = sidewalk;
+        sidewalk = 0;
+        const int result = original(drawable, drawContext, highlight);
+        sidewalk = savedSidewalk;
+        return result;
     }
 
     void TerrainDecalHook::SortByDrawOrder_(const void* const overlayManager, int* const decalIds) const
@@ -442,6 +631,10 @@ namespace TerrainDecal
                                                   SC4DrawContext* drawContext,
                                                   int* decalIds)
     {
+        if (activeOwnPass_ != OwnPass::None) {
+            // Shadows are drawn in the manager's own pass, over what lies under lots.
+            return;
+        }
         CallOriginalOverlayPass_(patch, overlayManager, worldToScreenMatrix, drawContext, decalIds);
         ReplayManagedDecalsAfterShadows_(overlayManager, worldToScreenMatrix, drawContext, decalIds);
         // What the decal pass laid is not to be drawn again by a later pass.

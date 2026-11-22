@@ -46,8 +46,9 @@ namespace TerrainDecal
         }
 
         auto* const site = reinterpret_cast<uint8_t*>(callSiteAddress_);
-        if (site[0] != 0xE8) {
-            LOG_ERROR("TerrainDecalHook: expected CALL rel32 at 0x{:08X} for {}",
+        // A CALL or a JMP, both rel32.
+        if (site[0] != 0xE8 && site[0] != 0xE9) {
+            LOG_ERROR("TerrainDecalHook: expected CALL or JMP rel32 at 0x{:08X} for {}",
                       static_cast<uint32_t>(callSiteAddress_), name_);
             return false;
         }

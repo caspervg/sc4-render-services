@@ -190,6 +190,35 @@ int main()
     }
 
     {
+        // Frames: uniform over the set bits, the same every time, apart from the texture pick.
+        using TerrainPaint::PickFrame;
+        using TerrainPaint::PickTexture;
+        CHECK(PickFrame(0, 7, 3, 4, 0) == 0 && PickFrame(1, 7, 3, 4, 0) == 0 && PickFrame(1u << 5, 7, 3, 4, 0) == 5);
+        constexpr uint32_t frames = (1u << 1) | (1u << 4) | (1u << 31);
+        int counts[32] = {};
+        const float weights[] = {1.0f, 1.0f};
+        int same = 0;
+        for (int32_t z = -50; z < 50; ++z) {
+            for (int32_t x = -50; x < 50; ++x) {
+                const uint32_t frame = PickFrame(frames, 42, x, z, 1);
+                CHECK(frame < 32 && ((frames >> frame) & 1u) && frame == PickFrame(frames, 42, x, z, 1));
+                ++counts[frame];
+                same += (PickTexture(weights, 42, x, z) == 1) == (frame == 1);
+            }
+        }
+        for (const uint32_t frame : {1u, 4u, 31u}) {
+            CHECK(counts[frame] > 3000 && counts[frame] < 3700);
+        }
+        // Independent of the texture pick: they agree about as often as chance says (5000).
+        CHECK(same > 4500 && same < 5500);
+        int moved = 0;
+        for (int32_t x = 0; x < 1000; ++x) {
+            moved += PickFrame(frames, 42, x, 0, 1) != PickFrame(frames, 42, x, 0, 2);
+        }
+        CHECK(moved > 550);
+    }
+
+    {
         // UV map: a 40 x 4 m strip across three cells, mapped u = x / 10, v = z / 4 by two
         // triangles that cover only x up to 30. Every vertex takes the map's coordinates, and the
         // part past the map is left out.

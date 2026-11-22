@@ -10,6 +10,9 @@ namespace TerrainDecal
     struct HookAddresses
     {
         uint16_t gameVersion = 0;
+        // cSTEOverlayManager::DrawOverlays(SC4DrawContext*), thiscall: one manager's decals and
+        // shadows, as the renderer's view object pass draws them.
+        uintptr_t drawOverlays = 0;
         uintptr_t drawDecals = 0;
         uintptr_t drawDecalsCallSite = 0;
         uintptr_t drawRect = 0;
@@ -21,6 +24,10 @@ namespace TerrainDecal
         uintptr_t clearTexTransform = 0;
         uintptr_t setTransparency = 0;
         uintptr_t setTexWrapModes = 0;
+        uintptr_t setTexture = 0;
+        // cSTEOverlayManager::RedisplayStaticOverlay(int slot), thiscall: the static view draws
+        // the overlay's rect again.
+        uintptr_t redisplayStaticOverlay = 0;
         uintptr_t setDepthOffset = 0;
         uintptr_t setVertexBuffer = 0;
         uintptr_t drawPrims = 0;
@@ -55,6 +62,10 @@ namespace TerrainDecal
         std::ptrdiff_t overlayRectOffset = 0;
         std::ptrdiff_t overlaySlotsPtrOffset = 0;
         std::ptrdiff_t overlaySlotStride = 0;
+        // The JMP in the vtordisp thunk of cSC4NetworkOccupant::Draw (0x0061A850), the static
+        // view's way in, and the CALL to it in cSC4NetworkOccupantWithPreBuiltModel::Draw.
+        uintptr_t networkDrawThunkJumpSite = 0;
+        uintptr_t networkDrawCallSite = 0;
     };
 
     [[nodiscard]] std::optional<HookAddresses> ResolveHookAddresses(uint16_t gameVersion);

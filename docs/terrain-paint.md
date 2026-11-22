@@ -10,13 +10,14 @@ A paint is a **shape** and a **style**:
 
 - The shape is one or more polygon rings in the ground plane (x and z in metres). The area is
   everything inside an odd number of rings, so a ring inside another one is a hole.
-- The style says how the area looks: up to eight textures, their size, turn and offset, a colour,
-  an opacity, a soft edge, and the draw order.
+- The style says how the area looks: up to 32 textures, their size, turn and offset, a colour,
+  an opacity, a soft edge, the layer and the draw order.
 
-The service drapes the paint over the terrain and follows later terrain changes. It draws the
-paint like a decal, in the game's decal pass under the shadows, including the shadow recovery
-pass. Paints live on the `StaticLand` overlay manager, so SCD3D11's live shadows fall on them.
-It also stores the paint in the city save.
+The service drapes the paint over the terrain and follows later terrain changes. By default it
+draws the paint like a decal, in the game's decal pass over lots and networks and under the
+shadows, including the shadow recovery pass. Paints live on the `StaticLand` overlay manager, so
+SCD3D11's live shadows fall on them. The layer can put a paint under lots and networks instead, or
+over the shadows (see [Layers](#layers)). The service also stores the paint in the city save.
 
 ## Getting the interface
 
@@ -56,13 +57,17 @@ Later calls take the id:
 - `GetPaintStyle` reads the style back.
 - `RemovePaint` deletes the paint.
 
-Style calls take the struct size, so the style can grow by appending fields in a later build.
+Style calls take the struct size. The service accepts styles from callers built before `layer`
+(`kTerrainPaintStyleSizeV1`); the fields they lack keep their defaults. It ignores bytes past its own
+size (`GetStyleSize`), so a plugin built against a newer header still works with an older service,
+without the newer fields.
 
 ### Style fields
 
 | Field | Meaning |
 |---|---|
-| `textures`, `textureCount` | 1 to 8 terrain textures. With more than one, every 16 m terrain cell of the area takes one of them, chosen by `weight`. The same `variationSeed` always picks the same textures. |
+| `textures`, `textureCount` | 1 to 32 terrain textures. With more than one, every 16 m terrain cell of the area takes one of them, chosen by `weight`. The same `variationSeed` always picks the same textures. |
+| `textureFrameMasks` | One per texture. For an FSH with several bitmaps (frames), bit n lets cells use frame n: every cell takes one of the allowed frames, each as likely, the same every time for the same `variationSeed`. Bits past the texture's last frame are ignored. 0 means frame 0 only. |
 | `textureSizeMeters` | The texture repeats every this many metres. Default 16, like the game's tiles. |
 | `textureRotationTurns`, `textureOffsetX/Z` | Turn (1 = a full turn) and shift of the texture. Both are fixed to the ground, so neighbouring paints line up. |
 | `color` | Multiplies the texture, the way decal colours do. For a plain colour, use a white texture. |
@@ -71,15 +76,61 @@ Style calls take the struct size, so the style can grow by appending fields in a
 | `drawOrder` | Paints and decals draw in ascending order. Game decals count as 0. When the order is equal, game decals come first, then the rest in the order they were made. |
 | `depthOffset` | As for decals; -1 uses the service default. |
 | `enabled` | Hidden while false. It is still saved. |
-| `flags` | `kTerrainPaintFlagTransient`: the paint is not saved. Use it for previews. |
+| `flags` | `kTerrainPaintFlagTransient`: the paint is not saved. Use it for previews. `kTerrainPaintFlagDraft`: no soft edge and no wear, so cutting the paint is cheap, for a paint that changes every frame. Flags are not saved, and older services ignore the ones they do not know. |
+| `layer` | Where the paint sits among what the game draws flat on the ground. See [Layers](#layers). |
+
+Style calls accept the size the style had before `layer` (`kTerrainPaintStyleSizeV1`). Paints
+made that way are `OverLots`.
+
+## Layers
+
+The game draws a frame in passes. The ones that matter for paint are, in order:
+
+1. The terrain.
+2. The static models: lot textures, networks, buildings and props.
+3. The `StaticLand` overlays: the game's decals and the shadows of buildings.
+4. The cars and other moving things, then the `DynamicLand` overlays.
+
+The overlays do not write depth, so whatever is drawn later covers what is under it. Buildings,
+props and cars hide a paint in every layer, the way they hide the ground.
+
+| `layer` | Drawn | Result |
+|---|---|---|
+| `OverLots` (default) | With the `StaticLand` overlays (3) | Over lot and network textures, under shadows |
+| `UnderLots` | Right after the terrain (between 1 and 2) | Under lot and network textures, like part of the ground. Shadows fall on it |
+| `OverShadows` | With the `DynamicLand` overlays (4) | Over lot and network textures and over shadows. SCD3D11's live shadows do not fall on it |
+| `OverSidewalks` | In the static models (2), between the sidewalks and surfaces of network tiles | Over lot textures and sidewalks, under road surfaces. Shadows fall on it |
+
+`UnderLots` paints stay on the `StaticLand` overlay manager, so the game culls them and redraws
+the static view when they change, as for any decal. The service draws them in a pass of its own: at
+the end of the renderer's `PreStatic` pass it runs the manager's `DrawOverlays` (`0x00738A50`)
+again, with the decal pass limited to them and the shadow passes left out. The usual decal pass then
+leaves them out, and so does shadow recovery. This needs the draw service
+(`EnableDrawService=true`), whose `PreStatic` hook also covers the partial redraws of the static
+view. Without it, `UnderLots` paints are drawn as `OverLots`.
+
+`OverSidewalks` paints are on `StaticLand` too. A network tile's `Draw` (`0x0061A850`) draws its
+sidewalk texture and then its surface on the same quad, so the service splits it. The static view
+(`DrawStaticView_`, `0x007C7370`) draws its models in rounds, and draws a model again in the next
+round when its `Draw` returns 2. In the first round a network tile draws only its sidewalk and
+returns 2. The first network tile in the second round draws the `OverSidewalks` paints, and then
+every tile draws its surface and what goes over it. When no network tile is in view, the paints are
+drawn at the end of the static pass. The service reaches `Draw` through the `JMP` in its vtordisp
+thunk (`0x0061C153`) and the call in `cSC4NetworkOccupantWithPreBuiltModel::Draw` (`0x0061E894`).
+Highlighted tiles and models added to the static view one at a time are drawn as before. This also
+needs the draw service. Without it, `OverSidewalks` paints are drawn as `OverLots`.
+
+Decals can go under lots too, with the `kTerrainDecalFlagUnderLots` flag
+(`docs/terrain-decals.md`).
 
 ## Draw order
 
 Decals have a `drawOrder` too (`TerrainDecalState::drawOrder`). Paints and decals made through the
 service sort together, so a texture decal can sit on top of a paint and the other way round. Two
 conditions apply:
-- They must share an overlay manager. Paints use `StaticLand`; decals on `DynamicLand` always
-  draw over them.
+- They must be in the same layer. Draw order sorts within a layer: an `OverLots` paint is above an
+  `UnderLots` paint whatever their draw orders, and decals on `DynamicLand` always draw over
+  `OverLots` paints.
 - The custom renderer must be on.
 
 ## How it is drawn
@@ -103,6 +154,13 @@ What a frame costs:
   drawing uses.
 - The cut is made once per cell row, the first time the row is on screen. The renderer keeps each
   piece with its weights on the terrain triangle, which do not depend on the heights.
+- Cutting has a time budget per frame over all paints, `TerrainPaintRowBudgetMs` in
+  `SC4RenderServices.ini` (default 4, 0 for no cap). Each paint overlay with rows to cut gets an
+  equal share, rows nearest the middle of the screen first. A row whose cells are not all cut yet
+  is drawn as it was before the change, or not at all, and is replaced in one go once they are.
+  While rows wait, the static view is told to draw the overlay again
+  (`cSTEOverlayManager::RedisplayStaticOverlay`, `0x00737D40`), so the work goes on when nothing
+  else moves.
 - Each frame then reads the four corners of each visible cell and blends them. Heights and
   colours are always current, so terrain edits and lighting changes show up at once, with nothing
   to go stale.
@@ -118,6 +176,11 @@ To use the vertex alpha, the renderer changes two things for the paint's draw on
 - It sets the texture to repeat.
 
 The opacity goes into the vertex alpha as well.
+
+With a frame mask, the overlay's cells are drawn in one batch per frame. Before each batch the
+renderer binds that frame's texture with `SC4DrawContext::SetTexture` (0x007D4070), and afterwards
+it binds frame 0 again, as `DrawDecals` left it. The game loads every bitmap of a decal FSH as a
+frame of one texture, but draws decals with frame 0 only.
 
 ## Textures that follow a path
 
@@ -142,6 +205,36 @@ record alone.
 
 The record format is defined by `src/service/decal/TerrainPaintCodec.h`. Every paint carries its
 byte length, so a later minor version can add fields that an older reader skips.
+
+| Minor version | Added at the end of each paint |
+|---|---|
+| 1 | The UV map |
+| 2 | Wear |
+| 3 | The layer |
+| 4 | The frame masks, one per texture. Older paints read with masks 0. |
+
+- Cities saved before the layer load with every paint `OverLots`, as they looked before.
+- An older service loads a city saved with layers and draws every paint `OverLots`. It drops the
+  layers when it saves the city.
+- A layer this service does not know, from a newer one, loads as `OverLots`.
+
+`tests/TerrainPaintCodecTests.cpp` checks these cases.
+
+## Measuring
+
+With `ShowTerrainPaintStats=true` in `SC4RenderServices.ini`, the "Terrain paint stats" window
+shows what drawing paint costs per frame, averaged over the last second:
+- One row per pass: the decal pass by the paint's layer (over lots, under lots, over shadows), then
+  the shadow recovery passes.
+- Overlays drawn, rows built (`BuildPaintRow`) and put off by the budget, cells visited and vertices lifted, draw calls, and
+  the time spent building rows, lifting vertices (with the rest of the setup), and in `Submit`.
+- The five paints with the most vertices.
+- Paint edits (`CreatePaint`, `SetPaintShape`, `SetPaintStyle`): calls and milliseconds per second,
+  the part spent making meshes, and the slowest call of the last 10 seconds with what it made
+  again. Cells are cut when first drawn, so cutting shows in the draw passes' build time.
+
+Every 10 seconds the same numbers go to the log as one line. With the setting off, the renderer
+measures nothing.
 
 ## Limits
 
