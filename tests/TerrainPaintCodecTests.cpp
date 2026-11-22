@@ -1,6 +1,7 @@
-// Checks for the terrain paint record: run TerrainPaintCodecTests.exe, it prints "ok" or aborts.
-// Cities saved by older versions must still load, and older versions must still load the paints
-// this version saves.
+// Checks for the terrain paint and decal records: run TerrainPaintCodecTests.exe, it prints "ok" or
+// aborts. Cities saved by older versions must still load, and older versions must still load the
+// paints this version saves.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +11,8 @@
 
 #include "cIGZIStream.h"
 #include "cIGZOStream.h"
+#include "service/decal/ClippedTerrainDecalRenderer.h"
+#include "service/decal/TerrainDecalSidecarCodec.h"
 #include "service/decal/TerrainPaintCodec.h"
 
 using TerrainPaintCodec::PaintSnapshot;
@@ -112,7 +115,7 @@ namespace
         int32_t error_ = 0;
     };
 
-    PaintSnapshot MakePaint(const uint32_t id, const TerrainPaintLayer layer)
+    PaintSnapshot MakePaint(const uint32_t id, const TerrainPaintLayer layer, const bool frameMasks = true)
     {
         PaintSnapshot paint{};
         paint.id = TerrainPaintId{id};
@@ -136,26 +139,30 @@ namespace
         style.wearPatchMeters = 0.6f;
         style.wearSeed = 99;
         style.layer = layer;
+        if (frameMasks) {
+            style.textureFrameMasks[0] = 0b1011;
+            style.textureFrameMasks[1] = 1u << 31;
+        }
         paint.ringSizes = {4};
         paint.points = {{100, 100}, {180, 100}, {180, 150}, {100, 150}};
         paint.uvMap = {{100, 100, 0, 0}, {180, 100, 5, 0}, {180, 150, 5, 1}};
         return paint;
     }
 
-    // The record as versions before the layer wrote it: minor version 2, ending with wear.
-    std::vector<uint8_t> WriteMinor2(const std::vector<PaintSnapshot>& paints)
+    // The record as older versions wrote it: minor version 2 ends with wear, 3 with the layer.
+    std::vector<uint8_t> WriteOld(const std::vector<PaintSnapshot>& paints, const uint16_t minor)
     {
         MemoryOStream out;
         out.SetUint32(TerrainPaintCodec::kMagic);
         out.SetUint16(1);
-        out.SetUint16(2);
+        out.SetUint16(minor);
         out.SetUint32(static_cast<uint32_t>(paints.size()));
         for (const PaintSnapshot& paint : paints) {
             const TerrainPaintStyle& style = paint.style;
             const uint32_t byteCount = 4 + 4 + 4 + 16 + 20 + 8 + 4 + 4 + 4 + 12 + style.textureCount * 16u +
                                        static_cast<uint32_t>(paint.ringSizes.size()) * 4u +
                                        static_cast<uint32_t>(paint.points.size()) * 8u +
-                                       static_cast<uint32_t>(paint.uvMap.size()) * 16u;
+                                       static_cast<uint32_t>(paint.uvMap.size()) * 16u + (minor >= 3 ? 4u : 0u);
             out.SetUint32(byteCount);
             out.SetUint32(paint.id.value);
             out.SetUint32(style.textureCount);
@@ -196,6 +203,9 @@ namespace
             out.SetFloat32(style.wear);
             out.SetFloat32(style.wearPatchMeters);
             out.SetUint32(style.wearSeed);
+            if (minor >= 3) {
+                out.SetUint32(static_cast<uint32_t>(style.layer));
+            }
         }
         return out.bytes;
     }
@@ -227,7 +237,8 @@ namespace
                a.textureOffsetZ == b.textureOffsetZ && a.color.fX == b.color.fX && a.color.fY == b.color.fY &&
                a.color.fZ == b.color.fZ && a.opacity == b.opacity && a.featherMeters == b.featherMeters &&
                a.drawOrder == b.drawOrder && a.depthOffset == b.depthOffset && a.enabled == b.enabled &&
-               a.wear == b.wear && a.wearPatchMeters == b.wearPatchMeters && a.wearSeed == b.wearSeed;
+               a.wear == b.wear && a.wearPatchMeters == b.wearPatchMeters && a.wearSeed == b.wearSeed &&
+               std::equal(a.textureFrameMasks, a.textureFrameMasks + a.textureCount, b.textureFrameMasks);
     }
 
     bool SameShape(const PaintSnapshot& a, const PaintSnapshot& b)
@@ -251,9 +262,9 @@ namespace
     // A city saved before the layer: every paint loads as it was, over lots.
     void OldRecordLoads()
     {
-        const std::vector<PaintSnapshot> paints = {MakePaint(1, TerrainPaintLayer::OverLots),
-                                                   MakePaint(2, TerrainPaintLayer::OverLots)};
-        MemoryIStream in(WriteMinor2(paints));
+        const std::vector<PaintSnapshot> paints = {MakePaint(1, TerrainPaintLayer::OverLots, false),
+                                                   MakePaint(2, TerrainPaintLayer::OverLots, false)};
+        MemoryIStream in(WriteOld(paints, 2));
         const auto result = TerrainPaintCodec::Read(in);
         CHECK(result.ok);
         CHECK(result.paints.size() == 2);
@@ -266,7 +277,23 @@ namespace
         CHECK(in.Remaining() == 0);
     }
 
-    // What this version saves loads back the same, layer included.
+    // A city saved with layers but before frame masks: layers kept, masks 0.
+    void LayerRecordLoads()
+    {
+        const std::vector<PaintSnapshot> paints = {MakePaint(1, TerrainPaintLayer::UnderLots, false),
+                                                   MakePaint(2, TerrainPaintLayer::OverShadows, false)};
+        MemoryIStream in(WriteOld(paints, 3));
+        const auto result = TerrainPaintCodec::Read(in);
+        CHECK(result.ok);
+        CHECK(result.paints.size() == 2);
+        for (size_t i = 0; i < 2; ++i) {
+            CHECK(SameStyle(result.paints[i].style, paints[i].style));
+            CHECK(result.paints[i].style.layer == paints[i].style.layer);
+        }
+        CHECK(in.Remaining() == 0);
+    }
+
+    // What this version saves loads back the same, layer and frame masks included.
     void RoundTrip()
     {
         const std::vector<PaintSnapshot> paints = {MakePaint(1, TerrainPaintLayer::UnderLots),
@@ -284,21 +311,22 @@ namespace
         CHECK(in.Remaining() == 0);
     }
 
-    // An older version reads a paint's fields up to wear and skips the rest by its byte count. The
-    // new record is the old one with the layer added at the end of each paint, so that works.
+    // An older version reads a paint's fields up to what it knows and skips the rest by its byte
+    // count. Each minor version is the one before with fields added at the end of each paint, so
+    // that works.
     void NewRecordExtendsOldOne()
     {
         const std::vector<PaintSnapshot> paints = {MakePaint(1, TerrainPaintLayer::UnderLots),
                                                    MakePaint(2, TerrainPaintLayer::OverShadows)};
-        const std::vector<uint8_t> oldBytes = WriteMinor2(paints);
+        const std::vector<uint8_t> oldBytes = WriteOld(paints, 3);
         const std::vector<uint8_t> newBytes = WriteCurrent(paints);
-        CHECK(newBytes.size() == oldBytes.size() + 2 * 4);
+        CHECK(newBytes.size() == oldBytes.size() + 2 * 2 * 4);
 
         // Header: only the minor version differs.
         CHECK(std::memcmp(oldBytes.data(), newBytes.data(), 6) == 0);
         uint16_t minor = 0;
         std::memcpy(&minor, newBytes.data() + 6, 2);
-        CHECK(minor == 3);
+        CHECK(minor == 4);
         CHECK(std::memcmp(oldBytes.data() + 8, newBytes.data() + 8, 4) == 0);
 
         size_t oldAt = 12;
@@ -308,12 +336,11 @@ namespace
             uint32_t newCount = 0;
             std::memcpy(&oldCount, oldBytes.data() + oldAt, 4);
             std::memcpy(&newCount, newBytes.data() + newAt, 4);
-            CHECK(newCount == oldCount + 4);
-            // The old fields, unchanged, then the layer.
+            CHECK(newCount == oldCount + paint.style.textureCount * 4);
+            // The old fields, unchanged, then the frame masks.
             CHECK(std::memcmp(oldBytes.data() + oldAt + 4, newBytes.data() + newAt + 4, oldCount) == 0);
-            uint32_t layer = 0;
-            std::memcpy(&layer, newBytes.data() + newAt + 4 + oldCount, 4);
-            CHECK(layer == static_cast<uint32_t>(paint.style.layer));
+            CHECK(std::memcmp(newBytes.data() + newAt + 4 + oldCount, paint.style.textureFrameMasks,
+                              paint.style.textureCount * 4) == 0);
             oldAt += 4 + oldCount;
             newAt += 4 + newCount;
         }
@@ -324,13 +351,15 @@ namespace
     // A later version may add layers and fields: the paint still loads, over lots.
     void NewerRecordLoads()
     {
-        std::vector<uint8_t> bytes = WriteCurrent({MakePaint(1, TerrainPaintLayer::UnderLots)});
+        const PaintSnapshot paint = MakePaint(1, TerrainPaintLayer::UnderLots);
+        std::vector<uint8_t> bytes = WriteCurrent({paint});
         const uint16_t minor = 9;
         std::memcpy(bytes.data() + 6, &minor, 2);
         uint32_t byteCount = 0;
         std::memcpy(&byteCount, bytes.data() + 12, 4);
+        // The layer is the last field before the frame masks.
         const uint32_t unknownLayer = 7;
-        std::memcpy(bytes.data() + 12 + byteCount, &unknownLayer, 4);
+        std::memcpy(bytes.data() + 12 + byteCount - paint.style.textureCount * 4, &unknownLayer, 4);
         byteCount += 8;
         std::memcpy(bytes.data() + 12, &byteCount, 4);
         bytes.insert(bytes.end(), {0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x02, 0x03, 0x04});
@@ -341,16 +370,119 @@ namespace
         CHECK(result.paints.size() == 1);
         CHECK(result.paints[0].style.layer == TerrainPaintLayer::OverLots);
         CHECK(result.paints[0].style.wearSeed == 99);
+        CHECK(SameStyle(result.paints[0].style, paint.style));
         CHECK(in.Remaining() == 0);
+    }
+
+    void MaxTexturesRoundTrip()
+    {
+        PaintSnapshot paint = MakePaint(1, TerrainPaintLayer::OverLots);
+        paint.style.textureCount = kTerrainPaintMaxTextures;
+        paint.style.textureFrameMasks[kTerrainPaintMaxTextures - 1] = 6;
+        paint.style.flags = kTerrainPaintFlagDraft;
+        MemoryIStream in(WriteCurrent({paint}));
+        const auto result = TerrainPaintCodec::Read(in);
+        CHECK(result.ok);
+        CHECK(result.paints.size() == 1);
+        CHECK(SameStyle(result.paints[0].style, paint.style));
+        CHECK(result.paints[0].style.flags == 0);
+        CHECK(in.Remaining() == 0);
+    }
+
+    // The row budget: an equal share per overlay with rows to build, a cap over all of them,
+    // and an overlay held back by the others goes first in the next frame.
+    void RowBudget()
+    {
+        TerrainDecal::RowBudget budget;
+        TerrainDecal::PaintDrawCache a;
+        TerrainDecal::PaintDrawCache b;
+        budget.SetFrameMs(4.0f);
+        budget.BeginFrame(0.0);
+        CHECK(budget.MayBuild(a, 0.0));
+        budget.Spend(a, 5.0);
+        CHECK(!budget.MayBuild(a, 1.0));
+        CHECK(!budget.MayBuild(b, 1.0) && b.budgetStarved);
+
+        budget.BeginFrame(10.0);
+        CHECK(budget.MayBuild(a, 10.0));
+        budget.Spend(a, 3.0);
+        CHECK(!budget.MayBuild(a, 11.0));
+        CHECK(budget.MayBuild(b, 11.0));
+        budget.Spend(b, 3.0);
+        CHECK(!budget.MayBuild(b, 12.0));
+
+        // No frame signal for a long time: a new frame starts anyway.
+        CHECK(budget.MayBuild(a, 500.0));
+
+        budget.SetFrameMs(0.0f);
+        budget.Spend(a, 100.0);
+        CHECK(budget.MayBuild(a, 501.0));
+    }
+
+    // The decal struct sizes callers may pass: before drawOrder, before frame, and now.
+    static_assert(kTerrainDecalStateSizeV1 == 108 && kTerrainDecalStateSizeV2 == 112 && kTerrainDecalStateSize == 116);
+    static_assert(kTerrainDecalSnapshotSizeV1 == 112 && kTerrainDecalSnapshotSizeV2 == 116 &&
+                  kTerrainDecalSnapshotSize == 120);
+
+    // Decal sidecar: the frame round trips, minor 2 records read frame 0, longer records are skipped.
+    void DecalFrame()
+    {
+        TerrainDecalSnapshot decal{};
+        decal.id.value = 4;
+        decal.state.textureKey = cGZPersistResourceKey(0x7AB50E44, 0x1ABE787D, 0xAA40173A);
+        decal.state.drawOrder = 7;
+        decal.state.frame = 5;
+        MemoryOStream out;
+        CHECK(TerrainDecalSidecar::Write(out, {decal, decal}));
+        const std::vector<uint8_t> sidecar = out.bytes;
+        // Header, then the chunk's payload size, record size and count; records start at 32.
+        constexpr size_t kMinorAt = 6;
+        constexpr size_t kPayloadAt = 20;
+        constexpr size_t kRecordSizeAt = 24;
+        constexpr size_t kRecordsAt = 32;
+        constexpr uint32_t kSize = sizeof(TerrainDecalSidecar::PersistedTerrainDecal);
+        CHECK(sidecar.size() == kRecordsAt + 2 * kSize);
+
+        const auto read = [](std::vector<uint8_t> bytes) {
+            MemoryIStream in(std::move(bytes));
+            return TerrainDecalSidecar::Read(in);
+        };
+        const auto current = read(sidecar);
+        CHECK(current.ok && current.decals.size() == 2 && current.decals[1].state.frame == 5 &&
+              current.decals[1].state.drawOrder == 7);
+
+        // Each record cut or padded to recordSize bytes.
+        const auto resized = [&](const uint32_t recordSize, const uint16_t minor) {
+            std::vector<uint8_t> bytes(sidecar.begin(), sidecar.begin() + kRecordsAt);
+            for (size_t i = 0; i < 2; ++i) {
+                const auto record = sidecar.begin() + static_cast<std::ptrdiff_t>(kRecordsAt + i * kSize);
+                bytes.insert(bytes.end(), record, record + std::min(recordSize, kSize));
+                bytes.insert(bytes.end(), recordSize > kSize ? recordSize - kSize : 0u, uint8_t{0xAB});
+            }
+            std::memcpy(bytes.data() + kMinorAt, &minor, 2);
+            const uint32_t payload = 2 * recordSize;
+            std::memcpy(bytes.data() + kPayloadAt, &payload, 4);
+            std::memcpy(bytes.data() + kRecordSizeAt, &recordSize, 4);
+            return bytes;
+        };
+        const auto minor2 = read(resized(kSize - 4, 2));
+        CHECK(minor2.ok && minor2.decals.size() == 2 && minor2.decals[1].state.frame == 0 &&
+              minor2.decals[1].state.drawOrder == 7);
+        const auto longer = read(resized(kSize + 8, 4));
+        CHECK(longer.ok && longer.decals.size() == 2 && longer.decals[1].state.frame == 5);
     }
 }
 
 int main()
 {
     OldRecordLoads();
+    LayerRecordLoads();
     RoundTrip();
     NewRecordExtendsOldOne();
     NewerRecordLoads();
+    MaxTexturesRoundTrip();
+    DecalFrame();
+    RowBudget();
     std::printf("ok\n");
     return 0;
 }

@@ -97,6 +97,7 @@ namespace TerrainDecal
               .enableClippedRendering = options.enableCustomRenderer,
               .customDefaultDepthOffset = options.customDefaultDepthOffset,
               .shadowRecoveryOpacityScale = options.shadowRecoveryOpacityScale,
+              .paintRowBudgetMs = options.paintRowBudgetMs,
           })
     {
     }
@@ -228,6 +229,12 @@ namespace TerrainDecal
                                                worldToScreenMatrix,
                                                drawContext,
                                                decalIds);
+        // The dynamic land overlays draw once every frame, last: the frame's paint rows are done.
+        constexpr std::ptrdiff_t kDynamicFlagOffset = 0x15;
+        if (!IsWaterOverlayManager(overlayManager) &&
+            static_cast<const std::byte*>(overlayManager)[kDynamicFlagOffset] != std::byte{0}) {
+            sActiveHook_->renderer_.BeginFrame();
+        }
     }
 
     void TerrainDecalHook::SetUnderLotsPassAvailable(const bool available) noexcept

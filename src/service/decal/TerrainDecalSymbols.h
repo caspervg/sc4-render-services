@@ -24,6 +24,10 @@ namespace TerrainDecal
         uintptr_t clearTexTransform = 0;
         uintptr_t setTransparency = 0;
         uintptr_t setTexWrapModes = 0;
+        uintptr_t setTexture = 0;
+        // cSTEOverlayManager::RedisplayStaticOverlay(int slot), thiscall: the static view draws
+        // the overlay's rect again.
+        uintptr_t redisplayStaticOverlay = 0;
         uintptr_t setDepthOffset = 0;
         uintptr_t setVertexBuffer = 0;
         uintptr_t drawPrims = 0;

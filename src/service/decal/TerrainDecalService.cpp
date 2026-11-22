@@ -22,6 +22,7 @@
 #include "cISTETerrainView.h"
 #include "utils/Logger.h"
 #include "TerrainDecalSidecarCodec.h"
+#include "TerrainPaintStats.h"
 
 namespace
 {
@@ -104,6 +105,7 @@ namespace
         overrides.uvOffset = state.decalInfo.uvOffset;
         overrides.mirror = (state.flags & kTerrainDecalFlagMirror) != 0;
         overrides.depthOffset = state.depthOffset;
+        overrides.frame = state.frame;
     }
 
     [[nodiscard]] bool IsFinite(const float value) noexcept
@@ -115,7 +117,7 @@ namespace
     [[nodiscard]] bool ValidateStyle(TerrainPaintStyle& style, std::string& error)
     {
         if (style.textureCount < 1 || style.textureCount > kTerrainPaintMaxTextures) {
-            error = "textureCount must be 1 to 8";
+            error = "textureCount must be 1 to 32";
             return false;
         }
         for (uint32_t i = 0; i < style.textureCount; ++i) {
@@ -188,6 +190,8 @@ namespace
 
     [[nodiscard]] std::unique_ptr<TerrainPaint::Mesh> BuildMesh(const TerrainPaintCodec::PaintSnapshot& data)
     {
+        TerrainPaintStats::Edit* const edit = TerrainPaintStats::currentEdit;
+        const double start = edit ? TerrainPaintStats::NowMs() : 0.0;
         std::vector<TerrainPaint::Ring> rings;
         rings.reserve(data.ringSizes.size());
         size_t next = 0;
@@ -204,9 +208,15 @@ namespace
         for (const TerrainPaintUvVertex& vertex : data.uvMap) {
             uvMap.push_back({vertex.x, vertex.z, vertex.u, vertex.v});
         }
-        return std::make_unique<TerrainPaint::Mesh>(
-            rings, data.style.featherMeters, uvMap,
-            TerrainPaint::Wear{data.style.wear, data.style.wearPatchMeters, data.style.wearSeed});
+        const bool draft = (data.style.flags & kTerrainPaintFlagDraft) != 0;
+        auto mesh = std::make_unique<TerrainPaint::Mesh>(
+            rings, draft ? 0.0f : data.style.featherMeters, uvMap,
+            draft ? TerrainPaint::Wear{} : TerrainPaint::Wear{data.style.wear, data.style.wearPatchMeters, data.style.wearSeed});
+        if (edit) {
+            edit->meshMs += TerrainPaintStats::NowMs() - start;
+            edit->newMesh = true;
+        }
+        return mesh;
     }
 }
 
@@ -494,6 +504,7 @@ bool TerrainDecalService::CreatePaint(const TerrainPaintShape& shape,
                                       const uint32_t styleSize,
                                       TerrainPaintId* const outId)
 {
+    TerrainPaintStats::EditScope measure("CreatePaint", nextPaintId_);
     if (!style || !outId || styleSize < kTerrainPaintStyleSizeV1) {
         return false;
     }
@@ -567,6 +578,7 @@ bool TerrainDecalService::RemovePaint(const TerrainPaintId id)
 
 bool TerrainDecalService::SetPaintShape(const TerrainPaintId id, const TerrainPaintShape& shape)
 {
+    TerrainPaintStats::EditScope measure("SetPaintShape", id.value);
     const auto it = paints_.find(id.value);
     if (it == paints_.end()) {
         return false;
@@ -590,6 +602,7 @@ bool TerrainDecalService::SetPaintShape(const TerrainPaintId id, const TerrainPa
 
 bool TerrainDecalService::SetPaintStyle(const TerrainPaintId id, const TerrainPaintStyle* const style, const uint32_t styleSize)
 {
+    TerrainPaintStats::EditScope measure("SetPaintStyle", id.value);
     const auto it = paints_.find(id.value);
     if (it == paints_.end() || !style || styleSize < kTerrainPaintStyleSizeV1) {
         return false;
@@ -607,7 +620,8 @@ bool TerrainDecalService::SetPaintStyle(const TerrainPaintId id, const TerrainPa
     // These are in the mesh: it is made again when one of them changes.
     const bool featherChanged = validated.featherMeters != current.featherMeters || validated.wear != current.wear ||
                                 validated.wearPatchMeters != current.wearPatchMeters ||
-                                validated.wearSeed != current.wearSeed;
+                                validated.wearSeed != current.wearSeed ||
+                                ((validated.flags ^ current.flags) & kTerrainPaintFlagDraft) != 0;
     bool newTextures = validated.textureCount != current.textureCount;
     for (uint32_t i = 0; !newTextures && i < validated.textureCount; ++i) {
         const cGZPersistResourceKey& a = validated.textures[i].key;
@@ -650,9 +664,16 @@ bool TerrainDecalService::RealizePaint_(PaintRecord& record, const bool newTextu
                               record.overlayIds.size() == record.data.style.textureCount;
     if (!keepOverlays) {
         UnrealizePaint_(record, true);
+        if (TerrainPaintStats::currentEdit) {
+            TerrainPaintStats::currentEdit->newOverlays = true;
+        }
     }
-    // The paint changed: what the renderer kept of it is out of date.
-    record.drawCaches.assign(record.data.style.textureCount, {});
+    // The paint changed: what the renderer kept of it is out of date, but drawn until it has
+    // been built again.
+    record.drawCaches.resize(record.data.style.textureCount);
+    for (TerrainDecal::PaintDrawCache& cache : record.drawCaches) {
+        cache.Invalidate();
+    }
     if (!PaintsAvailable_()) {
         // Kept, so it is saved again, but not drawn.
         return true;
@@ -758,6 +779,7 @@ bool TerrainDecalService::ResolveOverlay(const void* const overlayManager,
     out.paint = TerrainDecal::PaintOverlay{
         .mesh = paint->second.mesh.get(),
         .style = &paint->second.data.style,
+        .paintId = paint->first,
         .textureIndex = target.textureIndex,
         .uvFromGround = paint->second.uvFromGround,
         .cache = target.textureIndex < paint->second.drawCaches.size() ? &paint->second.drawCaches[target.textureIndex]
@@ -874,6 +896,11 @@ void TerrainDecalService::SetCustomDefaultDepthOffset(const int customDefaultDep
     customDefaultDepthOffset_ = customDefaultDepthOffset;
 }
 
+void TerrainDecalService::SetPaintRowBudgetMs(const float paintRowBudgetMs) noexcept
+{
+    paintRowBudgetMs_ = paintRowBudgetMs;
+}
+
 void TerrainDecalService::SetShadowRecoveryOpacityScale(const float shadowRecoveryOpacityScale) noexcept
 {
     shadowRecoveryOpacityScale_ = shadowRecoveryOpacityScale;
@@ -902,6 +929,7 @@ bool TerrainDecalService::Init()
         .customDefaultDepthOffset = customDefaultDepthOffset_,
         .shadowRecoveryOpacityScale = shadowRecoveryOpacityScale_,
         .shadowRecoveryUseStencil = shadowRecoveryUseStencil_,
+        .paintRowBudgetMs = paintRowBudgetMs_,
     });
 
     if (!renderHook_->Install()) {

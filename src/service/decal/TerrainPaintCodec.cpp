@@ -49,7 +49,7 @@ namespace TerrainPaintCodec
                                       + 4                // UV map vertex count
                                       + 3 * 4            // wear, patch size, seed
                                       + 4;               // layer
-            return kFixed + paint.style.textureCount * 16u +
+            return kFixed + paint.style.textureCount * (16u + 4u) +
                    static_cast<uint32_t>(paint.ringSizes.size()) * 4u +
                    static_cast<uint32_t>(paint.points.size()) * 8u +
                    static_cast<uint32_t>(paint.uvMap.size()) * 16u;
@@ -148,6 +148,16 @@ namespace TerrainPaintCodec
             style.layer = layer <= static_cast<uint32_t>(TerrainPaintLayer::OverShadows)
                               ? static_cast<TerrainPaintLayer>(layer)
                               : TerrainPaintLayer::OverLots;
+
+            // Minor version 4 and later: frame masks.
+            if (r.Consumed() + 4u * textureCount <= byteCount) {
+                for (uint32_t i = 0; i < textureCount; ++i) {
+                    if (!r.U32(style.textureFrameMasks[i])) {
+                        error = "truncated terrain paint frame masks";
+                        return false;
+                    }
+                }
+            }
 
             if (r.Consumed() > byteCount) {
                 error = "terrain paint longer than its byte count";
@@ -249,6 +259,9 @@ namespace TerrainPaintCodec
             }
             ok = ok && out.SetFloat32(style.wear) && out.SetFloat32(style.wearPatchMeters) &&
                  out.SetUint32(style.wearSeed) && out.SetUint32(static_cast<uint32_t>(style.layer));
+            for (uint32_t i = 0; ok && i < style.textureCount; ++i) {
+                ok = out.SetUint32(style.textureFrameMasks[i]);
+            }
             if (!ok) {
                 return false;
             }

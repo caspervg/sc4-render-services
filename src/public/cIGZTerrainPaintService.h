@@ -56,7 +56,7 @@ struct TerrainPaintShape {
     uint32_t uvVertexCount = 0;
 };
 
-static constexpr uint32_t kTerrainPaintMaxTextures = 8;
+static constexpr uint32_t kTerrainPaintMaxTextures = 32;
 
 struct TerrainPaintTexture {
     // A terrain decal texture (FSH, for example type 0x7AB50E44, group 0x0986135E).
@@ -67,6 +67,10 @@ struct TerrainPaintTexture {
 
 // Not stored in the city save. Use it for previews.
 static constexpr uint32_t kTerrainPaintFlagTransient = 1u << 0;
+// Cut and drawn without the soft edge and without wear, which is much cheaper: for a paint that
+// changes every frame, such as while a slider is held. Not stored in the city save. Changing it
+// cuts the paint again, like changing the soft edge.
+static constexpr uint32_t kTerrainPaintFlagDraft = 1u << 1;
 
 // Where a paint sits among what the game draws flat on the ground. Buildings, props and cars
 // hide a paint in every layer, as they hide the ground.
@@ -122,6 +126,10 @@ struct TerrainPaintStyle {
     // Draw order sorts paints and decals within one layer. Paints in different layers keep
     // the layers' order, whatever their draw order.
     TerrainPaintLayer layer = TerrainPaintLayer::OverLots;
+
+    // For an FSH with several bitmaps (frames): bit n set lets the cells of texture i use frame n,
+    // each cell one of them, the same every time for the same seed. 0 means frame 0 only.
+    uint32_t textureFrameMasks[kTerrainPaintMaxTextures]{};
 };
 
 static constexpr size_t kTerrainPaintStyleSize = sizeof(TerrainPaintStyle);

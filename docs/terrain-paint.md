@@ -10,7 +10,7 @@ A paint is a **shape** and a **style**:
 
 - The shape is one or more polygon rings in the ground plane (x and z in metres). The area is
   everything inside an odd number of rings, so a ring inside another one is a hole.
-- The style says how the area looks: up to eight textures, their size, turn and offset, a colour,
+- The style says how the area looks: up to 32 textures, their size, turn and offset, a colour,
   an opacity, a soft edge, the layer and the draw order.
 
 The service drapes the paint over the terrain and follows later terrain changes. By default it
@@ -57,13 +57,17 @@ Later calls take the id:
 - `GetPaintStyle` reads the style back.
 - `RemovePaint` deletes the paint.
 
-Style calls take the struct size, so the style can grow by appending fields in a later build.
+Style calls take the struct size. The service accepts styles from callers built before `layer`
+(`kTerrainPaintStyleSizeV1`); the fields they lack keep their defaults. It ignores bytes past its own
+size (`GetStyleSize`), so a plugin built against a newer header still works with an older service,
+without the newer fields.
 
 ### Style fields
 
 | Field | Meaning |
 |---|---|
-| `textures`, `textureCount` | 1 to 8 terrain textures. With more than one, every 16 m terrain cell of the area takes one of them, chosen by `weight`. The same `variationSeed` always picks the same textures. |
+| `textures`, `textureCount` | 1 to 32 terrain textures. With more than one, every 16 m terrain cell of the area takes one of them, chosen by `weight`. The same `variationSeed` always picks the same textures. |
+| `textureFrameMasks` | One per texture. For an FSH with several bitmaps (frames), bit n lets cells use frame n: every cell takes one of the allowed frames, each as likely, the same every time for the same `variationSeed`. Bits past the texture's last frame are ignored. 0 means frame 0 only. |
 | `textureSizeMeters` | The texture repeats every this many metres. Default 16, like the game's tiles. |
 | `textureRotationTurns`, `textureOffsetX/Z` | Turn (1 = a full turn) and shift of the texture. Both are fixed to the ground, so neighbouring paints line up. |
 | `color` | Multiplies the texture, the way decal colours do. For a plain colour, use a white texture. |
@@ -72,7 +76,7 @@ Style calls take the struct size, so the style can grow by appending fields in a
 | `drawOrder` | Paints and decals draw in ascending order. Game decals count as 0. When the order is equal, game decals come first, then the rest in the order they were made. |
 | `depthOffset` | As for decals; -1 uses the service default. |
 | `enabled` | Hidden while false. It is still saved. |
-| `flags` | `kTerrainPaintFlagTransient`: the paint is not saved. Use it for previews. |
+| `flags` | `kTerrainPaintFlagTransient`: the paint is not saved. Use it for previews. `kTerrainPaintFlagDraft`: no soft edge and no wear, so cutting the paint is cheap, for a paint that changes every frame. Flags are not saved, and older services ignore the ones they do not know. |
 | `layer` | Where the paint sits among what the game draws flat on the ground. See [Layers](#layers). |
 
 Style calls accept the size the style had before `layer` (`kTerrainPaintStyleSizeV1`). Paints
@@ -138,6 +142,13 @@ What a frame costs:
   drawing uses.
 - The cut is made once per cell row, the first time the row is on screen. The renderer keeps each
   piece with its weights on the terrain triangle, which do not depend on the heights.
+- Cutting has a time budget per frame over all paints, `TerrainPaintRowBudgetMs` in
+  `SC4RenderServices.ini` (default 4, 0 for no cap). Each paint overlay with rows to cut gets an
+  equal share, rows nearest the middle of the screen first. A row whose cells are not all cut yet
+  is drawn as it was before the change, or not at all, and is replaced in one go once they are.
+  While rows wait, the static view is told to draw the overlay again
+  (`cSTEOverlayManager::RedisplayStaticOverlay`, `0x00737D40`), so the work goes on when nothing
+  else moves.
 - Each frame then reads the four corners of each visible cell and blends them. Heights and
   colours are always current, so terrain edits and lighting changes show up at once, with nothing
   to go stale.
@@ -153,6 +164,11 @@ To use the vertex alpha, the renderer changes two things for the paint's draw on
 - It sets the texture to repeat.
 
 The opacity goes into the vertex alpha as well.
+
+With a frame mask, the overlay's cells are drawn in one batch per frame. Before each batch the
+renderer binds that frame's texture with `SC4DrawContext::SetTexture` (0x007D4070), and afterwards
+it binds frame 0 again, as `DrawDecals` left it. The game loads every bitmap of a decal FSH as a
+frame of one texture, but draws decals with frame 0 only.
 
 ## Textures that follow a path
 
@@ -183,6 +199,7 @@ byte length, so a later minor version can add fields that an older reader skips.
 | 1 | The UV map |
 | 2 | Wear |
 | 3 | The layer |
+| 4 | The frame masks, one per texture. Older paints read with masks 0. |
 
 - Cities saved before the layer load with every paint `OverLots`, as they looked before.
 - An older service loads a city saved with layers and draws every paint `OverLots`. It drops the
@@ -190,6 +207,22 @@ byte length, so a later minor version can add fields that an older reader skips.
 - A layer this service does not know, from a newer one, loads as `OverLots`.
 
 `tests/TerrainPaintCodecTests.cpp` checks these cases.
+
+## Measuring
+
+With `ShowTerrainPaintStats=true` in `SC4RenderServices.ini`, the "Terrain paint stats" window
+shows what drawing paint costs per frame, averaged over the last second:
+- One row per pass: the decal pass by the paint's layer (over lots, under lots, over shadows), then
+  the shadow recovery passes.
+- Overlays drawn, rows built (`BuildPaintRow`) and put off by the budget, cells visited and vertices lifted, draw calls, and
+  the time spent building rows, lifting vertices (with the rest of the setup), and in `Submit`.
+- The five paints with the most vertices.
+- Paint edits (`CreatePaint`, `SetPaintShape`, `SetPaintStyle`): calls and milliseconds per second,
+  the part spent making meshes, and the slowest call of the last 10 seconds with what it made
+  again. Cells are cut when first drawn, so cutting shows in the draw passes' build time.
+
+Every 10 seconds the same numbers go to the log as one line. With the setting off, the renderer
+measures nothing.
 
 ## Limits
 

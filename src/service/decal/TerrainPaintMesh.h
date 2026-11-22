@@ -75,6 +75,10 @@ namespace TerrainPaint
     // seed and cell. Negative weights count as 0; with no positive weight, the first texture.
     [[nodiscard]] uint32_t PickTexture(std::span<const float> weights, uint32_t seed, int32_t cellX, int32_t cellZ);
 
+    // Which frame of texture slot `slot` a terrain cell gets: one of the set bits of frames, each
+    // as likely, the same every time. Independent of PickTexture. With no bit set, frame 0.
+    [[nodiscard]] uint32_t PickFrame(uint32_t frames, uint32_t seed, int32_t cellX, int32_t cellZ, uint32_t slot);
+
     // The painted area of one paint, cut into terrain cells. Cells are cut on first use and kept,
     // so a large paint costs only what is on screen.
     class Mesh
@@ -97,6 +101,8 @@ namespace TerrainPaint
 
         // Empty when the cell is outside the area. flipped: split along the cell's other diagonal.
         [[nodiscard]] const CellMesh& Cell(int32_t cellX, int32_t cellZ, bool flipped = false) const;
+        // Whether Cell() returns at once: the cell is cut already, or outside the area.
+        [[nodiscard]] bool HasCell(int32_t cellX, int32_t cellZ, bool flipped = false) const;
 
     private:
         struct Edge
@@ -108,7 +114,11 @@ namespace TerrainPaint
         [[nodiscard]] float AlphaAt_(double x, double z) const;
         // The area in a cell as nested regions from the outline inwards, each with whether it is
         // the solid core: the soft-edge bands, then the core. Without a soft edge, only the core.
-        [[nodiscard]] std::vector<std::pair<Clipper2Lib::PathsD, bool>> RegionsIn_(const Clipper2Lib::RectD& cellRect) const;
+        [[nodiscard]] std::vector<std::pair<Clipper2Lib::PathsD, bool>> RegionsIn_(int32_t cellX, int32_t cellZ,
+                                                                                   const Clipper2Lib::RectD& cellRect) const;
+        // The area inside rect, which lies within NearMargin_() of the cell.
+        [[nodiscard]] Clipper2Lib::PathsD AreaNear_(int32_t cellX, int32_t cellZ, const Clipper2Lib::RectD& rect) const;
+        [[nodiscard]] double NearMargin_() const noexcept { return featherMeters_ * 1.5 + 0.1; }
         [[nodiscard]] std::vector<MeshVertex> MapUv_(const std::vector<MeshVertex>& triangles, uint64_t cellKey) const;
         // The patches worn away in a cell, sampled where it has paint; empty without wear.
         [[nodiscard]] Clipper2Lib::PathsD WearPatches_(const Clipper2Lib::RectD& cellRect, int32_t cellX, int32_t cellZ) const;
@@ -119,6 +129,8 @@ namespace TerrainPaint
         [[nodiscard]] bool SameSettings_(const Mesh& other) const noexcept;
 
         Clipper2Lib::PathsD area_;
+        // area_ rings by the cells their bounds, grown by NearMargin_(), touch.
+        std::unordered_map<uint64_t, std::vector<uint32_t>> pathsNearCell_;
         float featherMeters_ = 0.0f;
         Wear wear_{};
         CellRange cells_{};

@@ -23,7 +23,8 @@ namespace TerrainPaintCodec
     constexpr uint32_t kMagic = TerrainDecalSidecar::FourCC('T', 'P', 'N', 'T');
     constexpr uint16_t kVersionMajor = 1;
     // 1: the UV map, after the points. 2: wear, after the UV map. 3: the layer, after wear.
-    constexpr uint16_t kVersionMinor = 3;
+    // 4: frame masks, after the layer.
+    constexpr uint16_t kVersionMinor = 4;
 
     constexpr cGZPersistResourceKey kRecordKey(TerrainDecalSidecar::kSidecarType,
                                                TerrainDecalSidecar::kSidecarGroup,
