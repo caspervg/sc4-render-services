@@ -1,0 +1,26 @@
+name: sc4pac
+
+# Runs when a release is published: points the sc4pac package at it on a branch of
+# caspervg/simtropolis-channel, and links to a prefilled pull request in the job summary.
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  sc4pac:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment: sc4pac
+    concurrency: sc4pac-caspervg-sc4-render-services
+    steps:
+      - uses: caspervg/sc4pac-release-action@af95bc5692cab0a3b32e50aac5b82eb8249ffca9 # v1.0.0
+        with:
+          channel: sebamarynissen/simtropolis-channel
+          asset-id: caspervg-sc4-render-services
+          tag: ${{ github.event.release.tag_name }}
+          token: ${{ secrets.SC4PAC_FORK_TOKEN }}
