@@ -89,6 +89,18 @@ namespace TerrainDecal
             std::memcpy(&flags, slotBase + 4, sizeof(flags));
             return (flags & 0x80u) == 0u;
         }
+
+        // The network occupant's GetTexture (vtable +0x134, 0x0061C950), as cSC4NetworkOccupant::Draw
+        // calls it: the texture, or the fallback, from the game's cache; null when neither exists.
+        // The occupant interface is 0x17C before the drawable. The game does not release the result.
+        [[nodiscard]] bool SurfaceTextureExists(std::byte* const drawable, const uint32_t texture,
+                                                 const uint32_t fallback)
+        {
+            void* const occupant = drawable - 0x17C;
+            using GetTextureFn = void*(__thiscall*)(void*, uint32_t, uint32_t);
+            const auto getTexture = reinterpret_cast<GetTextureFn>((*static_cast<void***>(occupant))[0x134 / 4]);
+            return getTexture(occupant, texture, fallback) != nullptr;
+        }
     }
 
     TerrainDecalHook::TerrainDecalHook(const Options options)
@@ -376,8 +388,10 @@ namespace TerrainDecal
         const uint32_t round = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const std::byte*>(drawContext) + 4);
 
         if (round == 0) {
-            // The sidewalk alone, drawn as the surface so it gets the game's own states.
-            if (sidewalk != 0) {
+            // The sidewalk alone, drawn as the surface so it gets the game's own states. The game
+            // draws the sidewalk only under a surface texture that exists (0x0061A9FC): bridge and
+            // other model pieces can carry a sidewalk texture but have none, and must not show it.
+            if (sidewalk != 0 && SurfaceTextureExists(base, surface + variation * 0x10u, surface)) {
                 const uint32_t savedSurface = surface;
                 const uint8_t savedVariation = variation;
                 const uint32_t savedSidewalk = sidewalk;
